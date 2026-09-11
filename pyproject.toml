@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fmri-first-level-proc"
-version = "2.5.0"
+version = "3.1.0"
 description = "General-purpose first-level fMRI analysis framework built on AFNI."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 authors = [
     { name = "Taylor J. Keding, Ph.D." },
 ]
@@ -22,7 +22,20 @@ dependencies = [
 dev = ["pytest"]
 
 [project.scripts]
-run-first-level = "fmri_first_level_proc.run_first_level:main"
+fmri-first-level-proc = "fmri_first_level_proc.run_first_level:main"
+run-first-level = "fmri_first_level_proc.run_first_level:_main_deprecated"
 
 [tool.setuptools.packages.find]
 include = ["fmri_first_level_proc*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "level0_unit: Pure-function unit tests",
+    "level1_internal_integration: Cross-function integration within a module",
+    "level2_tool_equivalence: Verify tool wrapper output matches known reference",
+    "level3_checkpoint: Checkpoint/resume round-trip",
+    "level4_stage_integration: Single pipeline stage end-to-end",
+    "level5_adversarial: Edge cases, malformed input, boundary conditions",
+    "level6_cross_stage: Multi-stage integration",
+    "level7_pipeline: Full pipeline end-to-end",
+]

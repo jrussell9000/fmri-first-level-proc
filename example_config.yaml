@@ -64,6 +64,7 @@ analyses:
     custom_hrf: null             # Required when hrf_model is "custom", e.g. "TENT(0,14,8)"
     include_motion_derivs: false # true = use first 12 columns (base + derivs); false = use first 6 columns only
     use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM) as additional regressors
+    scale_to_psc: true           # true = scale BOLD to percent signal change before regression (recommended)
 
     # -- Contrasts --
     # functions: null = disabled; list of equations = enabled
@@ -77,9 +78,7 @@ analyses:
 
     # -- Extraction --
     extraction:
-      extract: true              # true = enable extraction, false = skip
-      extract_labels: ["stimFear", "stimSad", "Fear-Neutral", "Sad-Neutral"]
-      extract_stat: "z"          # "z" | "t" | "r"
+      stat_buckets: ["Tstat", "Zstat"]  # list of stat types to extract as multi-sub-brick NIfTIs; valid: "Coef", "Tstat", "Fstat", "R^2", "Zstat"; null = disabled
       extract_out_file_pre: "subj001_nback_baseline_Shen368"
       extract_resids: false      # true = extract residuals as well as stats
       extract_raw_ptseries: false  # true = extract pre-regression parcellated time series (requires template_path and extract_out_file_pre)
@@ -115,6 +114,7 @@ analyses:
     custom_hrf: null             # Required when hrf_model is "custom", e.g. "TENT(0,14,8)"
     include_motion_derivs: false # true = use first 12 columns (base + derivs); false = use first 6 columns only
     use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM) as additional regressors
+    scale_to_psc: true           # true = scale BOLD to percent signal change before regression (recommended)
 
     # -- Extraction --
     extraction:
@@ -180,6 +180,7 @@ analyses:
     keep_run_res_dtseries: true  # true = keep all run-specific dtseries (false to save space)
     use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM/GS) as additional regressors
     use_sequenced_bandpass: false  # true = use sequenced denoising path (Ciric-inspired): NTRP-interpolate -> 3dBandpass -> regress (no -bandpass at regression). Opt in for high-motion data where bandpass-implied DOF cost is excessive.
+    scale_to_psc: true           # true = scale BOLD to percent signal change before regression (recommended)
 
     # -- Extraction --
     extraction:

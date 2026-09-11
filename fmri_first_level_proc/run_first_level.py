@@ -6,14 +6,14 @@
 # to the appropriate pipeline script's run() function.
 #
 # Usage:
-#   run-first-level --config my_study.yaml
-#   run-first-level --config my_study.yaml --dry-run
-#   run-first-level --config my_study.yaml --analyses 0 2
-#   run-first-level --config my_study.yaml --log-file run.log
+#   fmri-first-level-proc --config my_study.yaml
+#   fmri-first-level-proc --config my_study.yaml --dry-run
+#   fmri-first-level-proc --config my_study.yaml --analyses 0 2
+#   fmri-first-level-proc --config my_study.yaml --log-file run.log
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 2.5.0
-# Last updated: 05/01/26
+# Version: 3.1.0
+# Last updated: 09/11/26
 # ============================================================================
 """
 CLI entry point and dispatch runner for fmri_first_level_proc.
@@ -21,11 +21,24 @@ CLI entry point and dispatch runner for fmri_first_level_proc.
 Reads a YAML configuration file, validates it via first_level_config.load_and_validate,
 and dispatches each analysis block to the appropriate pipeline run() function.
 
+Exit codes
+----------
+0 : All analyses completed with no high-severity warnings.
+1 : Pipeline invariant violation (GuardError); indicates a bug.
+2 : Configuration or input error (ConfigError, InputError).
+3 : All analyses completed but one or more high-severity warnings were raised.
+4 : External tool unavailable, version mismatch, or failed (ToolUnavailableError, ToolVersionError, ToolExecutionError).
+5 : Model estimation failure (ModelError): singularity, insufficient DOF, etc.
+
 Public API
 ----------
-main()
-    CLI entry point registered as the ``run-first-level`` console script.
+main(cli_name)
+    CLI entry point registered as the ``fmri-first-level-proc`` console script.
     Parses --config, --dry-run, --analyses, and --log-file flags.
+
+_main_deprecated()
+    Deprecated alias for main() registered as the ``run-first-level`` console
+    script. Emits a CLI_DEPRECATED graded_warning before delegating.
 
 DISPATCH : dict
     Mapping from analysis type string (``"task_act"``, ``"task_conn"``,
@@ -34,42 +47,64 @@ DISPATCH : dict
 
 Usage (CLI)
 -----------
-    run-first-level --config my_study.yaml
-    run-first-level --config my_study.yaml --dry-run
-    run-first-level --config my_study.yaml --analyses 0 2
-    run-first-level --config my_study.yaml --log-file run.log
+    fmri-first-level-proc --config my_study.yaml
+    fmri-first-level-proc --config my_study.yaml --dry-run
+    fmri-first-level-proc --config my_study.yaml --analyses 0 2
+    fmri-first-level-proc --config my_study.yaml --log-file run.log
 
 Usage (Python)
 --------------
     from fmri_first_level_proc import load_and_validate, setup_logging, DISPATCH
 
     logger = setup_logging("my_analysis")
-    analyses = load_and_validate("my_config.yaml", logger)
-    for atype, ns, name in analyses:
-        DISPATCH[atype](ns, logger)
+    configs = load_and_validate("my_config.yaml", logger)
+    for config in configs:
+        result = DISPATCH[config.analysis_type](config, logger)
 """
 
+import subprocess
 import sys
 import time
-import shutil
 import argparse
+from pathlib import Path
 
-from .first_level_utils import setup_logging
+from .first_level_utils import setup_logging, graded_warning
 from .first_level_config import load_and_validate
+from .exceptions import (
+    ConfigError,
+    InputError,
+    ModelError,
+    GuardError,
+    ToolUnavailableError,
+    ToolVersionError,
+    ToolExecutionError,
+)
+from .runtime import preflight_tool_environments, probe_tool_versions
 
 from .task_act_first_level import run as run_task_act
 from .task_conn_first_level import run as run_task_conn
 from .rest_conn_first_level import run as run_rest_conn
 
-# Dispatch table
+# Dispatch table: analysis_type string -> pipeline run() function
 DISPATCH = {
     "task_act": run_task_act,
     "task_conn": run_task_conn,
     "rest_conn": run_rest_conn,
 }
 
-def main():
-    """CLI entrypoint: parse config, validate, and dispatch analysis blocks."""
+# Lockfile path resolved relative to repository root
+_LOCKFILE_PATH: Path = Path(__file__).parent.parent / "tools.lock.yaml"
+
+
+def main(cli_name: str = 'fmri-first-level-proc') -> None:
+    """CLI entry point: parse config, validate, preflight, and dispatch analysis blocks.
+
+    Parameters
+    ----------
+    cli_name:
+        Name of the invoked console script. Used to detect the deprecated
+        ``run-first-level`` alias and emit CLI_DEPRECATED graded_warning.
+    """
     parser = argparse.ArgumentParser(
         description="Run fMRI first-level analyses from a YAML config file."
     )
@@ -91,64 +126,100 @@ def main():
     )
 
     args = parser.parse_args()
-    logger = setup_logging("run_first_level", log_file=args.log_file)
+    logger = setup_logging('fmri_first_level_proc', log_file=args.log_file)
 
-    # Check that AFNI is available on PATH
-    if shutil.which("3dinfo") is None:
-        logger.error("AFNI not found on PATH. Install AFNI and ensure it is on your PATH before running.")
-        sys.exit(1)
+    if cli_name == 'run-first-level':
+        graded_warning(
+            logger, 'low', 'CLI_DEPRECATED',
+            'The "run-first-level" command is deprecated; use "fmri-first-level-proc" instead.',
+            user_facing=True,
+        )
 
-    # Load and validate config
-    logger.info("Loading config from %s", args.config)
-    analysis_list = load_and_validate(args.config, logger)
-    logger.info("Config validated: %d analysis block(s) found.", len(analysis_list))
+    try:
+        preflight_tool_environments(logger=logger)
+        if _LOCKFILE_PATH.exists():
+            probe_tool_versions(str(_LOCKFILE_PATH), logger=logger)
+        else:
+            graded_warning(
+                logger, 'low', 'LOCKFILE_ABSENT',
+                f"tools.lock.yaml not found at {_LOCKFILE_PATH}; skipping version pinning.",
+                user_facing=True,
+            )
 
-    # Filter to requested indices
-    if args.analyses is not None:
-        for idx in args.analyses:
-            if idx < 0 or idx >= len(analysis_list):
-                logger.error("--analyses index %d is out of range (0-%d).", idx, len(analysis_list) - 1)
-                sys.exit(1)
-        analysis_list = [(atype, ns, name) for i, (atype, ns, name) in enumerate(analysis_list) if i in args.analyses]
-        logger.info("Running %d selected analysis block(s).", len(analysis_list))
+        configs = load_and_validate(args.config, logger)
+        logger.info("Config validated: %d analysis block(s) found.", len(configs))
 
-    # Print analysis plan
-    logger.info("=" * 60)
-    logger.info("ANALYSIS PLAN")
-    logger.info("=" * 60)
-    for i, (atype, ns, name) in enumerate(analysis_list):
-        logger.info("  [%d] %s (type: %s)", i, name, atype)
-        logger.info("       out_dir: %s", ns.out_dir)
-        logger.info("       out_file_pre: %s", ns.out_file_pre)
-    logger.info("=" * 60)
+        if args.analyses is not None:
+            for idx in args.analyses:
+                if idx < 0 or idx >= len(configs):
+                    raise ConfigError(
+                        f"--analyses index {idx} is out of range (0-{len(configs) - 1})."
+                    )
+            selected = set(args.analyses)
+            configs = [c for i, c in enumerate(configs) if i in selected]
+            logger.info("Running %d selected analysis block(s).", len(configs))
 
-    if args.dry_run:
-        logger.info("Dry run complete. No analyses were executed.")
-        return
+        logger.info("=" * 60)
+        logger.info("ANALYSIS PLAN")
+        logger.info("=" * 60)
+        for i, config in enumerate(configs):
+            logger.info(
+                "  [%d] %s (type: %s)", i, config.analysis_name or "", config.analysis_type
+            )
+            logger.info("       out_dir: %s", config.out_dir)
+            logger.info("       out_file_pre: %s", config.out_file_pre)
+        logger.info("=" * 60)
 
-    # Execute each analysis block
-    start_time = time.time()
-    for i, (atype, ns, name) in enumerate(analysis_list):
-        logger.info("-" * 60)
-        logger.info("Starting analysis [%d]: %s (type: %s)", i, name, atype)
-        logger.info("-" * 60)
+        if args.dry_run:
+            logger.info("Dry run complete. No analyses were executed.")
+            return
 
-        run_fn = DISPATCH[atype]
-        block_start = time.time()
-        try:
-            run_fn(ns, logger)
-        except SystemExit as e:
-            if e.code != 0:
-                logger.error("Analysis [%d] '%s' failed. Stopping.", i, name)
-                sys.exit(1)
-        except Exception as e:
-            logger.error("Analysis [%d] '%s' raised an unexpected error: %s", i, name, e)
-            sys.exit(1)
+        start_time = time.time()
+        all_warnings: list[dict] = []
 
-        logger.info("Analysis [%d] '%s' completed in %.2f seconds.", i, name, time.time() - block_start)
+        for i, config in enumerate(configs):
+            logger.info("-" * 60)
+            logger.info(
+                "Starting analysis [%d]: %s (type: %s)",
+                i, config.analysis_name or "", config.analysis_type,
+            )
+            logger.info("-" * 60)
+            block_start = time.time()
+            result = DISPATCH[config.analysis_type](config, logger)
+            all_warnings.extend(result.warnings)
+            logger.info(
+                "Analysis [%d] '%s' completed in %.2f seconds.",
+                i, config.analysis_name or "", time.time() - block_start,
+            )
 
-    logger.info("=" * 60)
-    logger.info("All analyses completed successfully in %.2f seconds.", time.time() - start_time)
+        logger.info("=" * 60)
+        logger.info(
+            "All analyses completed in %.2f seconds.", time.time() - start_time
+        )
+
+        if any(w['severity'] == 'high' for w in all_warnings):
+            sys.exit(3)
+
+    except ConfigError as e:
+        logger.error(str(e)); sys.exit(2)
+    except InputError as e:
+        logger.error(str(e)); sys.exit(2)
+    except ModelError as e:
+        logger.error(str(e)); sys.exit(5)
+    except (ToolUnavailableError, ToolVersionError, ToolExecutionError) as e:
+        logger.error(str(e)); sys.exit(4)
+    except GuardError as e:
+        logger.critical(str(e)); sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        logger.error("Unexpected subprocess failure: %s", e); sys.exit(4)
+    except Exception as e:
+        logger.critical("Unexpected error: %s", e); sys.exit(1)
+
+
+def _main_deprecated() -> None:
+    """Deprecated CLI alias; delegates to main() with deprecation warning."""
+    main(cli_name='run-first-level')
+
 
 if __name__ == "__main__":
     main()

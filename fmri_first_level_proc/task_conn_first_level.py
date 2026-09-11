@@ -9,7 +9,7 @@
 # 5. (optional) Runs functional connectivity analysis for available beta series with AFNI's 3dNetCorr
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 2.5.0
+# Version: 3.0.0
 # Last updated: 05/01/26
 # ============================================================================
 '''
@@ -77,14 +77,15 @@ OUTPUTS:
 
 # Imports
 import copy
+import logging
 import os
-import sys
-import argparse
-import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from .exceptions import ConfigError, InputError, ModelError, ToolExecutionError
+from .first_level_config import ResolvedConfig
 from .first_level_utils import (
     setup_logging,
     dir_path_exists,
@@ -119,13 +120,19 @@ from .first_level_utils import (
     validate_extract_options,
     validate_connectivity_options,
     gen_min_outlier_epi,
+    scale_to_psc,
+    graded_warning,
+    get_warnings,
+    clear_warnings,
+    FirstLevelResult,
+    CENSOR_HIGH_THRESHOLD,
     HRF_DM_MODELS,
     HRF_IMPULSE_MODELS,
     HRF_DURATION_MODELS,
     VALID_HRF_MODELS,
 )
 
-def read_stim_data(args, logger):
+def read_stim_data(config: ResolvedConfig, logger):
     """Read and validate stimulus timing data for the task connectivity pipeline.
 
     Reads and validates the timing CSV without writing any onset files. Separating
@@ -135,25 +142,25 @@ def read_stim_data(args, logger):
 
     Parameters
     ----------
-    args : argparse.Namespace
+    config : ResolvedConfig
         Must include: task_timing_path, cond_beta_labels.
     logger : logging.Logger
 
     Returns
     -------
     pd.DataFrame
-        Sorted timing data with CONDITION, ONSET, DURATION columns.
+        Sorted timing data with trial_type, onset, duration columns (BIDS naming).
     """
-    return read_and_validate_stim_data(args.task_timing_path, args.cond_beta_labels, logger=logger)
+    return read_and_validate_stim_data(config.task_timing_path, config.cond_beta_labels, logger=logger)
 
 
-def write_stim_onset_files(stim_data, args, logger):
+def write_stim_onset_files(stim_data, config: ResolvedConfig, logger):
     """Write AFNI-format onset files for the task connectivity pipeline.
 
-    Must be called after trial-survival filtering so that args.cond_beta_labels
+    Must be called after trial-survival filtering so that config.cond_beta_labels
     reflects only surviving conditions. Conditions present in stim_data but NOT
-    in args.cond_beta_labels receive individual onset files (nuisance regressors
-    in 3dDeconvolve). Conditions IN args.cond_beta_labels are accumulated into a
+    in config.cond_beta_labels receive individual onset files (nuisance regressors
+    in 3dDeconvolve). Conditions IN config.cond_beta_labels are accumulated into a
     single combined onset file for 3dLSS (-stim_times_IM).
 
     The combined beta onset file accumulates trials in first-appearance order
@@ -164,8 +171,8 @@ def write_stim_onset_files(stim_data, args, logger):
     Parameters
     ----------
     stim_data : pd.DataFrame
-        Sorted timing data with CONDITION, ONSET, DURATION columns.
-    args : argparse.Namespace
+        Sorted timing data with trial_type, onset, duration columns (BIDS naming).
+    config : ResolvedConfig
         Must include: cond_beta_labels, out_dir, out_file_pre, hrf_model, custom_hrf.
     logger : logging.Logger
 
@@ -181,30 +188,30 @@ def write_stim_onset_files(stim_data, args, logger):
     beta_cond_order = []
 
     # Iterate conditions in first-appearance order (matches 3dLSS sub-brick layout)
-    for cond in stim_data['CONDITION'].unique():
-        cond_df = stim_data[stim_data['CONDITION'] == cond]
+    for cond in stim_data['trial_type'].unique():
+        cond_df = stim_data[stim_data['trial_type'] == cond]
 
         # Conditions not in cond_beta_labels become individual nuisance onset files
-        if cond not in args.cond_beta_labels:
-            onset_file = f"{args.out_dir}/{args.out_file_pre}_concat_{cond}_onsets.txt"
-            write_onset_file(cond_df, onset_file, args.hrf_model, args.custom_hrf, logger=logger)
+        if cond not in config.cond_beta_labels:
+            onset_file = f"{config.out_dir}/{config.out_file_pre}_concat_{cond}_onsets.txt"
+            write_onset_file(cond_df, onset_file, config.hrf_model, config.custom_hrf, logger=logger)
         # Beta conditions are accumulated into a single combined onset file
         else:
             if betas_onsets is None:
-                betas_onsets = list(cond_df['ONSET'])
-                betas_durations = list(cond_df['DURATION'])
+                betas_onsets = list(cond_df['onset'])
+                betas_durations = list(cond_df['duration'])
             else:
-                betas_onsets.extend(cond_df['ONSET'])
-                betas_durations.extend(cond_df['DURATION'])
+                betas_onsets.extend(cond_df['onset'])
+                betas_durations.extend(cond_df['duration'])
             beta_cond_order.append(cond)
 
-    betas_df = pd.DataFrame({'ONSET': betas_onsets, 'DURATION': betas_durations})
-    beta_onset_file = f"{args.out_dir}/{args.out_file_pre}_concat_beta_onsets.txt"
-    write_onset_file(betas_df, beta_onset_file, args.hrf_model, args.custom_hrf, logger=logger)
+    betas_df = pd.DataFrame({'onset': betas_onsets, 'duration': betas_durations})
+    beta_onset_file = f"{config.out_dir}/{config.out_file_pre}_concat_beta_onsets.txt"
+    write_onset_file(betas_df, beta_onset_file, config.hrf_model, config.custom_hrf, logger=logger)
 
     return beta_cond_order
 
-def gen_design_matrix(stim_data, args, logger):
+def gen_design_matrix(stim_data, config: ResolvedConfig, logger):
     """Build the 3dDeconvolve design matrix for LSS beta series estimation.
 
     Creates nuisance regressors for non-beta conditions and a combined -stim_times_IM
@@ -216,41 +223,41 @@ def gen_design_matrix(stim_data, args, logger):
     ----------
     stim_data : pd.DataFrame
         Timing data from read_stim_data.
-    args : argparse.Namespace
+    config : ResolvedConfig
         Must include: scan_path, censor_path, motion_path, CSF_path, WM_path,
         CSF_deriv_path (if use_tissue_derivs), out_dir, out_file_pre, hrf_model,
         custom_hrf, cond_beta_labels, num_cores, tr.
     logger : logging.Logger
     """
     # Check if output already exists
-    if not os.path.exists(f"{args.out_dir}/{args.out_file_pre}_concat_bseries_dmat.x1D"):
+    if not os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_bseries_dmat.x1D"):
 
         # Compute tissue signal derivatives if requested
         CSF_deriv_path = None
         WM_deriv_path = None
-        if args.use_tissue_derivs:
-            if args.CSF_path is not None:
-                CSF_deriv_path = compute_tissue_derivative(args.CSF_path, args.out_dir, args.out_file_pre, "CSF", logger)
-            if args.WM_path is not None:
-                WM_deriv_path = compute_tissue_derivative(args.WM_path, args.out_dir, args.out_file_pre, "WM", logger)
+        if config.use_tissue_derivs:
+            if config.CSF_path is not None:
+                CSF_deriv_path = compute_tissue_derivative(config.CSF_path, config.out_dir, config.out_file_pre, "CSF", logger)
+            if config.WM_path is not None:
+                WM_deriv_path = compute_tissue_derivative(config.WM_path, config.out_dir, config.out_file_pre, "WM", logger)
 
         # Set-up base command, including temporal detrending, frame censors, and motion regressors
-        decon_command = build_decon_base_command(args.scan_path, args.censor_path, args.motion_path,
-                                                 CSF_path=args.CSF_path, WM_path=args.WM_path,
+        decon_command = build_decon_base_command(config.scan_path, config.censor_path, config.motion_path,
+                                                 CSF_path=config.CSF_path, WM_path=config.WM_path,
                                                  CSF_deriv_path=CSF_deriv_path, WM_deriv_path=WM_deriv_path,
-                                                 tr=args.tr)
-        decon_command.extend(["-num_stimts", f"{1+len(stim_data['CONDITION'].unique())-len(args.cond_beta_labels)}"])
+                                                 tr=config.tr)
+        decon_command.extend(["-num_stimts", f"{1+len(stim_data['trial_type'].unique())-len(config.cond_beta_labels)}"])
 
         # Iteratively add stim timing for conditions NOT included in beta series
         stim_count = 1
-        for cond in stim_data['CONDITION'].unique():
-            if cond not in args.cond_beta_labels:
+        for cond in stim_data['trial_type'].unique():
+            if cond not in config.cond_beta_labels:
                 mean_dur = None
-                if args.hrf_model in HRF_DURATION_MODELS:
-                    mean_dur = np.mean(stim_data[stim_data['CONDITION'] == cond]['DURATION'])
-                hrf_string = build_hrf_string(args.hrf_model, mean_dur=mean_dur, custom_hrf=args.custom_hrf)
-                stim_flag = "-stim_times_AM1" if needs_married_timing(args.hrf_model, args.custom_hrf) else "-stim_times"
-                decon_command.extend([stim_flag, f"{stim_count}", f"{args.out_dir}/{args.out_file_pre}_concat_{cond}_onsets.txt",
+                if config.hrf_model in HRF_DURATION_MODELS:
+                    mean_dur = np.mean(stim_data[stim_data['trial_type'] == cond]['duration'])
+                hrf_string = build_hrf_string(config.hrf_model, mean_dur=mean_dur, custom_hrf=config.custom_hrf)
+                stim_flag = "-stim_times_AM1" if needs_married_timing(config.hrf_model, config.custom_hrf) else "-stim_times"
+                decon_command.extend([stim_flag, f"{stim_count}", f"{config.out_dir}/{config.out_file_pre}_concat_{cond}_onsets.txt",
                                      hrf_string, "-stim_label", f"{stim_count}", f"{cond}"])
                 stim_count += 1
 
@@ -258,30 +265,32 @@ def gen_design_matrix(stim_data, args, logger):
         # 3dLSS requires -stim_times_IM; config validation rejects married-timing
         # HRFs (e.g. dmBLOCK) that would require -stim_times_AM1.
         mean_dur = None
-        if args.hrf_model in HRF_DURATION_MODELS:
-            mean_dur = np.mean(stim_data[stim_data['CONDITION'].isin(args.cond_beta_labels)]['DURATION'])
-        hrf_string = build_hrf_string(args.hrf_model, mean_dur=mean_dur, custom_hrf=args.custom_hrf)
+        if config.hrf_model in HRF_DURATION_MODELS:
+            mean_dur = np.mean(stim_data[stim_data['trial_type'].isin(config.cond_beta_labels)]['duration'])
+        hrf_string = build_hrf_string(config.hrf_model, mean_dur=mean_dur, custom_hrf=config.custom_hrf)
         beta_stim_flag = "-stim_times_IM"
-        decon_command.extend([beta_stim_flag, f"{stim_count}", f"{args.out_dir}/{args.out_file_pre}_concat_beta_onsets.txt",
+        decon_command.extend([beta_stim_flag, f"{stim_count}", f"{config.out_dir}/{config.out_file_pre}_concat_beta_onsets.txt",
                               hrf_string, "-stim_label", f"{stim_count}", "beta_stims",
-                              "-x1D", f"{args.out_dir}/{args.out_file_pre}_concat_bseries_dmat.x1D",
-                              "-x1D_stop", "-nobucket", "-jobs", f"{args.num_cores}"])
+                              "-x1D", f"{config.out_dir}/{config.out_file_pre}_concat_bseries_dmat.x1D",
+                              "-x1D_stop", "-nobucket", "-jobs", f"{config.num_cores}"])
 
         # Run command and be sure we have output
         run_afni_command(decon_command, description="3dDeconvolve design matrix", logger=logger)
 
-        if os.path.exists(f"{args.out_dir}/{args.out_file_pre}_concat_bseries_dmat.x1D"):
-            logger.info("Successfully created design matrix %s_concat_bseries_dmat.x1D", args.out_file_pre)
+        if os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_bseries_dmat.x1D"):
+            logger.info("Successfully created design matrix %s_concat_bseries_dmat.x1D", config.out_file_pre)
         else:
-            logger.error("Failed to create design matrix %s_concat_bseries_dmat.x1D", args.out_file_pre)
-            sys.exit(1)
+            logger.error("Failed to create design matrix %s_concat_bseries_dmat.x1D", config.out_file_pre)
+            raise ToolExecutionError(
+                f"Failed to create design matrix {config.out_file_pre}_concat_bseries_dmat.x1D"
+            )
     else:
-        logger.info("Design matrix for %s already exists.", args.out_file_pre)
+        logger.info("Design matrix for %s already exists.", config.out_file_pre)
 
     # Remove err file that always seems to be output
-    clean_deconvolve_err(args.out_dir)
+    clean_deconvolve_err(config.out_dir)
 
-def gen_beta_series(stim_data, args, beta_cond_order, logger):
+def gen_beta_series(stim_data, config: ResolvedConfig, beta_cond_order, logger):
     """Generate the full-task LSS beta series and condition-specific beta volumes.
 
     Runs 3dLSS on the design matrix to produce the full-task beta series NIfTI
@@ -297,7 +306,7 @@ def gen_beta_series(stim_data, args, beta_cond_order, logger):
     ----------
     stim_data : pd.DataFrame
         Timing data from read_stim_data.
-    args : argparse.Namespace
+    config : ResolvedConfig
         Must include: out_dir, out_file_pre, scan_path, cond_beta_labels.
     beta_cond_order : list of str
         Conditions in the order their onsets were written to beta_onsets.txt
@@ -311,22 +320,24 @@ def gen_beta_series(stim_data, args, beta_cond_order, logger):
         condition-specific beta series.
     """
     # Check if full-task beta series already exists
-    if not os.path.exists(f"{args.out_dir}/{args.out_file_pre}_concat_LSS.nii.gz"):
+    if not os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_LSS.nii.gz"):
 
         # Build the 3dLSS command and create full-task beta series
-        lss_command = ["3dLSS", "-matrix", f"{args.out_dir}/{args.out_file_pre}_concat_bseries_dmat.x1D",
-                       "-input", f"{args.scan_path}",
-                       "-save1D", f"{args.out_dir}/{args.out_file_pre}_concat_LSS.1d",
-                       "-prefix", f"{args.out_dir}/{args.out_file_pre}_concat_LSS.nii.gz"]
+        lss_command = ["3dLSS", "-matrix", f"{config.out_dir}/{config.out_file_pre}_concat_bseries_dmat.x1D",
+                       "-input", f"{config.scan_path}",
+                       "-save1D", f"{config.out_dir}/{config.out_file_pre}_concat_LSS.1d",
+                       "-prefix", f"{config.out_dir}/{config.out_file_pre}_concat_LSS.nii.gz"]
         run_afni_command(lss_command, description="3dLSS beta series", logger=logger)
 
-        if os.path.exists(f"{args.out_dir}/{args.out_file_pre}_concat_LSS.nii.gz"):
-            logger.info("Successfully created full-task beta series for %s", args.out_file_pre)
+        if os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_LSS.nii.gz"):
+            logger.info("Successfully created full-task beta series for %s", config.out_file_pre)
         else:
-            logger.error("Failed to create full-task beta series for %s", args.out_file_pre)
-            sys.exit(1)
+            logger.error("Failed to create full-task beta series for %s", config.out_file_pre)
+            raise ToolExecutionError(
+                f"Failed to create full-task beta series for {config.out_file_pre}"
+            )
     else:
-        logger.info("%s/%s_concat_LSS.nii.gz already exists", args.out_dir, args.out_file_pre)
+        logger.info("%s/%s_concat_LSS.nii.gz already exists", config.out_dir, config.out_file_pre)
 
     # Iterate beta conditions in the exact order onsets were written to beta_onsets.txt.
     # This ensures total_used correctly maps to 3dLSS sub-brick indices.
@@ -335,10 +346,10 @@ def gen_beta_series(stim_data, args, beta_cond_order, logger):
     for curr_cond in beta_cond_order:
 
         # Get onset times for the condition
-        cond = stim_data[stim_data['CONDITION'] == curr_cond]['ONSET']
+        cond = stim_data[stim_data['trial_type'] == curr_cond]['onset']
 
         # Check if condition-specific beta series already exists
-        if not os.path.exists(f"{args.out_dir}/{args.out_file_pre}_concat_bseries_{curr_cond}.nii.gz"):
+        if not os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_bseries_{curr_cond}.nii.gz"):
 
             # Create condition index string
             calc_indices_str = "["
@@ -349,34 +360,36 @@ def gen_beta_series(stim_data, args, beta_cond_order, logger):
                     calc_indices_str = f"{calc_indices_str}{n+total_used}]"
 
             # Build the 3dcalc command and create task condition beta series
-            calc_command = ["3dcalc", "-a", f"{args.out_dir}/{args.out_file_pre}_concat_LSS.nii.gz{calc_indices_str}",
+            calc_command = ["3dcalc", "-a", f"{config.out_dir}/{config.out_file_pre}_concat_LSS.nii.gz{calc_indices_str}",
                             "-expr", "a",
-                            "-prefix", f"{args.out_dir}/{args.out_file_pre}_concat_bseries_{curr_cond}.nii.gz"]
+                            "-prefix", f"{config.out_dir}/{config.out_file_pre}_concat_bseries_{curr_cond}.nii.gz"]
             run_afni_command(calc_command, description=f"3dcalc beta series {curr_cond}", logger=logger)
 
-            if os.path.exists(f"{args.out_dir}/{args.out_file_pre}_concat_bseries_{curr_cond}.nii.gz"):
-                logger.info("Successfully created beta series %s_concat_bseries_%s.nii.gz", args.out_file_pre, curr_cond)
+            if os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_bseries_{curr_cond}.nii.gz"):
+                logger.info("Successfully created beta series %s_concat_bseries_%s.nii.gz", config.out_file_pre, curr_cond)
                 bseries_out['CONDITION'].append(curr_cond)
-                bseries_out["PATH"].append(f"{args.out_dir}/{args.out_file_pre}_concat_bseries_{curr_cond}.nii.gz")
+                bseries_out["PATH"].append(f"{config.out_dir}/{config.out_file_pre}_concat_bseries_{curr_cond}.nii.gz")
             else:
-                logger.warning("Failed to create beta series %s_concat_bseries_%s.nii.gz", args.out_file_pre, curr_cond)
+                logger.warning("Failed to create beta series %s_concat_bseries_%s.nii.gz", config.out_file_pre, curr_cond)
                 logger.warning("Continuing to see if beta series can be created for other task conditions.")
         else:
-            logger.info("Beta series %s_concat_bseries_%s.nii.gz already exists.", args.out_file_pre, curr_cond)
+            logger.info("Beta series %s_concat_bseries_%s.nii.gz already exists.", config.out_file_pre, curr_cond)
             bseries_out['CONDITION'].append(curr_cond)
-            bseries_out["PATH"].append(f"{args.out_dir}/{args.out_file_pre}_concat_bseries_{curr_cond}.nii.gz")
+            bseries_out["PATH"].append(f"{config.out_dir}/{config.out_file_pre}_concat_bseries_{curr_cond}.nii.gz")
 
         total_used += len(cond)
 
     # Something went wrong if our output is empty
     if len(bseries_out["CONDITION"]) == 0:
-        logger.error("Could not find or create any beta series for %s.", args.out_file_pre)
-        sys.exit(1)
+        logger.error("Could not find or create any beta series for %s.", config.out_file_pre)
+        raise ToolExecutionError(
+            f"Could not find or create any beta series for {config.out_file_pre}."
+        )
 
     # Return dictionary with those conditions for which we've successfully created beta series
     return bseries_out
 
-def gen_pbseries(bseries_info, args, logger):
+def gen_pbseries(bseries_info, config: ResolvedConfig, logger):
     """Extract ROI-level parcel beta series for each condition.
 
     For each condition with a beta series NIfTI, calls extract_roi_stats to
@@ -387,7 +400,7 @@ def gen_pbseries(bseries_info, args, logger):
     ----------
     bseries_info : dict
         {'CONDITION': list of str, 'PATH': list of str} from gen_beta_series.
-    args : argparse.Namespace
+    config : ResolvedConfig
         Must include: out_dir, extract_out_file_pre, template_path, average_type.
     logger : logging.Logger
     """
@@ -395,32 +408,34 @@ def gen_pbseries(bseries_info, args, logger):
     for i, cond in enumerate(bseries_info['CONDITION']):
 
         # Check if output already exists
-        if not os.path.exists(f"{args.out_dir}/{args.extract_out_file_pre}_pbseries_{cond}.csv"):
+        if not os.path.exists(f"{config.out_dir}/{config.extract_out_file_pre}_pbseries_{cond}.csv"):
 
-            new_df = extract_roi_stats(bseries_info['PATH'][i], args.template_path, args.average_type, logger=logger)
+            new_df = extract_roi_stats(bseries_info['PATH'][i], config.template_path, config.average_type, logger=logger)
 
             # Save pbseries
-            new_df.to_csv(f"{args.out_dir}/{args.extract_out_file_pre}_pbseries_{cond}.csv")
-            if os.path.exists(f"{args.out_dir}/{args.extract_out_file_pre}_pbseries_{cond}.csv"):
+            new_df.to_csv(f"{config.out_dir}/{config.extract_out_file_pre}_pbseries_{cond}.csv")
+            if os.path.exists(f"{config.out_dir}/{config.extract_out_file_pre}_pbseries_{cond}.csv"):
                 logger.info("Successfully extracted pbseries from %s using ROI template.", bseries_info['PATH'][i])
             else:
                 logger.error("Could not extract pbseries from %s using ROI template.", bseries_info['PATH'][i])
-                sys.exit(1)
+                raise InputError(
+                    f"Could not extract pbseries from {bseries_info['PATH'][i]} using ROI template."
+                )
         else:
-            logger.info("%s/%s_pbseries_%s.csv already exists (skipping).", args.out_dir, args.extract_out_file_pre, cond)
+            logger.info("%s/%s_pbseries_%s.csv already exists (skipping).", config.out_dir, config.extract_out_file_pre, cond)
 
-def gen_conn(bseries_info, args, logger):
+def gen_conn(bseries_info, config: ResolvedConfig, logger):
     """Compute condition-specific functional connectivity from task beta series.
 
     Iterates over each condition in bseries_info and dispatches to either
     parcellated_conn (ROI-to-ROI matrix) or seed_to_voxel_conn (whole-brain map)
-    based on args.calc_conn.
+    based on config.calc_conn.
 
     Parameters
     ----------
     bseries_info : dict
         {'CONDITION': list of str, 'PATH': list of str} from gen_beta_series.
-    args : argparse.Namespace
+    config : ResolvedConfig
         Must include: calc_conn, out_dir, conn_out_file_pre, template_path,
         fishZ, pcorr.
     logger : logging.Logger
@@ -429,30 +444,30 @@ def gen_conn(bseries_info, args, logger):
     for i, cond in enumerate(bseries_info['CONDITION']):
 
         # Run connectivity analyses based on the specified flavor
-        if args.calc_conn == "parcellated":
+        if config.calc_conn == "parcellated":
             parcellated_conn(
                 inset_path=bseries_info['PATH'][i],
-                out_dir=args.out_dir,
-                conn_out_file_pre=args.conn_out_file_pre,
-                template_path=args.template_path,
-                fishZ=args.fishZ,
-                pcorr=args.pcorr,
+                out_dir=config.out_dir,
+                conn_out_file_pre=config.conn_out_file_pre,
+                template_path=config.template_path,
+                fishZ=config.fishZ,
+                pcorr=config.pcorr,
                 condition=cond,
                 logger=logger,
             )
         else:
             seed_to_voxel_conn(
                 inset_path=bseries_info['PATH'][i],
-                out_dir=args.out_dir,
-                conn_out_file_pre=args.conn_out_file_pre,
-                template_path=args.template_path,
-                fishZ=args.fishZ,
-                pcorr=args.pcorr,
+                out_dir=config.out_dir,
+                conn_out_file_pre=config.conn_out_file_pre,
+                template_path=config.template_path,
+                fishZ=config.fishZ,
+                pcorr=config.pcorr,
                 condition=cond,
                 logger=logger,
             )
 
-def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, args, logger):
+def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, config: ResolvedConfig, logger):
     """Generate connectivity contrasts from condition-level connectivity outputs.
 
     For each contrast, validates that all referenced conditions have connectivity
@@ -467,8 +482,8 @@ def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, args, lo
         Output of valid_contrast_functions — list of {'COEFS': [...], 'CONDS': [...]}.
     contrast_labels : list of str
         User-specified labels for each contrast.
-    args : argparse.Namespace
-        Pipeline arguments (must include calc_conn, conn_out_file_pre, fishZ, pcorr, out_dir).
+    config : ResolvedConfig
+        Pipeline config (must include calc_conn, conn_out_file_pre, fishZ, pcorr, out_dir).
     logger : logging.Logger
     """
     available_conds = set(bseries_info['CONDITION'])
@@ -487,8 +502,8 @@ def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, args, lo
                 cond_conn_paths.append(None)
                 continue
             cond_path = build_conn_output_path(
-                args.out_dir, args.conn_out_file_pre, cond,
-                args.fishZ, args.pcorr, args.calc_conn)
+                config.out_dir, config.conn_out_file_pre, cond,
+                config.fishZ, config.pcorr, config.calc_conn)
             if not os.path.exists(cond_path):
                 missing.append(cond)
             cond_conn_paths.append(cond_path)
@@ -500,14 +515,14 @@ def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, args, lo
 
         # Build contrast output path
         contrast_conn_path = build_conn_output_path(
-            args.out_dir, args.conn_out_file_pre, safe_label,
-            args.fishZ, args.pcorr, args.calc_conn)
+            config.out_dir, config.conn_out_file_pre, safe_label,
+            config.fishZ, config.pcorr, config.calc_conn)
 
         if os.path.exists(contrast_conn_path):
             logger.info("Connectivity contrast '%s' already exists at %s.", label, contrast_conn_path)
             continue
 
-        if args.calc_conn == "parcellated":
+        if config.calc_conn == "parcellated":
             compute_matrix_contrast(cond_conn_paths, coefs, contrast_conn_path, logger)
             logger.info("Parcellated connectivity contrast '%s' saved to %s.", label, contrast_conn_path)
         else:
@@ -545,8 +560,8 @@ def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, args, lo
                 logger.error("Failed to create seed-to-voxel connectivity contrast '%s'.", label)
 
 
-def run(args, logger):
-    """Validate args and execute the task connectivity pipeline.
+def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLevelResult:
+    """Validate config and execute the task connectivity pipeline.
 
     Orchestrates the full task_conn pipeline in the following order:
     1. Validate extraction and connectivity arguments.
@@ -573,252 +588,266 @@ def run(args, logger):
     19. Optionally compute connectivity contrasts (gen_conn_contrasts).
     20. Write QC summary JSON.
 
-    Works from both the CLI (main()) and the config-driven dispatch runner
+    Works from the config-driven dispatch runner
     (run_first_level.py / DISPATCH["task_conn"]).
 
     Parameters
     ----------
-    args : argparse.Namespace
-        All pipeline arguments (see main() argparse block or first_level_config.py
-        build_namespace for the full attribute list).
-    logger : logging.Logger
-    """
-    args = copy.copy(args)
+    config : ResolvedConfig
+        All pipeline parameters (see first_level_config.py for the full attribute list).
+    logger : logging.Logger or None
+        If None, a default logger named 'task_conn_first_level' is created.
 
-    logger.info("Beta series will be created for the following task conditions: %s", args.cond_beta_labels)
+    Returns
+    -------
+    FirstLevelResult
+        Structured result with status, output_dir, warnings, qc_summary, and
+        output_files.
+    """
+    if logger is None:
+        logger = setup_logging("task_conn_first_level")
+
+    config = copy.copy(config)
+    clear_warnings()
+
+    logger.info("Beta series will be created for the following task conditions: %s", config.cond_beta_labels)
     logger.info("All other task conditions will be controlled for, but won't have betas modeled.")
-    log_hrf_model(args.hrf_model, args.custom_hrf, logger)
-    log_nuisance_model(args.CSF_path, args.WM_path, logger, use_tissue_derivs=args.use_tissue_derivs)
+    log_hrf_model(config.hrf_model, config.custom_hrf, logger)
+    log_nuisance_model(config.CSF_path, config.WM_path, logger, use_tissue_derivs=config.use_tissue_derivs)
 
     # If --remove_previous is provided, clear-out the output dir (before template
     # resampling or any other file creation in out_dir)
-    if args.remove_previous:
-        logger.info("Removing all files from previous analyses in %s (if they exist).", args.out_dir)
-        remove_files_from_dir(args.out_dir, logger=logger)
+    if config.remove_previous:
+        logger.info("Removing all files from previous analyses in %s (if they exist).", config.out_dir)
+        remove_files_from_dir(config.out_dir, logger=logger)
 
     # Make sure optional args exist if --extract_pbseries is provided
-    if args.extract_pbseries:
-        args.template_path = validate_extract_options(
-            "--extract_pbseries", args.average_type, args.extract_out_file_pre,
-            args.template_path, args.scan_path, args.out_dir, args.force_diff_atlas,
+    if config.extract_pbseries:
+        config.template_path = validate_extract_options(
+            "--extract_pbseries", config.average_type, config.extract_out_file_pre,
+            config.template_path, config.scan_path, config.out_dir, config.force_diff_atlas,
             logger=logger)
 
     # Make sure optional args exist if --calc_conn is provided
-    if args.calc_conn is not None:
-        args.template_path = validate_connectivity_options(
-            args.calc_conn, args.conn_out_file_pre, args.template_path,
-            args.scan_path, args.out_dir, args.force_diff_atlas,
+    if config.calc_conn is not None:
+        config.template_path = validate_connectivity_options(
+            config.calc_conn, config.conn_out_file_pre, config.template_path,
+            config.scan_path, config.out_dir, config.force_diff_atlas,
             data_label="task beta series", logger=logger)
     else:
         logger.info("Connectivity will not be output after generating task beta series.")
 
     # Extract pre-regression parcellated time series if requested
-    if getattr(args, 'extract_raw_ptseries', False):
-        if args.extract_out_file_pre is None:
+    if getattr(config, 'extract_raw_ptseries', False):
+        if config.extract_out_file_pre is None:
             logger.error("extract_raw_ptseries requires extract_out_file_pre to be set.")
-            sys.exit(1)
-        raw_out = os.path.join(args.out_dir, f"{args.extract_out_file_pre}_raw_ptseries.csv")
+            raise ConfigError("extract_raw_ptseries requires extract_out_file_pre to be set.")
+        raw_out = os.path.join(config.out_dir, f"{config.extract_out_file_pre}_raw_ptseries.csv")
         if not os.path.exists(raw_out):
-            if args.template_path is None:
+            if config.template_path is None:
                 logger.error("extract_raw_ptseries requires a valid template_path.")
-                sys.exit(1)
-            validated_tpl = validate_template(args.scan_path, args.template_path,
-                args.out_dir, args.force_diff_atlas, conn_type="extract", logger=logger)
-            raw_df = extract_roi_stats(args.scan_path, validated_tpl, args.average_type, logger=logger)
+                raise ConfigError("extract_raw_ptseries requires a valid template_path.")
+            validated_tpl = validate_template(config.scan_path, config.template_path,
+                config.out_dir, config.force_diff_atlas, conn_type="extract", logger=logger)
+            raw_df = extract_roi_stats(config.scan_path, validated_tpl, config.average_type, logger=logger)
             raw_df.to_csv(raw_out)
             if os.path.exists(raw_out):
                 logger.info("Extracted raw (pre-regression) ptseries to %s.", raw_out)
             else:
                 logger.error("Failed to extract raw ptseries.")
-                sys.exit(1)
+                raise ToolExecutionError("Failed to extract raw ptseries.")
         else:
             logger.info("Raw ptseries already exists: %s", raw_out)
 
     # ---------------------------------
 
     # Extract minimum-outlier representative EPI frame (mandatory, before regression)
-    gen_min_outlier_epi(args.scan_path, args.out_dir, args.out_file_pre, "", logger)
+    gen_min_outlier_epi(config.scan_path, config.out_dir, config.out_file_pre, "", logger)
+
+    # PSC scaling (after min-outlier EPI, before regression)
+    if config.scale_to_psc:
+        psc_path = scale_to_psc(
+            config.scan_path, config.out_dir, config.out_file_pre, "", logger)
+        config.scan_path = psc_path
 
     # Generate censor file from motion regressors (before prepare_motion_file overwrites path)
-    args.censor_path = create_censor_file(
-        args.motion_path, args.fd_threshold, args.censor_prev_tr,
-        args.out_dir, args.out_file_pre, "concat", logger)
+    config.censor_path = create_censor_file(
+        config.motion_path, config.fd_threshold, config.censor_prev_tr,
+        config.out_dir, config.out_file_pre, "concat", logger)
 
     # Validate and prepare motion regressors
-    use_cols = 12 if args.include_motion_derivs else 6
-    args.motion_path = prepare_motion_file(
-        args.motion_path, use_cols, args.out_dir, args.out_file_pre, "concat", logger)
+    use_cols = 12 if config.include_motion_derivs else 6
+    config.motion_path = prepare_motion_file(
+        config.motion_path, use_cols, config.out_dir, config.out_file_pre, "concat", logger)
 
 
 
     # Read and validate stimulus timing data (no file I/O yet)
-    stim_data = read_stim_data(args, logger)
+    stim_data = read_stim_data(config, logger)
 
     # Contrast-related checks
-    if args.contrast_labels is not None:
-        if args.contrast_functions is None:
+    if config.contrast_labels is not None:
+        if config.contrast_functions is None:
             logger.error("--contrast_functions must exist if --contrast_labels exist.")
-            sys.exit(1)
+            raise ConfigError("--contrast_functions must exist if --contrast_labels exist.")
     else:
-        if args.contrast_functions is not None:
+        if config.contrast_functions is not None:
             logger.error("--contrast_labels must exist if --contrast_functions exist.")
-            sys.exit(1)
+            raise ConfigError("--contrast_labels must exist if --contrast_functions exist.")
 
     # Per-condition trial survival QC
-    trial_survival = check_trial_survival(stim_data, args.cond_beta_labels, args.censor_path, args.tr, logger)
+    trial_survival = check_trial_survival(stim_data, config.cond_beta_labels, config.censor_path, config.tr, logger)
+
+    # Emit TRIALS_FEW warning for conditions with >=2 but <5 surviving trials
+    for cond, n_surviving in trial_survival.items():
+        if 2 <= n_surviving < 5:
+            msg = (
+                f"Condition '{cond}': only {n_surviving} trials survive censoring; "
+                "estimates may be unreliable due to low trial count."
+            )
+            graded_warning(logger, 'medium', 'TRIALS_FEW', msg, user_facing=True)
 
     # Filter conditions by survival (minimum 2 trials required for AFNI estimation)
-    original_conds = list(args.cond_beta_labels)
+    original_conds = list(config.cond_beta_labels)
 
     # Parse contrast functions using the full original condition list before any filtering.
     # parse-then-drop ensures cont["CONDS"] is a valid dict when the drop block iterates.
-    if args.contrast_functions is not None and args.contrast_labels is not None:
-        args.contrast_functions = valid_contrast_functions(
-            args.contrast_functions, args.contrast_labels,
+    if config.contrast_functions is not None and config.contrast_labels is not None:
+        config.contrast_functions = valid_contrast_functions(
+            config.contrast_functions, config.contrast_labels,
             original_conds, logger=logger)
 
-    args.cond_beta_labels = [c for c in original_conds if trial_survival.get(c, 0) >= 2]
-    dropped_conds = [c for c in original_conds if c not in args.cond_beta_labels]
+    config.cond_beta_labels = [c for c in original_conds if trial_survival.get(c, 0) >= 2]
+    dropped_conds = [c for c in original_conds if c not in config.cond_beta_labels]
 
     if dropped_conds:
-        logger.warning("The following conditions have insufficient surviving trials (< 2) and will be DROPPED: %s", dropped_conds)
+        for cond in dropped_conds:
+            n = trial_survival.get(cond, 0)
+            n_total = int(len(stim_data[stim_data['trial_type'] == cond]))
+            msg = (
+                f"Condition '{cond}' dropped: only {n} of {n_total} trials survive censoring "
+                "(minimum 2 required for reliable estimation)."
+            )
+            graded_warning(logger, 'medium', 'COND_DROPPED', msg, user_facing=True)
 
-    if not args.cond_beta_labels:
+    if not config.cond_beta_labels:
         logger.error("NO task conditions have sufficient surviving trials. Aborting analysis.")
-        sys.exit(1)
+        raise ModelError("NO task conditions have sufficient surviving trials. Aborting analysis.")
 
     # Update contrast functions if any conditions were dropped
-    if args.contrast_functions and dropped_conds:
+    if config.contrast_functions and dropped_conds:
         valid_contrasts = []
         valid_labels = []
-        for i, cont in enumerate(args.contrast_functions):
+        for i, cont in enumerate(config.contrast_functions):
             if any(c in dropped_conds for c in cont["CONDS"]):
-                logger.warning("Contrast '%s' depends on dropped conditions %s and will be SKIPPED.",
-                               args.contrast_labels[i], [c for c in cont["CONDS"] if c in dropped_conds])
+                dropped_in_contrast = [c for c in cont["CONDS"] if c in dropped_conds]
+                msg = (
+                    f"Contrast '{config.contrast_labels[i]}' depends on dropped conditions "
+                    f"{dropped_in_contrast} and will be SKIPPED."
+                )
+                graded_warning(logger, 'medium', 'CONTRAST_DROPPED', msg, user_facing=True)
             else:
                 valid_contrasts.append(cont)
-                valid_labels.append(args.contrast_labels[i])
-        args.contrast_functions = valid_contrasts
-        args.contrast_labels = valid_labels
+                valid_labels.append(config.contrast_labels[i])
+        config.contrast_functions = valid_contrasts
+        config.contrast_labels = valid_labels
 
     # Write onset files now that cond_beta_labels reflects only surviving conditions.
     # Dropped conditions receive individual nuisance onset files; surviving conditions
     # are accumulated into beta_onsets.txt in first-appearance order.
-    beta_cond_order = write_stim_onset_files(stim_data, args, logger)
+    beta_cond_order = write_stim_onset_files(stim_data, config, logger)
 
     # Pre-flight DOF check (conservative lower bound — actual per-trial regressors are higher)
-    n_regressors = use_cols + len(args.cond_beta_labels)
-    if args.CSF_path is not None:
+    n_regressors = use_cols + len(config.cond_beta_labels)
+    if config.CSF_path is not None:
         n_regressors += 1
-    if args.WM_path is not None:
+    if config.WM_path is not None:
         n_regressors += 1
-    if args.use_tissue_derivs:
-        if args.CSF_path is not None:
+    if config.use_tissue_derivs:
+        if config.CSF_path is not None:
             n_regressors += 1
-        if args.WM_path is not None:
+        if config.WM_path is not None:
             n_regressors += 1
-    dof = compute_dof(args.censor_path, n_regressors, logger)
+    dof = compute_dof(config.censor_path, n_regressors, logger, tr=config.tr)
 
     # Build QC summary data
     qc_data = {
         "analysis_type": "task_conn",
-        "hrf_model": args.hrf_model if args.hrf_model != "custom" else f"custom ({args.custom_hrf})",
-        "fd_threshold": args.fd_threshold,
-        "censor_prev_tr": args.censor_prev_tr,
+        "hrf_model": config.hrf_model if config.hrf_model != "custom" else f"custom ({config.custom_hrf})",
+        "fd_threshold": config.fd_threshold,
+        "censor_prev_tr": config.censor_prev_tr,
     }
     try:
-        censor_data = np.loadtxt(args.censor_path)
+        censor_data = np.loadtxt(config.censor_path)
         qc_data["n_trs_total"] = len(censor_data)
         qc_data["n_trs_censored"] = int(np.sum(censor_data == 0))
         qc_data["pct_censored"] = round(100.0 * qc_data["n_trs_censored"] / qc_data["n_trs_total"], 2) if qc_data["n_trs_total"] > 0 else 0.0
     except Exception:
         pass
-    qc_data["per_condition_trial_counts"] = {c: int(len(stim_data[stim_data['CONDITION'] == c])) for c in args.cond_beta_labels}
+    qc_data["per_condition_trial_counts"] = {c: int(len(stim_data[stim_data['trial_type'] == c])) for c in config.cond_beta_labels}
     qc_data["per_condition_surviving_trials"] = trial_survival
     qc_data["dof"] = dof
 
+    # Emit CENSOR_HIGH warning if censoring exceeds threshold
+    pct_censored = qc_data.get("pct_censored", 0.0)
+    if pct_censored > CENSOR_HIGH_THRESHOLD:
+        msg = (
+            f"Censoring exceeds {CENSOR_HIGH_THRESHOLD}%: {pct_censored}% of TRs censored "
+            f"({qc_data.get('n_trs_censored', 'N/A')} of {qc_data.get('n_trs_total', 'N/A')} TRs)."
+        )
+        graded_warning(logger, 'high', 'CENSOR_HIGH', msg, user_facing=True)
+
     # Generate task design matrix, including regressors for denoising, censoring, and stimulus timing
-    gen_design_matrix(stim_data, args, logger)
+    gen_design_matrix(stim_data, config, logger)
 
     # Generate full task beta-series and condition-specific beta series
-    bseries_out = gen_beta_series(stim_data, args, beta_cond_order, logger)
+    bseries_out = gen_beta_series(stim_data, config, beta_cond_order, logger)
 
     # Extract pbseries if user provided option
-    if args.extract_pbseries:
-        gen_pbseries(bseries_out, args, logger)
+    if config.extract_pbseries:
+        gen_pbseries(bseries_out, config, logger)
 
     # Generate connectivity from task beta-series if user provided option
-    if args.calc_conn is not None:
-        gen_conn(bseries_out, args, logger)
+    if config.calc_conn is not None:
+        gen_conn(bseries_out, config, logger)
 
-    # Connectivity contrasts (args.contrast_functions already parsed above)
-    if args.contrast_functions is not None and args.contrast_labels is not None:
-        if args.calc_conn is not None:
-            gen_conn_contrasts(bseries_out, args.contrast_functions, args.contrast_labels, args, logger)
-            qc_data["contrast_labels"] = args.contrast_labels
+    # Connectivity contrasts (config.contrast_functions already parsed above)
+    if config.contrast_functions is not None and config.contrast_labels is not None:
+        if config.calc_conn is not None:
+            gen_conn_contrasts(bseries_out, config.contrast_functions, config.contrast_labels, config, logger)
+            qc_data["contrast_labels"] = config.contrast_labels
         else:
             logger.warning("Contrasts specified but calc_conn is disabled — "
                            "connectivity contrasts require connectivity to be enabled. Skipping.")
 
     # Write QC summary
-    write_qc_summary(args.out_dir, args.out_file_pre, qc_data, logger)
+    write_qc_summary(config.out_dir, config.out_file_pre, qc_data, logger)
 
-def main():
-    """CLI entrypoint: parse --flags, call run()."""
+    # Collect deliverable output files
+    output_files: list[str] = []
+    psc_out = os.path.join(config.out_dir, f"{config.out_file_pre}_psc.nii.gz")
+    if os.path.exists(psc_out):
+        output_files.append(psc_out)
+    qc_path = os.path.join(config.out_dir, f"{config.out_file_pre}_qc_summary.json")
+    if os.path.exists(qc_path):
+        output_files.append(qc_path)
+    lss_path = f"{config.out_dir}/{config.out_file_pre}_concat_LSS.nii.gz"
+    if os.path.exists(lss_path):
+        output_files.append(lss_path)
+    dmat_path = f"{config.out_dir}/{config.out_file_pre}_concat_bseries_dmat.x1D"
+    if os.path.exists(dmat_path):
+        output_files.append(dmat_path)
+    for path in bseries_out.get("PATH", []):
+        if os.path.exists(path):
+            output_files.append(path)
 
-    # Start the timer
-    start_time = time.time()
+    # Determine final status
+    status = "warning" if any(w.get("severity") == "high" for w in get_warnings()) else "success"
 
-    # ---------------------------------
-    # Parse arguments
-    # ---------------------------------
-    parser = argparse.ArgumentParser()
-    # required:
-    parser.add_argument("--scan_path", type=file_path_exists, required=True)
-    parser.add_argument("--task_timing_path", type=file_path_exists, required=True)
-    parser.add_argument("--motion_path", type=file_path_exists, required=True)
-    parser.add_argument("--cond_beta_labels", type=valid_string_list, required=True)
-    parser.add_argument("--out_dir", type=dir_path_exists, required=True)
-    parser.add_argument("--out_file_pre", type=str, required=True)
-    parser.add_argument("--num_cores", type=int, required=True)
-    parser.add_argument("--fd_threshold", type=float, required=True,
-                        help="Framewise displacement threshold (mm) for motion censoring.")
-    parser.add_argument("--censor_prev_tr", action='store_true', default=False,
-                        help="Also censor the TR before each high-motion TR (default: False).")
-    parser.add_argument("--include_motion_derivs", action='store_true', default=False,
-                        help="Include temporal derivatives of motion regressors (12 columns instead of 6; default: False).")
-    parser.add_argument("--tr", type=float, required=True,
-                        help="Repetition time in seconds.")
-
-    # optional:
-    parser.add_argument("--hrf_model", type=str, choices=sorted(VALID_HRF_MODELS), default="GAM", required=False)
-    parser.add_argument("--custom_hrf", type=str, default=None, required=False)
-    parser.add_argument("--CSF_path", type=file_path_exists, default=None, required=False)
-    parser.add_argument("--WM_path", type=file_path_exists, default=None, required=False)
-    parser.add_argument("--remove_previous", action='store_true', required=False)
-    parser.add_argument("--extract_pbseries", action='store_true', required=False)
-    parser.add_argument("--average_type", type=valid_ave_type, required=False)
-    parser.add_argument("--extract_out_file_pre", type=str, required=False)
-    parser.add_argument("--calc_conn", type=valid_conn_type, required=False)
-    parser.add_argument("--conn_out_file_pre", type=str, required=False)
-    parser.add_argument("--template_path", type=file_path_exists, required=False)
-    parser.add_argument("--contrast_functions", type=valid_string_list, required=False)
-    parser.add_argument("--contrast_labels", type=valid_string_list, required=False)
-    parser.add_argument("--extract_raw_ptseries", action='store_true', default=False, required=False,
-                        help="Extract pre-regression parcellated time series (requires --template_path and --extract_out_file_pre).")
-    parser.add_argument("--force_diff_atlas", action='store_true', required=False)
-    parser.add_argument("--pcorr", action='store_true', required=False)
-    parser.add_argument("--fishZ", action='store_true', required=False)
-    parser.add_argument("--use_tissue_derivs", action='store_true', default=False, required=False,
-                        help="Include first temporal derivatives of tissue signals (CSF/WM) as additional nuisance regressors.")
-
-    args = parser.parse_args()
-    logger = setup_logging("task_conn_first_level")
-
-    run(args, logger)
-
-    # Display total runtime
-    logger.info("Total runtime: %.2f seconds", time.time() - start_time)
-
-if __name__ == "__main__":
-    main()
+    return FirstLevelResult(
+        status=status,
+        output_dir=Path(config.out_dir),
+        warnings=get_warnings(),
+        qc_summary=qc_data,
+        output_files=output_files,
+    )

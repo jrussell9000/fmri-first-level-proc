@@ -30,10 +30,10 @@ fmri_first_level_proc is a general-purpose, pip-installable framework for first-
 
 Development utilized **Claude Code** (Anthropic), employing two model tiers:
 
-| Model | Role | Tasks |
-|-------|------|-------|
-| Claude Opus 4 | Analytical and review | Critical review of statistical methods, brainstorming sessions, code quality audits, risk assessment, and architectural decisions |
-| Claude Sonnet 4 | Implementation | Code generation, test implementation, documentation drafting, and file management |
+| Model | Function | Tasks |
+|-------|----------|-------|
+| Claude Opus 4 / Opus 4.6 | Analytical and review | Critical review of statistical methods, brainstorming sessions, code quality audits, risk assessment, and architectural decisions |
+| Claude Sonnet 4 / Sonnet 4.6 / Sonnet 5 | Implementation | Code generation, test implementation, documentation drafting, and file management |
 
 This dual-model approach ensured that analytical depth (Opus) was applied to decisions with statistical or methodological consequences, while implementation efficiency (Sonnet) was used for well-specified coding tasks under explicit human direction.
 
@@ -49,7 +49,9 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 
 4. **Test** -- Comprehensive test suite development covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology).
 
-5. **Document** -- Authoring and updating of user-facing documentation and machine-readable technical specifications.
+5. **Clean** -- Code quality review for consistency, style, and maintainability.
+
+6. **Document** -- Authoring and updating of user-facing documentation and machine-readable technical specifications.
 
 Key properties of this workflow:
 
@@ -101,3 +103,4 @@ Raw session transcripts are excluded for privacy reasons. The structured reports
 - **v2.4.0** (2026-04-03): Added motion derivative degree configuration, mandatory minimum-outlier EPI generation, and optional pre-regression parcellated time series extraction. AID artifacts synced for all development cycles through v2.4.0.
 - **v2.4.0-post1** (2026-04-03): Fixed DOF pre-flight check in rest_conn that overestimated regressor count by 3 (stale polort 2 assumption after v2.3.1 changed to polort -1). Updated module docstring and inline comments. Added run_first_level module-level docstring and corrected its version header. Minor signature formatting in first_level_utils.
 - **v2.5.0** (2026-05-01): Added sequenced denoising path for resting-state connectivity (`use_sequenced_bandpass`). Implements Ciric et al. 2017 NTRP-interpolation and separate bandpass approach with Hallquist 2013 nuisance-filtering doctrine. New utility functions `censor_interpolate_1d_afni` and `bandpass_filter_1d_afni` added to first_level_utils. Config validation, test suite (55 new tests; 515 total passing), and documentation updated.
+- **v3.1.0** (2026-09-11): Major infrastructure and feature release. Infrastructure: custom exception hierarchy (`FmriFirstLevelError` base with 7 subclasses), 3-stage config pipeline with `ResolvedConfig` dataclass, BIDS derivative output path construction and multi-directory input discovery (`bids.py`), processing DAG with append-only JSONL checkpoint ledger (`checkpoint.py`), AFNI binary preflight and version-lock validation (`runtime.py`), centralized AFNI error wrapping, polort A DOF accounting, `tools.lock.yaml` resilience, and orchestrator harmonization. Features: graded warning accumulator (`get_warnings`/`clear_warnings`), `ToolVersionError` subclass, percent signal change scaling (`scale_to_psc` for all three pipeline types), `stat_buckets` extraction API replacing the legacy `extract`/`extract_stat` fields, `generate_bucket_stats_index` for sub-brick label indexing, and BIDS-format timing file acceptance with legacy CSV deprecation. Documentation: README.md, INPUT_SPECIFICATION.md, and AID artifacts updated.

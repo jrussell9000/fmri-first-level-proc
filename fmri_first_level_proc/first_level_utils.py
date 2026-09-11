@@ -5,7 +5,7 @@
 # Common functions used across task_act, task_conn, and rest_conn pipelines.
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 2.5.0
+# Version: 3.0.0
 # Last updated: 05/01/26
 # ============================================================================
 """
@@ -33,23 +33,65 @@ This module provides functions used by all three analysis pipelines
 - Seed-to-voxel and parcellated connectivity via 3dNetCorr
 """
 
+import argparse
+import dataclasses
 import json
 import os
 import re
 import sys
 import shutil
 import logging
-import argparse
 import subprocess
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from io import StringIO
+from .exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
 
 # ----------------------------------------------------------------------------
 # Censoring QC thresholds (warn only — never abort based on percentage)
 # ----------------------------------------------------------------------------
 CENSOR_WARN_THRESHOLD = 30.0    # % censored → warning
 CENSOR_HIGH_THRESHOLD = 50.0    # % censored → strong warning
+
+# Module-level warning accumulator (cross-pipeline contract)
+_WARNING_ACCUMULATOR: list[dict] = []
+
+
+def get_warnings() -> list[dict]:
+    """Return a shallow copy of the module-level warning accumulator."""
+    return list(_WARNING_ACCUMULATOR)
+
+
+def clear_warnings() -> None:
+    """Clear all accumulated warnings. Call at pipeline entry before dispatching."""
+    _WARNING_ACCUMULATOR.clear()
+
+
+@dataclasses.dataclass
+class FirstLevelResult:
+    """Structured result returned by each pipeline's run() function.
+
+    Attributes
+    ----------
+    status : str
+        ``'completed'`` on success.
+    output_dir : Path
+        Directory where output files were written.
+    warnings : list[dict]
+        Accumulated graded_warning records from the pipeline run.
+    qc_summary : dict
+        Quality-control metrics (written to the QC summary JSON).
+    output_files : list[str]
+        Paths to all files produced by the pipeline run.
+    """
+
+    status: str
+    output_dir: Path
+    warnings: list[dict]
+    qc_summary: dict
+    output_files: list[str]
 
 # ----------------------------------------------------------------------------
 # General Helpers
@@ -109,15 +151,12 @@ def prepare_motion_file(motion_path, use_columns, out_dir, out_prefix, label, lo
     try:
         data = np.loadtxt(motion_path)
     except Exception as e:
-        logger.error("Cannot read motion file '%s': %s", motion_path, e)
-        sys.exit(1)
+        raise InputError(f"Cannot read motion file '{motion_path}': {e}") from e
     if data.ndim == 1:
         data = data.reshape(-1, 1)
     ncols = data.shape[1]
     if ncols < use_columns:
-        logger.error("Motion file '%s' has %d columns, expected >= %d.",
-                     motion_path, ncols, use_columns)
-        sys.exit(1)
+        raise InputError(f"Motion file '{motion_path}' has {ncols} columns, expected >= {use_columns}.")
     # Truncate to requested columns
     truncated = data[:, :use_columns]
     prepared_path = os.path.join(out_dir, f"{out_prefix}_{label}_motion_prepared.1D")
@@ -169,13 +208,13 @@ def valid_conn_type(conn_string):
         )
     return conn_string
 
-def setup_logging(script_name, log_file=None):
+def setup_logging(name: str, log_file: str | None = None) -> logging.Logger:
     """
     Configure and return a logger with console output (and optional file output).
 
     Parameters
     ----------
-    script_name : str
+    name : str
         Name used in log format, e.g. "task_act_first_level".
     log_file : str, optional
         Path to a log file. If provided, logs are also written to this file.
@@ -184,7 +223,7 @@ def setup_logging(script_name, log_file=None):
     -------
     logging.Logger
     """
-    logger = logging.getLogger(script_name)
+    logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
 
     # Prevent duplicate handlers if called multiple times
@@ -192,12 +231,12 @@ def setup_logging(script_name, log_file=None):
         return logger
 
     fmt = logging.Formatter(
-        fmt="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
     )
 
-    # Console handler
-    ch = logging.StreamHandler(sys.stdout)
+    # Console handler (stderr to keep stdout clean for piped output)
+    ch = logging.StreamHandler(sys.stderr)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
@@ -210,6 +249,56 @@ def setup_logging(script_name, log_file=None):
         logger.addHandler(fh)
 
     return logger
+
+
+def graded_warning(
+    logger: logging.Logger,
+    severity: str,
+    code: str,
+    message: str,
+    *,
+    user_facing: bool = False,
+) -> dict:
+    """
+    Emit a graded warning and return a structured record for accumulation.
+
+    Parameters
+    ----------
+    logger : logging.Logger
+        Logger instance to use for emission.
+    severity : str
+        One of 'low', 'medium', or 'high'. High-severity warnings trigger
+        exit code 3 when accumulated in FirstLevelResult.warnings.
+    code : str
+        Machine-readable warning code (e.g. 'W001_MISSING_RUNS').
+    message : str
+        Human-readable warning description.
+    user_facing : bool, optional
+        If True, log at WARNING level (visible on console). If False, log at
+        INFO level (written to file only when --log-file is provided).
+
+    Returns
+    -------
+    dict
+        {'severity': severity, 'code': code, 'message': message,
+         'user_facing': user_facing}
+
+    Notes
+    -----
+    Appends to the module-level _WARNING_ACCUMULATOR and returns the dict.
+    Pipeline entry points should call clear_warnings() at entry and
+    get_warnings() at FirstLevelResult construction.
+    """
+    level = logging.WARNING if user_facing else logging.INFO
+    logger.log(level, "[%s] %s", code, message)
+    record = {
+        "severity": severity,
+        "code": code,
+        "message": message,
+        "user_facing": user_facing,
+    }
+    _WARNING_ACCUMULATOR.append(record)
+    return record
 
 def validate_extract_options(extract_flag_name, average_type, extract_out_file_pre, template_path, scan_path, out_dir, force_diff_atlas, logger=None):
 
@@ -236,16 +325,13 @@ def validate_extract_options(extract_flag_name, average_type, extract_out_file_p
     _log = logger or logging.getLogger(__name__)
 
     if average_type is None:
-        _log.error("--average_type must be provided if %s is present.", extract_flag_name)
-        sys.exit(1)
+        raise ConfigError(f"--average_type must be provided if {extract_flag_name} is present.")
 
     if extract_out_file_pre is None:
-        _log.error("--extract_out_file_pre must be provided if %s is present.", extract_flag_name)
-        sys.exit(1)
+        raise ConfigError(f"--extract_out_file_pre must be provided if {extract_flag_name} is present.")
 
     if template_path is None:
-        _log.error("%s requires an ROI or ROI set (.nii) be provided to --template_path.", extract_flag_name)
-        sys.exit(1)
+        raise ConfigError(f"{extract_flag_name} requires an ROI or ROI set (.nii) be provided to --template_path.")
 
     return validate_template(scan_path, template_path, out_dir, force_diff_atlas,
                               conn_type="extract", logger=logger)
@@ -280,20 +366,17 @@ def validate_connectivity_options(calc_conn, conn_out_file_pre, template_path, s
         return template_path
 
     if conn_out_file_pre is None:
-        _log.error("--conn_out_file_pre must be provided if --calc_conn is present.")
-        sys.exit(1)
+        raise ConfigError("--conn_out_file_pre must be provided if --calc_conn is present.")
 
     if calc_conn == "parcellated":
         if template_path is None:
-            _log.error("--calc_conn '%s' requires an ROI set (.nii) be provided to --template_path.", calc_conn)
-            sys.exit(1)
+            raise ConfigError(f"--calc_conn '{calc_conn}' requires an ROI set (.nii) be provided to --template_path.")
         validated = validate_template(scan_path, template_path, out_dir, force_diff_atlas,
                                        conn_type="parcellated", logger=logger)
         _log.info("Calculating parcellated (ROI-based) connectivity matrices after generating %s.", data_label)
     else:
         if template_path is None:
-            _log.error("--calc_conn '%s' requires a seed ROI mask file (binary .nii) be provided to --template_path.", calc_conn)
-            sys.exit(1)
+            raise ConfigError(f"--calc_conn '{calc_conn}' requires a seed ROI mask file (binary .nii) be provided to --template_path.")
         validated = validate_template(scan_path, template_path, out_dir, force_diff_atlas,
                                        conn_type="seed_to_voxel", logger=logger)
         _log.info("Calculating seed-to-voxel whole-brain connectivity (.nii) after generating %s.", data_label)
@@ -305,8 +388,7 @@ def remove_files_from_dir(dir_string, logger=None):
     _log = logger or logging.getLogger(__name__)
     resolved = os.path.realpath(dir_string)
     if resolved == "/" or resolved == os.path.expanduser("~") or len(resolved) < 5:
-        _log.error("Refusing to clear dangerous path: '%s' (resolved: '%s').", dir_string, resolved)
-        sys.exit(1)
+        raise GuardError(f"Refusing to clear dangerous path: '{dir_string}' (resolved: '{resolved}').")
     if not os.path.isdir(dir_string):
         _log.warning("'%s' does not yet exist. --remove_previous will be ignored.", dir_string)
     else:
@@ -428,7 +510,7 @@ def build_hrf_string(hrf_model, mean_dur=None, custom_hrf=None):
     """Construct AFNI stim_times model string for the selected HRF."""
     if hrf_model == "custom":
         if not custom_hrf:
-            raise ValueError("custom_hrf is required when hrf_model='custom'")
+            raise ConfigError("custom_hrf is required when hrf_model='custom'")
         return custom_hrf
     if hrf_model == "GAM":
         return f"GAM(8.6,.547,{mean_dur})"
@@ -438,19 +520,27 @@ def build_hrf_string(hrf_model, mean_dur=None, custom_hrf=None):
         return "dmBLOCK(0)"
     if hrf_model == "SPMG1":
         return "SPMG1"
-    raise ValueError(f"Unknown hrf_model: {hrf_model}")
+    raise ConfigError(f"Unknown hrf_model: {hrf_model}")
 
 # ----------------------------------------------------------------------------
 # Stim Data & Onset File Helpers
 # ----------------------------------------------------------------------------
 
 def read_and_validate_stim_data(timing_path, cond_labels, logger=None):
-    """Read task timing CSV, validate columns, sort by onset, check conditions exist.
+    """Read task timing file (BIDS _events.tsv or legacy CSV), validate columns, sort by onset.
+
+    Detection is content-authoritative: the file extension determines the delimiter
+    (.tsv -> tab; .csv/other -> comma), then the header is inspected to classify the
+    format. BIDS format is identified by onset/duration/trial_type columns (case-
+    insensitive). Legacy CSV format is identified by ONSET/DURATION/CONDITION columns
+    (case-insensitive). A deprecation warning is emitted when legacy format is detected.
+    The returned DataFrame uses BIDS column names (onset, duration, trial_type) regardless
+    of the input format.
 
     Parameters
     ----------
     timing_path : str
-        Path to the timing CSV with CONDITION, ONSET, DURATION columns.
+        Path to the timing file. BIDS _events.tsv (preferred) or legacy CSV (deprecated).
     cond_labels : list of str
         Expected condition labels (must all exist in the timing file).
     logger : logging.Logger, optional
@@ -458,37 +548,78 @@ def read_and_validate_stim_data(timing_path, cond_labels, logger=None):
     Returns
     -------
     pd.DataFrame
-        Sorted by ONSET, reset index.
+        Sorted by onset, reset index. Columns use BIDS names: onset, duration, trial_type.
+
+    Raises
+    ------
+    InputError
+        If the file header does not match either known format, or if required condition
+        labels are absent from the timing file.
     """
     _log = logger or logging.getLogger(__name__)
 
-    stim_df = pd.read_csv(timing_path, sep=',')
-    stim_df.columns = stim_df.columns.str.strip()
+    # Determine delimiter from extension
+    ext = os.path.splitext(timing_path)[1].lower()
+    delimiter = '\t' if ext == '.tsv' else ','
 
-    for curr_col in ["CONDITION", "ONSET", "DURATION"]:
-        if curr_col not in stim_df.columns.to_list():
-            _log.error("Timing file did not contain necessary columns 'CONDITION', 'ONSET', and 'DURATION'")
-            sys.exit(1)
+    # Read header to detect format (content-authoritative)
+    try:
+        header_df = pd.read_csv(timing_path, sep=delimiter, nrows=0)
+    except Exception as e:
+        raise InputError(f"Cannot read timing file '{timing_path}': {e}") from e
+    cols_lower = [c.strip().lower() for c in header_df.columns]
 
-    sorted_df = stim_df.sort_values(by='ONSET', ascending=True)
+    bids_required = {'onset', 'duration', 'trial_type'}
+    legacy_required = {'condition', 'onset', 'duration'}
+
+    if bids_required.issubset(set(cols_lower)):
+        # BIDS format
+        stim_df = pd.read_csv(timing_path, sep=delimiter)
+        stim_df.columns = stim_df.columns.str.strip()
+        # Normalize to lower-case BIDS names for any mixed-case BIDS files
+        rename_map = {c: c.lower() for c in stim_df.columns if c.lower() in bids_required}
+        stim_df = stim_df.rename(columns=rename_map)
+    elif legacy_required.issubset(set(cols_lower)):
+        # Legacy CSV format — emit deprecation warning
+        graded_warning(
+            _log, 'low', 'EVENTS_LEGACY',
+            'Legacy CSV events format detected. Migrate to BIDS _events.tsv. '
+            'CSV support will be removed in version 4.0.0.',
+            user_facing=True,
+        )
+        stim_df = pd.read_csv(timing_path, sep=delimiter)
+        stim_df.columns = stim_df.columns.str.strip()
+        # Rename legacy columns to BIDS names (case-insensitive match)
+        col_map = {c: c.lower() for c in stim_df.columns if c.lower() in legacy_required}
+        stim_df = stim_df.rename(columns=col_map)
+        # CONDITION -> trial_type
+        if 'condition' in stim_df.columns:
+            stim_df = stim_df.rename(columns={'condition': 'trial_type'})
+    else:
+        raise InputError(
+            f"Timing file '{timing_path}' header does not match any known format. "
+            "Expected BIDS columns (onset, duration, trial_type) or legacy columns "
+            "(CONDITION, ONSET, DURATION). Found: " + str(list(header_df.columns))
+        )
+
+    sorted_df = stim_df.sort_values(by='onset', ascending=True)
 
     # Check conditions exist in the timing file
-    missing = [c for c in cond_labels if c not in sorted_df['CONDITION'].unique()]
+    missing = [c for c in cond_labels if c not in sorted_df['trial_type'].unique()]
     if missing:
-        _log.error("Task condition(s) not found in timing file: %s", missing)
-        sys.exit(1)
+        raise InputError(
+            f"Task condition(s) not found in timing file '{timing_path}': {missing}"
+        )
 
     # Check for conditions with too few trials
     for cond in cond_labels:
-        n_trials = len(sorted_df[sorted_df['CONDITION'] == cond])
+        n_trials = len(sorted_df[sorted_df['trial_type'] == cond])
         if n_trials == 0:
             _log.warning("Condition '%s' has 0 trials in the timing file. "
                        "Cannot create onset file for a condition with no events.", cond)
-            # sys.exit(1) - skipped for robustness
         elif n_trials < 2:
             _log.warning("Condition '%s' has only %d trial(s). At least 2 trials are required "
                        "for a reliable estimate.", cond, n_trials)
-            # sys.exit(1) - skipped for robustness
         elif n_trials < 3:
             _log.warning("Condition '%s' has only %d trial(s). Estimates may be unreliable.", cond, n_trials)
 
@@ -500,7 +631,8 @@ def write_onset_file(condition_df, filepath, hrf_model, custom_hrf=None, logger=
     Parameters
     ----------
     condition_df : pd.DataFrame
-        Must contain 'ONSET' column, and 'DURATION' if married timing needed.
+        Must contain 'onset' column, and 'duration' if married timing needed.
+        Expects BIDS column names (onset, duration, trial_type).
     filepath : str
         Output onset file path.
     hrf_model : str
@@ -525,10 +657,10 @@ def write_onset_file(condition_df, filepath, hrf_model, custom_hrf=None, logger=
     if married:
         with open(filepath, 'w') as f:
             for _, row in condition_df.iterrows():
-                f.write(f"{row['ONSET']}*{row['DURATION']}\n")
+                f.write(f"{row['onset']}*{row['duration']}\n")
     else:
         with open(filepath, 'w') as f:
-            for onset in condition_df['ONSET']:
+            for onset in condition_df['onset']:
                 f.write(f"{onset}\n")
     _log.info("Created %s", filepath)
     return True
@@ -586,8 +718,7 @@ def create_censor_file(motion_path, fd_threshold, censor_prev_tr, out_dir, out_p
         run_afni_command(cmd, description=f"1d_tool.py censor {label}", logger=logger)
 
         if not os.path.exists(censor_path):
-            logger.error("Expected censor file not found: %s", censor_path)
-            sys.exit(1)
+            raise ToolExecutionError(f"Expected censor file not found: {censor_path}")
 
     # Log count of censored TRs and warn at thresholds
     try:
@@ -619,7 +750,7 @@ def check_trial_survival(stim_df, cond_labels, censor_path, tr, logger):
     Parameters
     ----------
     stim_df : pd.DataFrame
-        Timing data with CONDITION and ONSET columns.
+        Timing data with trial_type and onset columns (BIDS column names).
     cond_labels : list of str
         Condition labels to check.
     censor_path : str
@@ -641,10 +772,10 @@ def check_trial_survival(stim_df, cond_labels, censor_path, tr, logger):
 
     survival = {}
     for cond in cond_labels:
-        cond_df = stim_df[stim_df['CONDITION'] == cond]
+        cond_df = stim_df[stim_df['trial_type'] == cond]
         n_total = len(cond_df)
         n_surviving = 0
-        for onset in cond_df['ONSET']:
+        for onset in cond_df['onset']:
             tr_idx = int(round(onset / tr))
             if 0 <= tr_idx < len(censor_data) and censor_data[tr_idx] == 1:
                 n_surviving += 1
@@ -716,16 +847,14 @@ def notch_filter_motion(motion_path, tr, stopband, out_dir, out_prefix, label, l
     run_afni_command(cmd, description=f"3dTproject notch filter {label}", logger=logger)
 
     if not os.path.exists(out_path):
-        logger.error("Expected notch-filtered motion file not found: %s", out_path)
-        sys.exit(1)
+        raise ToolExecutionError(f"Expected notch-filtered motion file not found: {out_path}")
 
     # Restore rows=TRs, cols=params orientation (3dTproject output is transposed)
     transposed_path = out_path + ".transposed.1D"
     transpose_cmd = ["1dtranspose", out_path, transposed_path]
     run_afni_command(transpose_cmd, description=f"1dtranspose notch filter {label}", logger=logger)
     if not os.path.exists(transposed_path):
-        logger.error("1dtranspose failed for notch-filtered motion: %s", out_path)
-        sys.exit(1)
+        raise ToolExecutionError(f"1dtranspose failed for notch-filtered motion: {out_path}")
     os.replace(transposed_path, out_path)
 
     logger.info("Notch-filtered motion parameters (rows=TRs, cols=params) saved to %s", out_path)
@@ -784,16 +913,14 @@ def censor_interpolate_1d_afni(input_path, tr, censor_path, out_dir, out_prefix,
     run_afni_command(cmd, description=f"3dTproject NTRP interpolate {label}", logger=logger)
 
     if not os.path.exists(out_path):
-        logger.error("Expected NTRP-interpolated 1D file not found: %s", out_path)
-        sys.exit(1)
+        raise ToolExecutionError(f"Expected NTRP-interpolated 1D file not found: {out_path}")
 
     # Restore rows=TRs, cols=cols orientation (3dTproject output is transposed)
     transposed_path = out_path + ".transposed.1D"
     transpose_cmd = ["1dtranspose", out_path, transposed_path]
     run_afni_command(transpose_cmd, description=f"1dtranspose interpolate {label}", logger=logger)
     if not os.path.exists(transposed_path):
-        logger.error("1dtranspose failed for interpolated 1D file: %s", out_path)
-        sys.exit(1)
+        raise ToolExecutionError(f"1dtranspose failed for interpolated 1D file: {out_path}")
     os.replace(transposed_path, out_path)
 
     logger.info("NTRP-interpolated 1D file (rows=TRs, cols=cols) saved to %s", out_path)
@@ -855,16 +982,14 @@ def bandpass_filter_1d_afni(input_path, tr, bandpass, out_dir, out_prefix, label
     run_afni_command(cmd, description=f"3dBandpass {label}", logger=logger)
 
     if not os.path.exists(out_path):
-        logger.error("Expected bandpass-filtered 1D file not found: %s", out_path)
-        sys.exit(1)
+        raise ToolExecutionError(f"Expected bandpass-filtered 1D file not found: {out_path}")
 
     # Restore rows=TRs, cols=cols orientation (3dBandpass output is transposed)
     transposed_path = out_path + ".transposed.1D"
     transpose_cmd = ["1dtranspose", out_path, transposed_path]
     run_afni_command(transpose_cmd, description=f"1dtranspose {label}", logger=logger)
     if not os.path.exists(transposed_path):
-        logger.error("1dtranspose failed for bandpass-filtered 1D file: %s", out_path)
-        sys.exit(1)
+        raise ToolExecutionError(f"1dtranspose failed for bandpass-filtered 1D file: {out_path}")
     os.replace(transposed_path, out_path)
 
     logger.info("Bandpass-filtered 1D file (rows=TRs, cols=cols) saved to %s", out_path)
@@ -897,11 +1022,9 @@ def compute_tissue_derivative(tissue_path, out_dir, out_prefix, tissue_label, lo
     try:
         data = np.loadtxt(tissue_path)
     except Exception as e:
-        logger.error("Cannot read tissue file '%s': %s", tissue_path, e)
-        sys.exit(1)
+        raise InputError(f"Cannot read tissue file '{tissue_path}': {e}") from e
     if data.ndim != 1:
-        logger.error("Tissue file '%s' must be single-column, got shape %s.", tissue_path, data.shape)
-        sys.exit(1)
+        raise InputError(f"Tissue file '{tissue_path}' must be single-column, got shape {data.shape}.")
     deriv = np.diff(data, prepend=data[0])
     deriv_path = os.path.join(out_dir, f"{out_prefix}_{tissue_label}_deriv.txt")
     np.savetxt(deriv_path, deriv, fmt="%.8f")
@@ -1006,8 +1129,9 @@ def run_afni_command(command, capture_output=False, description="", logger=None)
 
     Raises
     ------
-    subprocess.CalledProcessError
-        If the command exits with non-zero status.
+    ToolExecutionError
+        If the command exits with non-zero status. Message includes the
+        command, description, and stderr.
     """
     if logger:
         logger.debug("Running: %s", " ".join(command))
@@ -1032,7 +1156,7 @@ def run_afni_command(command, capture_output=False, description="", logger=None)
             msg += f"\n  stderr: {e.stderr.strip()}"
         if logger:
             logger.error(msg)
-        raise
+        raise ToolExecutionError(msg) from e
 
 def get_3dinfo_properties(nifti_path, logger=None):
     """
@@ -1058,7 +1182,7 @@ def get_3dinfo_properties(nifti_path, logger=None):
                 logger=logger,
             )
             props[key] = out.strip()
-        except subprocess.CalledProcessError:
+        except ToolExecutionError:
             if logger:
                 logger.error("Could not retrieve %s from %s with 3dinfo.", key, nifti_path)
             props[key] = None
@@ -1102,37 +1226,30 @@ def validate_template(scan_path, template_path, out_dir, force_diff_atlas, conn_
     # Get template properties
     tpl = get_3dinfo_properties(template_path, logger=logger)
     if any(v is None for v in tpl.values()):
-        _log.error("Could not get info from --template_path %s with AFNI's 3dinfo - please check your template.", template_path)
-        sys.exit(1)
+        raise InputError(f"Could not get info from --template_path {template_path} with AFNI's 3dinfo - please check your template.")
 
     # Validate ROI content via dmax
     try:
         dmax_val = float(tpl["dmax"])
         int_upper = int(dmax_val)
     except ValueError:
-        _log.error("Template provided to --template_path contained non-numeric data max value ('%s') - please check your template.", tpl["dmax"])
-        sys.exit(1)
+        raise GuardError(f"Template provided to --template_path contained non-numeric data max value ('{tpl['dmax']}') - please check your template.")
 
     if dmax_val != int_upper:
-        _log.error("Template provided to --template_path contained floats, and should only contain ints (ROI set or binary mask) - please check your template.")
-        sys.exit(1)
+        raise InputError("Template provided to --template_path contained floats, and should only contain ints (ROI set or binary mask) - please check your template.")
     if int_upper == 0:
-        _log.error("Template provided to --template_path contained no data - please check your template.")
-        sys.exit(1)
+        raise InputError("Template provided to --template_path contained no data - please check your template.")
 
     # conn_type-specific checks
     if conn_type == "parcellated" and int_upper < 2:
-        _log.error("Template provided to --template_path contained a binary mask. With --calc_conn 'parcellated', template must have at least 2 ROIs.")
-        sys.exit(1)
+        raise ConfigError("Template provided to --template_path contained a binary mask. With --calc_conn 'parcellated', template must have at least 2 ROIs.")
     if conn_type == "seed_to_voxel" and int_upper > 1:
-        _log.error("Template provided to --template_path contained an ROI set. With --calc_conn 'seed_to_voxel', template must be a binary mask for a single ROI.")
-        sys.exit(1)
+        raise ConfigError("Template provided to --template_path contained an ROI set. With --calc_conn 'seed_to_voxel', template must be a binary mask for a single ROI.")
 
     # Get scan properties
     scn = get_3dinfo_properties(scan_path, logger=logger)
     if any(v is None for v in [scn["space"], scn["orient"], scn["spacing"]]):
-        _log.error("Could not get info from --scan_path %s with AFNI's 3dinfo - please check your scan.", scan_path)
-        sys.exit(1)
+        raise InputError(f"Could not get info from --scan_path {scan_path} with AFNI's 3dinfo - please check your scan.")
 
     _log.info("Specs for scan %s and template %s", scan_path, template_path)
     _log.info("  orient template: %s | orient scan: %s", tpl["orient"], scn["orient"])
@@ -1144,8 +1261,7 @@ def validate_template(scan_path, template_path, out_dir, force_diff_atlas, conn_
         if force_diff_atlas:
             _log.warning("%s and %s are in different standard template spaces, but proceeding anyway with --force_diff_atlas.", scan_path, template_path)
         else:
-            _log.error("Atlas space mismatch between --scan_path %s and --template_path %s - scan and template must be registered to the same atlas.", scan_path, template_path)
-            sys.exit(1)
+            raise InputError(f"Atlas space mismatch between --scan_path {scan_path} and --template_path {template_path} - scan and template must be registered to the same atlas.")
 
     # Orientation / grid spacing check — resample if mismatch
     if tpl["orient"] != scn["orient"] or tpl["spacing"] != scn["spacing"]:
@@ -1168,22 +1284,17 @@ def validate_template(scan_path, template_path, out_dir, force_diff_atlas, conn_
                 os.remove(resampled_path)
 
         if needs_resample:
-            try:
-                run_afni_command(
-                    ["3dresample", "-master", scan_path, "-input", template_path,
-                     "-prefix", resampled_path],
-                    description="resample template to scan grid",
-                    logger=logger,
-                )
-            except subprocess.CalledProcessError:
-                _log.error("Could not resample --template_path %s. Please manually resample and try again.", template_path)
-                sys.exit(1)
+            run_afni_command(
+                ["3dresample", "-master", scan_path, "-input", template_path,
+                 "-prefix", resampled_path],
+                description="resample template to scan grid",
+                logger=logger,
+            )
 
             if os.path.exists(resampled_path):
                 _log.info("Successfully resampled template; saved to %s", resampled_path)
             else:
-                _log.error("Could not resample --template_path %s. Please manually resample and try again.", template_path)
-                sys.exit(1)
+                raise ToolExecutionError(f"Could not resample --template_path {template_path}. Please manually resample and try again.")
 
         return resampled_path
     else:
@@ -1210,18 +1321,14 @@ def extract_roi_stats(nifti_path, template_path, average_type, logger=None):
     """
     _log = logger or logging.getLogger(__name__)
 
-    try:
-        extract_cmd = ["3dROIstats", f"-nz{average_type}", "-1Dformat",
-                       "-mask", template_path, nifti_path]
-        extract_out = run_afni_command(
-            extract_cmd,
-            capture_output=True,
-            description=f"3dROIstats on {nifti_path}",
-            logger=logger,
-        )
-    except subprocess.CalledProcessError:
-        _log.error("Could not extract ROI stats from %s with template %s using AFNI's 3dROIstats.", nifti_path, template_path)
-        sys.exit(1)
+    extract_cmd = ["3dROIstats", f"-nz{average_type}", "-1Dformat",
+                   "-mask", template_path, nifti_path]
+    extract_out = run_afni_command(
+        extract_cmd,
+        capture_output=True,
+        description=f"3dROIstats on {nifti_path}",
+        logger=logger,
+    )
 
     # Parse the -1Dformat output.
     # Format: line 0 "#File\tSub-brick", line 1 = column headers,
@@ -1245,16 +1352,14 @@ def extract_roi_stats(nifti_path, template_path, average_type, logger=None):
             raise ValueError("No data lines found in 3dROIstats output")
         out_df = pd.DataFrame(rows, columns=headers)
     except (IndexError, ValueError) as e:
-        _log.error("Could not parse 3dROIstats output for %s: %s", nifti_path, e)
-        sys.exit(1)
+        raise GuardError(f"Could not parse 3dROIstats output for {nifti_path}: {e}") from e
 
     # Filter columns based on average type
     ave_type_flag = "NZMed" if average_type == "median" else "NZMean"
     cols_to_keep = [colname for colname in out_df.columns if ave_type_flag in colname]
 
     if len(cols_to_keep) == 0:
-        _log.error("No columns matching '%s' found in 3dROIstats output. Available columns: %s", ave_type_flag, list(out_df.columns))
-        sys.exit(1)
+        raise GuardError(f"No columns matching '{ave_type_flag}' found in 3dROIstats output. Available columns: {list(out_df.columns)}")
 
     new_df = out_df[cols_to_keep].copy()
     new_df.rename(
@@ -1313,19 +1418,16 @@ def gen_min_outlier_epi(scan_path, out_dir, out_file_pre, label, logger):
             toutcount_cmd, capture_output=True,
             description="3dToutcount min-outlier scan", logger=logger)
     except Exception as e:
-        logger.error("3dToutcount failed for %s: %s", scan_path, e)
-        sys.exit(1)
+        raise ToolExecutionError(f"3dToutcount failed for {scan_path}: {e}") from e
 
     # Parse outlier fractions (one float per TR)
     try:
         fractions = np.array([float(v) for v in toutcount_out.strip().split()])
     except (ValueError, AttributeError) as e:
-        logger.error("Could not parse 3dToutcount output for %s: %s", scan_path, e)
-        sys.exit(1)
+        raise GuardError(f"Could not parse 3dToutcount output for {scan_path}: {e}") from e
 
     if len(fractions) == 0:
-        logger.error("3dToutcount returned no data for %s.", scan_path)
-        sys.exit(1)
+        raise GuardError(f"3dToutcount returned no data for {scan_path}.")
 
     min_idx = int(np.argmin(fractions))
     logger.info("Min-outlier TR for %s: index %d (outlier fraction = %.6f).",
@@ -1336,16 +1438,73 @@ def gen_min_outlier_epi(scan_path, out_dir, out_file_pre, label, logger):
     try:
         run_afni_command(bucket_cmd, description="3dbucket min-outlier EPI", logger=logger)
     except Exception as e:
-        logger.error("3dbucket failed for %s[%d]: %s", scan_path, min_idx, e)
-        sys.exit(1)
+        raise ToolExecutionError(f"3dbucket failed for {scan_path}[{min_idx}]: {e}") from e
 
     if os.path.exists(out_path):
         logger.info("Successfully extracted min-outlier EPI: %s", out_path)
     else:
-        logger.error("Failed to create min-outlier EPI: %s", out_path)
-        sys.exit(1)
+        raise ToolExecutionError(f"Failed to create min-outlier EPI: {out_path}")
 
     return out_path
+
+
+def scale_to_psc(scan_path, out_dir, out_file_pre, label, logger):
+    """Scale a 4D NIfTI to percent signal change (PSC).
+
+    Computes the voxelwise temporal mean via 3dTstat, then divides each
+    voxel's time series by its mean and multiplies by 100, with a 200%
+    ceiling and zero-guard via step functions.
+
+    Parameters
+    ----------
+    scan_path : str
+        Path to the input 4D NIfTI.
+    out_dir : str
+        Output directory.
+    out_file_pre : str
+        Output filename prefix.
+    label : str
+        Descriptive label appended to filenames. Use "" for task pipelines
+        (single concatenated scan) or "run1", "run2", etc. for rest_conn.
+    logger : logging.Logger
+
+    Returns
+    -------
+    str
+        Path to the PSC-scaled 4D NIfTI.
+    """
+    if label:
+        mean_name = f"{out_file_pre}_{label}_mean.nii.gz"
+        psc_name = f"{out_file_pre}_{label}_psc.nii.gz"
+    else:
+        mean_name = f"{out_file_pre}_mean.nii.gz"
+        psc_name = f"{out_file_pre}_psc.nii.gz"
+    mean_path = os.path.join(out_dir, mean_name)
+    psc_path = os.path.join(out_dir, psc_name)
+
+    if os.path.exists(psc_path):
+        logger.info("PSC-scaled file already exists: %s", psc_path)
+        return psc_path
+
+    run_afni_command(
+        ["3dTstat", "-mean", "-prefix", mean_path, scan_path],
+        description="3dTstat temporal mean for PSC scaling",
+        logger=logger,
+    )
+
+    run_afni_command(
+        ["3dcalc",
+         "-a", scan_path,
+         "-b", mean_path,
+         "-expr", "min(200,a/b*100)*step(a)*step(b)",
+         "-prefix", psc_path],
+        description="3dcalc PSC scaling",
+        logger=logger,
+    )
+
+    logger.info("PSC-scaled scan written to %s", psc_path)
+    return psc_path
+
 
 # ----------------------------------------------------------------------------
 # QC Summary Output
@@ -1378,7 +1537,7 @@ def write_qc_summary(out_dir, out_file_pre, qc_data, logger):
         logger.warning("Could not write QC summary to %s: %s", qc_path, e)
 
 
-def compute_dof(censor_path, n_regressors, logger, exit_on_error=True):
+def compute_dof(censor_path, n_regressors, logger, tr=None):
     """Compute degrees of freedom from censor file and regressor count.
 
     Parameters
@@ -1388,21 +1547,30 @@ def compute_dof(censor_path, n_regressors, logger, exit_on_error=True):
     n_regressors : int
         Total number of regressors in the model.
     logger : logging.Logger
-    exit_on_error : bool, optional
-        If True (default), calls sys.exit(1) when DOF < 1.
-        If False, logs the error and returns the negative DOF value (used for
-        per-run DOF checks in rest_conn, where individual runs may be skipped
-        rather than aborting the entire pipeline).
+    tr : float or None, optional
+        Repetition time in seconds. When provided, the AFNI polort A
+        polynomial regressor count (1 + floor(duration / 150)) is computed
+        from the censor file length and added to n_regressors before the
+        DOF check. When None (default), no polort adjustment is applied.
 
     Returns
     -------
     int or None
-        Degrees of freedom (n_uncensored - n_regressors), or None if the
-        censor file could not be read.
+        Degrees of freedom (n_uncensored - adjusted_n_regressors), or None
+        if the censor file could not be read. When tr is provided, the
+        returned DOF accounts for the polort A adjustment.
+
+    Raises
+    ------
+    ModelError
+        If DOF < 1 (too many TRs censored and/or too many regressors).
     """
     try:
         censor_data = np.loadtxt(censor_path)
         n_uncensored = int(np.sum(censor_data == 1))
+        if tr is not None:
+            n_poly = 1 + int((len(censor_data) * tr) / 150.0)
+            n_regressors = n_regressors + n_poly
     except Exception:
         logger.warning("Could not read censor file for DOF check.")
         return None
@@ -1410,12 +1578,12 @@ def compute_dof(censor_path, n_regressors, logger, exit_on_error=True):
     logger.info("Estimated DOF: %d (uncensored TRs: %d, regressors: %d)",
                 dof, n_uncensored, n_regressors)
     if dof < 1:
-        logger.error("Insufficient degrees of freedom (DOF=%d). "
-                     "Too many TRs censored and/or too many regressors for AFNI "
-                     "to produce valid output. Consider relaxing the FD threshold "
-                     "or reducing the model complexity.", dof)
-        if exit_on_error:
-            sys.exit(1)
+        raise ModelError(
+            f"Insufficient degrees of freedom (DOF={dof}). "
+            "Too many TRs censored and/or too many regressors for AFNI "
+            "to produce valid output. Consider relaxing the FD threshold "
+            "or reducing the model complexity."
+        )
     return dof
 
 
@@ -1435,8 +1603,7 @@ def valid_contrast_functions(contrast_list, contrast_labs_list, cond_list, logge
 
     # Check that contrast_list and contrast_labs_list are same size
     if len(contrast_list) != len(contrast_labs_list):
-        logger.error("Every contrast in --contrast_functions must have a label in --contrast_labels")
-        sys.exit(1)
+        raise ConfigError("Every contrast in --contrast_functions must have a label in --contrast_labels")
 
     # Regex for a single term: optional sign, a numeric coefficient, *, condition name
     _TERM_RE = re.compile(r'([+-]?\d*\.?\d+)\*(\w+)')
@@ -1449,28 +1616,30 @@ def valid_contrast_functions(contrast_list, contrast_labs_list, cond_list, logge
         contrast = contrast.replace(" ", "")
 
         if not contrast:
-            logger.error("Empty contrast equation (original: '%s').", raw)
-            sys.exit(1)
+            raise ConfigError(f"Empty contrast equation (original: '{raw}').")
 
         # Validate the entire string matches the expected grammar
         if not _FULL_RE.match(contrast):
             # Provide a targeted diagnostic
             if '*' not in contrast:
-                logger.error("Contrast '%s' is missing coefficients. "
-                             "Every condition must have an explicit coefficient "
-                             "(e.g. '1*stimA-1*stimB', not 'stimA-stimB').", raw)
+                raise ConfigError(
+                    f"Contrast '{raw}' is missing coefficients. "
+                    "Every condition must have an explicit coefficient "
+                    "(e.g. '1*stimA-1*stimB', not 'stimA-stimB')."
+                )
             elif re.search(r'[*/]{2,}', contrast):
-                logger.error("Contrast '%s' has consecutive operators.", raw)
+                raise ConfigError(f"Contrast '{raw}' has consecutive operators.")
             elif contrast.endswith(('+', '-', '*')):
-                logger.error("Contrast '%s' has a trailing operator.", raw)
+                raise ConfigError(f"Contrast '{raw}' has a trailing operator.")
             elif re.search(r'[^+\-\d.*\w]', contrast):
                 bad = re.findall(r'[^+\-\d.*\w]', contrast)
-                logger.error("Contrast '%s' contains invalid characters: %s", raw, bad)
+                raise ConfigError(f"Contrast '{raw}' contains invalid characters: {bad}")
             else:
-                logger.error("Contrast '%s' could not be parsed. "
-                             "Expected format: coef*COND[+-coef*COND...] "
-                             "(e.g. '1*stimA-1*stimB').", raw)
-            sys.exit(1)
+                raise ConfigError(
+                    f"Contrast '{raw}' could not be parsed. "
+                    "Expected format: coef*COND[+-coef*COND...] "
+                    "(e.g. '1*stimA-1*stimB')."
+                )
 
         matches = _TERM_RE.findall(contrast)
 
@@ -1480,17 +1649,14 @@ def valid_contrast_functions(contrast_list, contrast_labs_list, cond_list, logge
         # Check all contrast conditions exist in cond_list
         for item in conds:
             if item not in cond_list:
-                logger.error("Contrast '%s' references condition '%s' which is not in --cond_labels (%s).",
-                             raw, item, cond_list)
-                sys.exit(1)
+                raise ConfigError(f"Contrast '{raw}' references condition '{item}' which is not in --cond_labels ({cond_list}).")
 
         # Validate coefficients are valid floats
         for item in coefs:
             try:
                 float(item)
             except ValueError:
-                logger.error("Contrast '%s' has invalid coefficient '%s'.", raw, item)
-                sys.exit(1)
+                raise ConfigError(f"Contrast '{raw}' has invalid coefficient '{item}'.")
 
         # Warn about zero coefficients (technically valid but likely a mistake)
         for coef, cond in zip(coefs, conds):
@@ -1581,7 +1747,7 @@ def compute_matrix_contrast(condition_matrix_paths, coefs, out_path, logger):
 
     Raises
     ------
-    SystemExit
+    InputError
         If matrices have mismatched dimensions or cannot be loaded.
     """
     matrices = []
@@ -1589,19 +1755,17 @@ def compute_matrix_contrast(condition_matrix_paths, coefs, out_path, logger):
         try:
             mat = np.loadtxt(path, delimiter='\t')
         except Exception as e:
-            logger.error("Could not load connectivity matrix '%s': %s", path, e)
-            sys.exit(1)
+            raise InputError(f"Could not load connectivity matrix '{path}': {e}") from e
         matrices.append(mat)
 
     # Validate all matrices have identical dimensions
     ref_shape = matrices[0].shape
     for i, mat in enumerate(matrices[1:], start=1):
         if mat.shape != ref_shape:
-            logger.error("Connectivity matrix dimension mismatch: '%s' has shape %s, "
-                         "expected %s (from '%s').",
-                         condition_matrix_paths[i], mat.shape,
-                         ref_shape, condition_matrix_paths[0])
-            sys.exit(1)
+            raise InputError(
+                f"Connectivity matrix dimension mismatch: '{condition_matrix_paths[i]}' has shape {mat.shape}, "
+                f"expected {ref_shape} (from '{condition_matrix_paths[0]}')."
+            )
 
     # Compute weighted linear combination
     result = np.zeros(ref_shape)
@@ -1682,7 +1846,7 @@ def seed_to_voxel_conn(inset_path, out_dir, conn_out_file_pre, template_path, fi
 
     try:
         run_afni_command(netCorr_command, description="3dNetCorr seed-to-voxel", logger=logger)
-    except subprocess.CalledProcessError:
+    except ToolExecutionError:
         _log.warning("Could not create functional connectivity for seed %s.", template_path)
         return
 
@@ -1843,7 +2007,7 @@ def parcellated_conn(inset_path, out_dir, conn_out_file_pre, template_path, fish
 
     try:
         run_afni_command(netCorr_command, description="3dNetCorr parcellated", logger=logger)
-    except subprocess.CalledProcessError:
+    except ToolExecutionError:
         _log.warning("Could not create functional connectivity for template %s.", template_path)
         return
 
@@ -1860,8 +2024,6 @@ def parcellated_conn(inset_path, out_dir, conn_out_file_pre, template_path, fish
             os.remove(netcc_file)
             _log.info("Parcellated functional connectivity matrix created for %s with ROIs from template %s.", prefix, template_path)
         else:
-            _log.error("Could not format functional connectivity for template %s. Likely an internal bug.", template_path)
-            sys.exit(1)
+            raise ToolExecutionError(f"Could not format functional connectivity for template {template_path}. Likely an internal bug.")
     else:
-        _log.error("Could not create functional connectivity for template %s.", template_path)
-        sys.exit(1)
+        raise ToolExecutionError(f"Could not create functional connectivity for template {template_path}.")
