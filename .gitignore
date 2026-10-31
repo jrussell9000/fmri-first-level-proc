@@ -11,12 +11,19 @@
 !INPUT_SPECIFICATION.md
 !fmri_first_level_proc/
 !fmri_first_level_proc/__init__.py
+!fmri_first_level_proc/bids.py
+!fmri_first_level_proc/checkpoint.py
+!fmri_first_level_proc/exceptions.py
 !fmri_first_level_proc/first_level_config.py
 !fmri_first_level_proc/first_level_utils.py
 !fmri_first_level_proc/rest_conn_first_level.py
 !fmri_first_level_proc/run_first_level.py
+!fmri_first_level_proc/runtime.py
 !fmri_first_level_proc/task_act_first_level.py
 !fmri_first_level_proc/task_conn_first_level.py
+
+# Tool version lockfile
+!tools.lock.yaml
 
 # AID Framework disclosure files
 !AID_LOG.md

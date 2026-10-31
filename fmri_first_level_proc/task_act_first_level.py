@@ -7,7 +7,7 @@
 # 3. (optional) Extract parcel-level/ROI activation with a provided template with AFNI's 3dROIstats
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 2.5.0
+# Version: 3.0.0
 # Last updated: 05/01/26
 # ============================================================================
 '''
@@ -73,21 +73,26 @@ OUTPUTS:
 
 # Imports
 import copy
+import json
+import logging
 import os
-import sys
 import subprocess
-import argparse
-import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from .exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
+from .first_level_config import ResolvedConfig
 from .first_level_utils import (
+    FirstLevelResult,
+    graded_warning,
+    get_warnings,
+    clear_warnings,
     setup_logging,
     dir_path_exists,
     file_path_exists,
     valid_string_list,
-    valid_stat_type,
     valid_ave_type,
     run_afni_command,
     validate_template,
@@ -109,6 +114,7 @@ from .first_level_utils import (
     compute_dof,
     valid_contrast_functions,
     gen_min_outlier_epi,
+    scale_to_psc,
     CENSOR_WARN_THRESHOLD,
     CENSOR_HIGH_THRESHOLD,
     HRF_DM_MODELS,
@@ -117,26 +123,11 @@ from .first_level_utils import (
     VALID_HRF_MODELS,
 )
 
-def valid_extract_labels(cond_labels, contrast_labels, extract_labels, logger=None):
-    """Validate that all extract_labels exist in cond_labels or contrast_labels.
+# Surviving trial count below which TRIALS_FEW warning is emitted (condition still included)
+_TRIALS_FEW_THRESHOLD = 10
 
-    Parameters
-    ----------
-    cond_labels : list of str
-        Task condition labels.
-    contrast_labels : list of str or None
-        Contrast labels (may be None if no contrasts are defined).
-    extract_labels : list of str
-        Labels to extract; each must match a condition or contrast label.
-    logger : logging.Logger, optional
-    """
-    combined = list(cond_labels) + (contrast_labels if contrast_labels else [])
-    for valid in extract_labels:
-        if valid not in combined:
-            logger.error("Every entry in --extract_labels must have an exact label in --contrast_labels or --cond_labels.")
-            sys.exit(1)
 
-def read_stim_data(args, logger):
+def read_stim_data(config: ResolvedConfig, logger: logging.Logger) -> pd.DataFrame:
     """Read and validate stimulus timing data for the task activation pipeline.
 
     Reads and validates the timing CSV without writing any onset files. Separating
@@ -146,41 +137,41 @@ def read_stim_data(args, logger):
 
     Parameters
     ----------
-    args : argparse.Namespace
+    config : ResolvedConfig
         Must include: task_timing_path, cond_labels.
     logger : logging.Logger
 
     Returns
     -------
     pd.DataFrame
-        Sorted timing data with CONDITION, ONSET, DURATION columns.
+        Sorted timing data with trial_type, onset, duration columns (BIDS naming).
     """
-    return read_and_validate_stim_data(args.task_timing_path, args.cond_labels, logger=logger)
+    return read_and_validate_stim_data(config.task_timing_path, config.cond_labels, logger=logger)
 
 
-def write_stim_onset_files(stim_data, args, logger):
+def write_stim_onset_files(stim_data: pd.DataFrame, config: ResolvedConfig, logger: logging.Logger) -> None:
     """Write per-condition AFNI onset files for the task activation pipeline.
 
-    Must be called after trial-survival filtering so that args.cond_labels reflects
+    Must be called after trial-survival filtering so that config.cond_labels reflects
     only surviving conditions. Writes one AFNI-format onset file per condition in
-    args.cond_labels (used as -stim_times inputs to 3dDeconvolve). Conditions present
-    in stim_data but not in args.cond_labels are silently ignored.
+    config.cond_labels (used as -stim_times inputs to 3dDeconvolve). Conditions present
+    in stim_data but not in config.cond_labels are silently ignored.
 
     Parameters
     ----------
     stim_data : pd.DataFrame
-        Sorted timing data with CONDITION, ONSET, DURATION columns.
-    args : argparse.Namespace
+        Sorted timing data with trial_type, onset, duration columns (BIDS naming).
+    config : ResolvedConfig
         Must include: cond_labels, out_dir, out_file_pre, hrf_model, custom_hrf.
     logger : logging.Logger
     """
-    for cond in stim_data['CONDITION'].unique():
-        cond_df = stim_data[stim_data['CONDITION'] == cond]
-        if cond in args.cond_labels:
-            onset_file = f"{args.out_dir}/{args.out_file_pre}_concat_{cond}_onsets.txt"
-            write_onset_file(cond_df, onset_file, args.hrf_model, args.custom_hrf, logger=logger)
+    for cond in stim_data['trial_type'].unique():
+        cond_df = stim_data[stim_data['trial_type'] == cond]
+        if cond in config.cond_labels:
+            onset_file = f"{config.out_dir}/{config.out_file_pre}_concat_{cond}_onsets.txt"
+            write_onset_file(cond_df, onset_file, config.hrf_model, config.custom_hrf, logger=logger)
 
-def run_first_level(stim_data, args, logger):
+def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: logging.Logger) -> None:
     """Execute the 3dDeconvolve activation first-level regression.
 
     Builds the full 3dDeconvolve command including nuisance regressors
@@ -193,101 +184,79 @@ def run_first_level(stim_data, args, logger):
     ----------
     stim_data : pd.DataFrame
         Timing data from read_stim_data.
-    args : argparse.Namespace
+    config : ResolvedConfig
         Must include: scan_path, censor_path, motion_path, CSF_path, WM_path,
         out_dir, out_file_pre, cond_labels, hrf_model, custom_hrf,
         contrast_functions, contrast_labels, num_cores, tr.
     logger : logging.Logger
+
+    Raises
+    ------
+    ToolExecutionError
+        If 3dDeconvolve fails or does not produce the expected bucket stats file.
     """
-    # Check if outputs exists
-    if not os.path.exists(f"{args.out_dir}/{args.out_file_pre}_concat_bucket_stats.nii.gz"):
+    # Check if outputs exist
+    if not os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"):
 
         # Compute tissue signal derivatives if requested
         CSF_deriv_path = None
         WM_deriv_path = None
-        if args.use_tissue_derivs:
-            if args.CSF_path is not None:
-                CSF_deriv_path = compute_tissue_derivative(args.CSF_path, args.out_dir, args.out_file_pre, "CSF", logger)
-            if args.WM_path is not None:
-                WM_deriv_path = compute_tissue_derivative(args.WM_path, args.out_dir, args.out_file_pre, "WM", logger)
+        if config.use_tissue_derivs:
+            if config.CSF_path is not None:
+                CSF_deriv_path = compute_tissue_derivative(config.CSF_path, config.out_dir, config.out_file_pre, "CSF", logger)
+            if config.WM_path is not None:
+                WM_deriv_path = compute_tissue_derivative(config.WM_path, config.out_dir, config.out_file_pre, "WM", logger)
 
         # Set-up base command, including temporal detrending, frame censors, and motion regressors
-        decon_command = build_decon_base_command(args.scan_path, args.censor_path, args.motion_path,
-                                                 CSF_path=args.CSF_path, WM_path=args.WM_path,
+        decon_command = build_decon_base_command(config.scan_path, config.censor_path, config.motion_path,
+                                                 CSF_path=config.CSF_path, WM_path=config.WM_path,
                                                  CSF_deriv_path=CSF_deriv_path, WM_deriv_path=WM_deriv_path,
-                                                 tr=args.tr)
-        decon_command.extend(["-num_stimts", f"{len(args.cond_labels)}"])
+                                                 tr=config.tr)
+        decon_command.extend(["-num_stimts", f"{len(config.cond_labels)}"])
 
         # Iteratively add stim timing for conditions
-        for i, cond in enumerate(args.cond_labels):
+        for i, cond in enumerate(config.cond_labels):
             # Compute mean duration for models that need it
             mean_dur = None
-            if args.hrf_model in HRF_DURATION_MODELS:
-                mean_dur = np.mean(stim_data[stim_data['CONDITION'] == cond]['DURATION'])
-            hrf_string = build_hrf_string(args.hrf_model, mean_dur=mean_dur, custom_hrf=args.custom_hrf)
+            if config.hrf_model in HRF_DURATION_MODELS:
+                mean_dur = np.mean(stim_data[stim_data['trial_type'] == cond]['duration'])
+            hrf_string = build_hrf_string(config.hrf_model, mean_dur=mean_dur, custom_hrf=config.custom_hrf)
 
             # dmBLOCK-family models require -stim_times_AM1 for married timing
-            stim_flag = "-stim_times_AM1" if needs_married_timing(args.hrf_model, args.custom_hrf) else "-stim_times"
-            decon_command.extend([stim_flag, f"{i+1}", f"{args.out_dir}/{args.out_file_pre}_concat_{cond}_onsets.txt",
+            stim_flag = "-stim_times_AM1" if needs_married_timing(config.hrf_model, config.custom_hrf) else "-stim_times"
+            decon_command.extend([stim_flag, f"{i+1}", f"{config.out_dir}/{config.out_file_pre}_concat_{cond}_onsets.txt",
                                  hrf_string, "-stim_label", f"{i+1}", f"{cond}"])
 
         # Iteratively add contrasts
-        if args.contrast_functions:
-            decon_command.extend(["-num_glt", str(len(args.contrast_functions))])
-            for ci, cont in enumerate(args.contrast_functions):
+        if config.contrast_functions:
+            decon_command.extend(["-num_glt", str(len(config.contrast_functions))])
+            for ci, cont in enumerate(config.contrast_functions):
                 sym_eq = "SYM: " + " ".join(
                     f"{coef}*{cond}" for coef, cond in zip(cont["COEFS"], cont["CONDS"])
                 )
                 decon_command.extend(["-gltsym", sym_eq,
-                                      "-glt_label", f"{ci+1}", f"{args.contrast_labels[ci]}"])
+                                      "-glt_label", f"{ci+1}", f"{config.contrast_labels[ci]}"])
 
         # Add statistics output
-        decon_command.extend(["-errts", f"{args.out_dir}/{args.out_file_pre}_concat_bucket_resids.nii.gz",
+        decon_command.extend(["-errts", f"{config.out_dir}/{config.out_file_pre}_concat_bucket_resids.nii.gz",
                               "-fout", "-rout", "-tout",
-                              "-bucket", f"{args.out_dir}/{args.out_file_pre}_concat_bucket_stats.nii.gz",
-                              "-jobs", f"{args.num_cores}"])
+                              "-bucket", f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz",
+                              "-jobs", f"{config.num_cores}"])
 
-        # Run command and be sure we have output
+        # Run command
         run_afni_command(decon_command, description="3dDeconvolve activation", logger=logger)
 
-        if os.path.exists(f"{args.out_dir}/{args.out_file_pre}_concat_bucket_stats.nii.gz"):
-            logger.info("Successfully created first level activation stats for %s", args.out_file_pre)
+        if os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"):
+            logger.info("Successfully created first level activation stats for %s", config.out_file_pre)
         else:
-            logger.error("Failed to create first level activation stats for %s", args.out_file_pre)
-            sys.exit(1)
+            raise ToolExecutionError(
+                f"3dDeconvolve did not produce bucket stats for {config.out_file_pre}."
+            )
     else:
-        logger.info("First level activation stats for %s already exists.", args.out_file_pre)
+        logger.info("First level activation stats for %s already exists.", config.out_file_pre)
 
     # Remove err file that always seems to be output
-    clean_deconvolve_err(args.out_dir)
-
-def _find_subbrik_index(bucket_split, cond_label, stat_suffix, logger=None):
-    """Find the sub-brick index for a condition and stat type in 3dinfo output.
-
-    Parameters
-    ----------
-    bucket_split : list of str
-        Output of ``3dinfo -subbrick_info``, split on whitespace.
-    cond_label : str
-        The condition or contrast label to match (e.g. ``"ave_negface-posface"``).
-    stat_suffix : str
-        The stat suffix to match (e.g. ``"Tstat"``, ``"Fstat"``).
-
-    Returns
-    -------
-    int or None
-        The sub-brick index, or None if not found.
-    """
-    for i, substr in enumerate(bucket_split):
-        if cond_label in substr and stat_suffix in substr:
-            try:
-                return int(bucket_split[i - 1][1:])
-            except (ValueError, IndexError):
-                if logger:
-                    logger.error("Could not parse sub-brick index for %s, %s", cond_label, stat_suffix)
-                return None
-    return None
-
+    clean_deconvolve_err(config.out_dir)
 
 def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
     """Get the statistical auxiliary parameters (e.g. DOF) for a sub-brick.
@@ -304,7 +273,7 @@ def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
             description="3dAttribute BRICK_STATAUX",
             logger=logger,
         )
-    except subprocess.CalledProcessError:
+    except ToolExecutionError:
         return []
 
     # BRICK_STATAUX format: pairs of (subbrik_index stat_type n_params param1 param2 ...)
@@ -325,132 +294,206 @@ def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
     return []
 
 
-def extract_effects(args, logger):
-    """Extract condition- or contrast-specific statistical maps from the bucket dataset.
-
-    For each label in extract_labels, locates the corresponding sub-brick in the
-    3dDeconvolve bucket stats NIfTI. Supports T-, F-, and Z-statistics; Z-stats are
-    obtained via T-to-Z conversion using 3dcalc's fitt_t2z() with DOF retrieved from
-    BRICK_STATAUX. Outputs either whole-brain NIfTIs (template_path='WB') or
-    parcel-averaged CSVs when a template is provided. Optionally extracts residuals
-    as a parcel-averaged CSV when extract_resids is enabled.
+def generate_bucket_stats_index(config: ResolvedConfig, logger: logging.Logger) -> str:
+    """Generate a JSON index mapping every sub-brick label in the bucket stats output to its 0-based index.
 
     Parameters
     ----------
-    args : argparse.Namespace
-        Must include: out_dir, out_file_pre, extract_labels, extract_stat,
-        extract_out_file_pre, template_path, average_type, extract_resids.
+    config : ResolvedConfig
+        Must include: out_dir, out_file_pre.
     logger : logging.Logger
+
+    Returns
+    -------
+    str
+        Path to the written index JSON file.
     """
-    bucket_path = f"{args.out_dir}/{args.out_file_pre}_concat_bucket_stats.nii.gz"
+    bucket_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"
+    index_path = os.path.join(
+        config.out_dir, f"{config.out_file_pre}_concat_bucket_stats_index.json")
 
-    # Get subbrik info from bucket stats dataset
-    try:
-        bucket_info = run_afni_command(
-            ['3dinfo', '-subbrick_info', bucket_path],
-            capture_output=True,
-            description="3dinfo subbrick_info",
-            logger=logger,
-        )
-    except subprocess.CalledProcessError:
-        logger.error("Could not open %s with AFNI's 3dinfo - check your first-level outputs.", bucket_path)
-        sys.exit(1)
+    if os.path.exists(index_path):
+        logger.info("Bucket stats index already exists: %s", index_path)
+        return index_path
 
+    info = run_afni_command(
+        ['3dinfo', '-label', bucket_path],
+        capture_output=True,
+        description="3dinfo label for bucket stats index",
+        logger=logger,
+    )
+    labels = [l.strip() for l in info.strip().split('|') if l.strip()]
+    index_map = {label: i for i, label in enumerate(labels)}
+
+    with open(index_path, "w") as f:
+        json.dump(index_map, f, indent=2)
+    logger.info("Wrote bucket stats index: %s", index_path)
+
+    return index_path
+
+
+def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list[str]:
+    """Extract stat-type-based bucket outputs from the 3dDeconvolve bucket dataset.
+
+    For each stat type in config.stat_buckets, this function:
+    1. Discovers all sub-bricks matching that stat type via 3dinfo -subbrick_info.
+    2. Extracts them into a single multi-sub-brick NIfTI via 3dbucket.
+    3. Writes a JSON index mapping condition/contrast labels to sub-brick indices.
+    4. When template_path is available and not 'WB', writes a parcellated CSV
+       (rows = conditions/contrasts, columns = ROIs).
+
+    For Zstat: finds Tstat sub-bricks, converts each to Z via 3dcalc fitt_t2z(),
+    then assembles the Z volumes into the bucket.
+
+    Parameters
+    ----------
+    config : ResolvedConfig
+        Must include: out_dir, out_file_pre, stat_buckets, extract_out_file_pre,
+        template_path, average_type, extract_resids.
+    logger : logging.Logger
+
+    Returns
+    -------
+    list[str]
+        Paths of all output files created.
+    """
+    bucket_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"
+    output_files = []
+
+    bucket_info = run_afni_command(
+        ['3dinfo', '-subbrick_info', bucket_path],
+        capture_output=True,
+        description="3dinfo subbrick_info for stat bucket extraction",
+        logger=logger,
+    )
     bucket_split = bucket_info.split()
 
-    # Determine whether T-to-Z conversion is needed.
-    # 3dDeconvolve outputs T-stats, not Z-stats. When extract_stat="z",
-    # we find the T-stat sub-brick and convert using fitt_t2z().
-    need_t2z = args.extract_stat == "z"
-    search_stat = "Tstat" if need_t2z else f"{args.extract_stat.upper()}stat"
+    available_stats = set()
+    for token in bucket_split:
+        for st in ("Coef", "Tstat", "Fstat", "R^2"):
+            if st in token:
+                available_stats.add(st)
+    if any("Tstat" in token for token in bucket_split):
+        available_stats.add("Zstat")
+    logger.info("Available stat types in bucket: %s", sorted(available_stats))
 
-    # Iterate effects to extract from bucket stats
-    for curr_cond in args.extract_labels:
+    for stat_type in config.stat_buckets:
+        search_stat = "Tstat" if stat_type == "Zstat" else stat_type
+        need_t2z = (stat_type == "Zstat")
 
-        out_csv = f"{args.out_dir}/{args.extract_out_file_pre}_{curr_cond}_{args.extract_stat}.csv"
-        out_nii = f"{args.out_dir}/{args.extract_out_file_pre}_{curr_cond}_{args.extract_stat}.nii.gz"
-
-        # Check if output for this effect already exists
-        if not os.path.exists(out_csv) and not os.path.exists(out_nii):
-
-            # Get the subbrik associated with the current effect and stat
-            out_sub_brik_indx = _find_subbrik_index(bucket_split, curr_cond, search_stat, logger=logger)
-            if out_sub_brik_indx is None:
-                logger.error("Could not find appropriate bucket subbrik for %s, %s in %s", curr_cond, search_stat, bucket_path)
-                sys.exit(1)
-
-            extract_vol = f"{bucket_path}[{out_sub_brik_indx}]"
-
-            # If Z-stats requested, convert T-stat sub-brick to Z using 3dcalc
-            if need_t2z:
-                aux_params = _get_subbrik_stat_aux(bucket_path, out_sub_brik_indx, logger=logger)
-                if not aux_params:
-                    logger.error("Could not retrieve DOF for sub-brick %d in %s; cannot convert T to Z.", out_sub_brik_indx, bucket_path)
-                    sys.exit(1)
-                dof = int(aux_params[0])
-                z_prefix = f"{args.out_dir}/{args.out_file_pre}_{curr_cond}_zconv_tmp.nii.gz"
-                calc_cmd = ["3dcalc", "-a", extract_vol,
-                            "-expr", f"fitt_t2z(a,{dof})",
-                            "-prefix", z_prefix]
+        matched = []
+        for i, token in enumerate(bucket_split):
+            if search_stat in token and "#" in token:
+                label_part = token.split("#")[0]
                 try:
-                    run_afni_command(calc_cmd, description=f"T-to-Z conversion for {curr_cond}", logger=logger)
-                except subprocess.CalledProcessError:
-                    logger.error("Failed to convert T to Z for %s.", curr_cond)
-                    sys.exit(1)
-                extract_vol = z_prefix
-                logger.info("Converted T-stat to Z-stat for %s (DOF=%d).", curr_cond, dof)
+                    idx = int(bucket_split[i - 1][1:])
+                    matched.append((label_part, idx))
+                except (ValueError, IndexError):
+                    continue
 
-            # If no template was given, output specific condition/stat bucket to its own nifti
-            if args.template_path == "WB":
+        if not matched:
+            logger.warning(
+                "No sub-bricks found for stat type '%s' in %s. Skipping.",
+                stat_type, bucket_path)
+            continue
 
-                if need_t2z:
-                    # Z volume already created as a standalone nifti; rename it
-                    os.rename(z_prefix, out_nii)
-                else:
-                    # Build the 3dcalc command and extract from the identified bucket subbrik
-                    calc_cmd = ["3dcalc", "-a", extract_vol,
-                                "-expr", "a", "-prefix", out_nii]
-                    try:
-                        run_afni_command(calc_cmd, description="3dcalc extract subbrik", logger=logger)
-                    except subprocess.CalledProcessError:
-                        pass
-                if not os.path.exists(out_nii):
-                    logger.error("Could not create %s from %s", out_nii, bucket_path)
-                    sys.exit(1)
+        logger.info("Found %d sub-bricks for stat type '%s': %s",
+                    len(matched), stat_type, [m[0] for m in matched])
 
-            # If a template was given, output average activation condition/stat bucket by ROI to .csv
+        bucket_out = os.path.join(
+            config.out_dir,
+            f"{config.extract_out_file_pre}_{stat_type}_bucket.nii.gz")
+        index_out = os.path.join(
+            config.out_dir,
+            f"{config.extract_out_file_pre}_{stat_type}_index.json")
+
+        if not os.path.exists(bucket_out):
+            if need_t2z:
+                z_vols = []
+                for label, idx in matched:
+                    aux_params = _get_subbrik_stat_aux(bucket_path, idx, logger=logger)
+                    if not aux_params:
+                        raise GuardError(
+                            f"Could not retrieve DOF for sub-brick {idx} ({label}) in "
+                            f"{bucket_path}; cannot convert T to Z.")
+                    dof = int(aux_params[0])
+                    z_tmp = os.path.join(
+                        config.out_dir,
+                        f"{config.out_file_pre}_{label}_zconv_tmp.nii.gz")
+                    run_afni_command(
+                        ["3dcalc", "-a", f"{bucket_path}[{idx}]",
+                         "-expr", f"fitt_t2z(a,{dof})",
+                         "-prefix", z_tmp],
+                        description=f"T-to-Z conversion for {label}",
+                        logger=logger)
+                    z_vols.append(z_tmp)
+
+                bucket_cmd = ["3dbucket", "-prefix", bucket_out] + z_vols
+                run_afni_command(bucket_cmd,
+                    description=f"3dbucket assemble {stat_type} bucket",
+                    logger=logger)
+
+                for zv in z_vols:
+                    if os.path.exists(zv):
+                        os.remove(zv)
             else:
-                new_act_df = extract_roi_stats(extract_vol, args.template_path, args.average_type, logger=logger)
-                new_act_df.rename(index={0: f"{args.extract_stat}"}, inplace=True)
+                sub_brik_selectors = [f"{bucket_path}[{idx}]" for _, idx in matched]
+                bucket_cmd = ["3dbucket", "-prefix", bucket_out] + sub_brik_selectors
+                run_afni_command(bucket_cmd,
+                    description=f"3dbucket extract {stat_type} bucket",
+                    logger=logger)
 
-                new_act_df.to_csv(out_csv)
-                if os.path.exists(out_csv):
-                    logger.info("Successfully extracted %s, %s using ROI template.", curr_cond, args.extract_stat)
-                else:
-                    logger.error("Could not extract %s, %s using ROI template.", curr_cond, args.extract_stat)
-                    sys.exit(1)
-
-                # Clean up temporary Z conversion file
-                if need_t2z and os.path.exists(z_prefix):
-                    os.remove(z_prefix)
+            if not os.path.exists(bucket_out):
+                raise ToolExecutionError(
+                    f"Failed to create {stat_type} bucket: {bucket_out}")
+            logger.info("Created %s bucket: %s", stat_type, bucket_out)
         else:
-            logger.info("%s/%s_%s_%s already exists (skipping).", args.out_dir, args.extract_out_file_pre, curr_cond, args.extract_stat)
+            logger.info("%s bucket already exists: %s", stat_type, bucket_out)
 
-    # Extract residuals from the template
-    if args.extract_resids:
-        resid_path = f"{args.out_dir}/{args.out_file_pre}_concat_bucket_resids.nii.gz"
-        new_resid_df = extract_roi_stats(resid_path, args.template_path, args.average_type, logger=logger)
-        new_resid_df.rename(index={0: f"{args.extract_stat}"}, inplace=True)
+        output_files.append(bucket_out)
 
-        new_resid_df.to_csv(f"{args.out_dir}/{args.extract_out_file_pre}_resids.csv")
-        if os.path.exists(f"{args.out_dir}/{args.extract_out_file_pre}_resids.csv"):
-            logger.info("Successfully extracted residuals using ROI template.")
-        else:
-            logger.error("Could not extract residuals using ROI template.")
-            sys.exit(1)
+        index_map = {label: i for i, (label, _) in enumerate(matched)}
+        with open(index_out, "w") as f:
+            json.dump(index_map, f, indent=2)
+        output_files.append(index_out)
+        logger.info("Wrote %s index: %s", stat_type, index_out)
 
-def run(args, logger):
-    """Validate args and execute the task activation pipeline.
+        if config.template_path is not None and config.template_path != "WB":
+            csv_out = os.path.join(
+                config.out_dir,
+                f"{config.extract_out_file_pre}_{stat_type}_parcellated.csv")
+            if not os.path.exists(csv_out):
+                rows = {}
+                for new_idx, (label, _) in enumerate(matched):
+                    roi_df = extract_roi_stats(
+                        f"{bucket_out}[{new_idx}]",
+                        config.template_path, config.average_type, logger=logger)
+                    rows[label] = roi_df.iloc[0]
+                parcellated_df = pd.DataFrame(rows).T
+                parcellated_df.index.name = "condition"
+                parcellated_df.to_csv(csv_out)
+                logger.info("Wrote %s parcellated CSV: %s", stat_type, csv_out)
+            else:
+                logger.info("%s parcellated CSV already exists: %s", stat_type, csv_out)
+            output_files.append(csv_out)
+
+    if config.extract_resids:
+        resid_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_resids.nii.gz"
+        resid_csv = f"{config.out_dir}/{config.extract_out_file_pre}_resids.csv"
+        if not os.path.exists(resid_csv):
+            resid_df = extract_roi_stats(
+                resid_path, config.template_path, config.average_type, logger=logger)
+            resid_df.to_csv(resid_csv)
+            if os.path.exists(resid_csv):
+                logger.info("Extracted residuals to %s", resid_csv)
+            else:
+                raise ToolExecutionError("Could not extract residuals using ROI template.")
+        output_files.append(resid_csv)
+
+    return output_files
+
+def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLevelResult:
+    """Validate config and execute the task activation pipeline.
 
     Orchestrates the full task_act pipeline in the following order:
     1. Validate contrast and extraction arguments.
@@ -462,255 +505,274 @@ def run(args, logger):
     7. Prepare motion regressors (truncate to required columns).
     8. Read and validate stimulus timing data (read_stim_data).
     9. Check per-condition trial survival after censoring.
-    10. Filter conditions with fewer than 2 surviving trials (warn and drop).
-    11. Drop contrasts/extractions that reference dropped conditions.
-    12. Write per-condition AFNI onset files (write_stim_onset_files).
-    13. Pre-flight DOF check.
-    14. Run 3dDeconvolve GLM (run_first_level).
-    15. Optionally extract condition/contrast-specific stat maps (extract_effects).
-    16. Write QC summary JSON.
+    10. Warn for conditions with few surviving trials (TRIALS_FEW).
+    11. Filter conditions with fewer than 2 surviving trials (warn COND_DROPPED and drop).
+    12. Drop contrasts/extractions that reference dropped conditions (warn CONTRAST_DROPPED / EXTRACT_DROPPED).
+    13. Write per-condition AFNI onset files (write_stim_onset_files).
+    14. Pre-flight DOF check.
+    15. Warn if overall censoring rate exceeds CENSOR_HIGH_THRESHOLD (CENSOR_HIGH).
+    16. Run 3dDeconvolve GLM (run_first_level).
+    17. Optionally extract stat-type-based bucket outputs (extract_stat_buckets).
+    18. Write QC summary JSON.
+    19. Return FirstLevelResult with status, warnings, qc_summary, and output_files.
 
-    Works from both the CLI (main()) and the config-driven dispatch runner
+    Works from the config-driven dispatch runner
     (run_first_level.py / DISPATCH["task_act"]).
 
     Parameters
     ----------
-    args : argparse.Namespace
-        All pipeline arguments (see main() argparse block or first_level_config.py
-        build_namespace for the full attribute list).
-    logger : logging.Logger
-    """
-    args = copy.copy(args)
+    config : ResolvedConfig
+        All pipeline parameters (see first_level_config.py ResolvedConfig for
+        the full attribute list).
+    logger : logging.Logger or None, optional
+        Logger instance. A default logger is created if None is provided.
 
-    logger.info("First-level regression will use the following task conditions: %s", args.cond_labels)
+    Returns
+    -------
+    FirstLevelResult
+        Structured result with status ('success' or 'warning'),
+        output_dir, accumulated graded warnings, qc_summary dict, and
+        list of output file paths.
+
+    Raises
+    ------
+    ConfigError
+        On invalid or incompatible configuration options.
+    InputError
+        If an expected output file is not found after a write step.
+    ModelError
+        If all conditions are dropped due to insufficient surviving trials.
+    ToolExecutionError
+        If an AFNI command fails or does not produce its expected output.
+    GuardError
+        If a pipeline invariant is violated (e.g. unexpected sub-brick state).
+    """
+    if logger is None:
+        logger = setup_logging("task_act_first_level")
+
+    config = copy.copy(config)
+    clear_warnings()
+
+    logger.info("First-level regression will use the following task conditions: %s", config.cond_labels)
     logger.info("All other task conditions will not be modeled.")
-    log_hrf_model(args.hrf_model, args.custom_hrf, logger)
-    log_nuisance_model(args.CSF_path, args.WM_path, logger, use_tissue_derivs=args.use_tissue_derivs)
+    log_hrf_model(config.hrf_model, config.custom_hrf, logger)
+    log_nuisance_model(config.CSF_path, config.WM_path, logger, use_tissue_derivs=config.use_tissue_derivs)
 
     # Contrast-related checks
-    if args.contrast_labels is not None:
-        if args.contrast_functions is None:
-            logger.error("--contrast_functions must exist if --contrast_labels exist.")
-            sys.exit(1)
+    if config.contrast_labels is not None:
+        if config.contrast_functions is None:
+            raise ConfigError("contrast_functions must exist if contrast_labels exist.")
     else:
-        if args.contrast_functions is not None:
-            logger.error("--contrast_labels must exist if --contrast_functions exist.")
-            sys.exit(1)
-    if args.contrast_functions is not None and args.contrast_labels is not None:
-        args.contrast_functions = valid_contrast_functions(args.contrast_functions, args.contrast_labels, args.cond_labels, logger=logger)
+        if config.contrast_functions is not None:
+            raise ConfigError("contrast_labels must exist if contrast_functions exist.")
+    if config.contrast_functions is not None and config.contrast_labels is not None:
+        config.contrast_functions = valid_contrast_functions(
+            config.contrast_functions, config.contrast_labels, config.cond_labels, logger=logger
+        )
 
-    # If --remove_previous is provided, clear-out the output dir (before template
+    # If remove_previous is provided, clear-out the output dir (before template
     # resampling or any other file creation in out_dir)
-    if args.remove_previous:
-        logger.info("Removing all files from previous analyses in %s (if they exist).", args.out_dir)
-        remove_files_from_dir(args.out_dir, logger=logger)
+    if config.remove_previous:
+        logger.info("Removing all files from previous analyses in %s (if they exist).", config.out_dir)
+        remove_files_from_dir(config.out_dir, logger=logger)
 
-    # Check if the user wants to extract data
-    if args.extract:
+    # Check if the user wants to extract stat buckets
+    if config.stat_buckets:
+        if config.extract_out_file_pre is None:
+            raise ConfigError(
+                "extract_out_file_pre must be set when stat_buckets is specified."
+            )
+        logger.info("Stat bucket extraction requested for types: %s", config.stat_buckets)
 
-        if args.extract_labels is None or args.extract_stat is None or args.extract_out_file_pre is None:
-            logger.error("--extract_labels, --extract_stat, and --extract_out_file_pre must be present and valid with --extract option")
-            sys.exit(1)
+        if config.template_path is None:
+            config.template_path = "WB"
+            logger.info("No template was provided; stat buckets will be NIfTI-only (no parcellated CSV).")
+            if config.extract_resids:
+                raise ConfigError("extract_resids is only valid when template_path is provided and valid.")
         else:
-            valid_extract_labels(args.cond_labels, args.contrast_labels, args.extract_labels, logger=logger)
-        logger.info("Activation will be calculated from %s maps for the following task effects: %s", args.extract_stat, args.extract_labels)
-
-        if args.template_path is None:
-            args.template_path = "WB"
-            logger.info("No template was provided, so all extractions will be whole-brain, voxelwise maps.")
-            if args.extract_resids:
-                logger.error("--extract_resids is only valid when --template_path is provided and valid.")
-                sys.exit(1)
-        else:
-            args.template_path = validate_template(args.scan_path, args.template_path, args.out_dir, args.force_diff_atlas, conn_type="extract", logger=logger)
-            if args.average_type is None:
-                logger.error("--average_type is required when --extract is provided and --template_path is valid.")
-                sys.exit(1)
-            logger.info("Parcellated %s %s will be extracted based on %s.", args.average_type, args.extract_stat, args.template_path)
+            config.template_path = validate_template(
+                config.scan_path, config.template_path, config.out_dir,
+                config.force_diff_atlas, conn_type="extract", logger=logger
+            )
+            if config.average_type is None:
+                raise ConfigError("average_type is required when stat_buckets is specified and template_path is valid.")
+            logger.info("Parcellated CSVs will be extracted based on %s.", config.template_path)
     else:
-        logger.info("Activation will not be extracted after generating voxelwise maps.")
+        logger.info("No stat bucket extraction requested.")
 
     # Extract pre-regression parcellated time series if requested
-    if getattr(args, 'extract_raw_ptseries', False):
-        if args.extract_out_file_pre is None:
-            logger.error("extract_raw_ptseries requires extract_out_file_pre to be set.")
-            sys.exit(1)
-        raw_out = os.path.join(args.out_dir, f"{args.extract_out_file_pre}_raw_ptseries.csv")
+    if getattr(config, 'extract_raw_ptseries', False):
+        if config.extract_out_file_pre is None:
+            raise ConfigError("extract_raw_ptseries requires extract_out_file_pre to be set.")
+        raw_out = os.path.join(config.out_dir, f"{config.extract_out_file_pre}_raw_ptseries.csv")
         if not os.path.exists(raw_out):
-            if args.template_path is None or args.template_path == "WB":
-                logger.error("extract_raw_ptseries requires a valid template_path (not whole-brain).")
-                sys.exit(1)
+            if config.template_path is None or config.template_path == "WB":
+                raise ConfigError("extract_raw_ptseries requires a valid template_path (not whole-brain).")
             # Validate template if not already validated by the extract block above
-            validated_tpl = validate_template(args.scan_path, args.template_path,
-                args.out_dir, args.force_diff_atlas, conn_type="extract", logger=logger)
-            raw_df = extract_roi_stats(args.scan_path, validated_tpl, args.average_type, logger=logger)
+            validated_tpl = validate_template(
+                config.scan_path, config.template_path,
+                config.out_dir, config.force_diff_atlas, conn_type="extract", logger=logger
+            )
+            raw_df = extract_roi_stats(config.scan_path, validated_tpl, config.average_type, logger=logger)
             raw_df.to_csv(raw_out)
             if os.path.exists(raw_out):
                 logger.info("Extracted raw (pre-regression) ptseries to %s.", raw_out)
             else:
-                logger.error("Failed to extract raw ptseries.")
-                sys.exit(1)
+                raise InputError("Failed to extract raw ptseries.")
         else:
             logger.info("Raw ptseries already exists: %s", raw_out)
 
     # ---------------------------------
 
     # Extract minimum-outlier representative EPI frame (mandatory, before regression)
-    gen_min_outlier_epi(args.scan_path, args.out_dir, args.out_file_pre, "", logger)
+    gen_min_outlier_epi(config.scan_path, config.out_dir, config.out_file_pre, "", logger)
+
+    # PSC scaling (after min-outlier EPI, before regression)
+    if config.scale_to_psc:
+        psc_path = scale_to_psc(
+            config.scan_path, config.out_dir, config.out_file_pre, "", logger)
+        config.scan_path = psc_path
 
     # Generate censor file from motion regressors (before prepare_motion_file overwrites path)
-    args.censor_path = create_censor_file(
-        args.motion_path, args.fd_threshold, args.censor_prev_tr,
-        args.out_dir, args.out_file_pre, "concat", logger)
+    config.censor_path = create_censor_file(
+        config.motion_path, config.fd_threshold, config.censor_prev_tr,
+        config.out_dir, config.out_file_pre, "concat", logger)
 
     # Validate and prepare motion regressors
-    use_cols = 12 if args.include_motion_derivs else 6
-    args.motion_path = prepare_motion_file(
-        args.motion_path, use_cols, args.out_dir, args.out_file_pre, "concat", logger)
-
+    use_cols = 12 if config.include_motion_derivs else 6
+    config.motion_path = prepare_motion_file(
+        config.motion_path, use_cols, config.out_dir, config.out_file_pre, "concat", logger)
 
     # Read and validate stimulus timing data (no file I/O yet)
-    stim_data = read_stim_data(args, logger)
+    stim_data = read_stim_data(config, logger)
 
     # Per-condition trial survival QC
-    trial_survival = check_trial_survival(stim_data, args.cond_labels, args.censor_path, args.tr, logger)
+    trial_survival = check_trial_survival(stim_data, config.cond_labels, config.censor_path, config.tr, logger)
+
+    # Warn for conditions with few but sufficient surviving trials
+    for cond, n_surv in trial_survival.items():
+        if 2 <= n_surv < _TRIALS_FEW_THRESHOLD:
+            graded_warning(
+                logger, 'medium', 'TRIALS_FEW',
+                f"Condition '{cond}' has only {n_surv} surviving trial(s) after censoring "
+                f"(below advisory threshold of {_TRIALS_FEW_THRESHOLD}).",
+                user_facing=True,
+            )
 
     # Filter conditions by survival (minimum 2 trials required for AFNI estimation)
-    original_conds = list(args.cond_labels)
-    args.cond_labels = [c for c in original_conds if trial_survival.get(c, 0) >= 2]
-    dropped_conds = [c for c in original_conds if c not in args.cond_labels]
+    original_conds = list(config.cond_labels)
+    config.cond_labels = [c for c in original_conds if trial_survival.get(c, 0) >= 2]
+    dropped_conds = [c for c in original_conds if c not in config.cond_labels]
 
     if dropped_conds:
-        logger.warning("The following conditions have insufficient surviving trials (< 2) and will be DROPPED: %s", dropped_conds)
-    
-    if not args.cond_labels:
-        logger.error("NO task conditions have sufficient surviving trials. Aborting analysis.")
-        sys.exit(1)
+        graded_warning(
+            logger, 'medium', 'COND_DROPPED',
+            f"Conditions with insufficient surviving trials (< 2) dropped: {dropped_conds}",
+            user_facing=True,
+        )
+
+    if not config.cond_labels:
+        raise ModelError("No task conditions have sufficient surviving trials. Analysis aborted.")
 
     # Update contrast functions if any conditions were dropped
-    if args.contrast_functions and dropped_conds:
+    if config.contrast_functions and dropped_conds:
         valid_contrasts = []
         valid_labels = []
-        for i, cont in enumerate(args.contrast_functions):
+        for i, cont in enumerate(config.contrast_functions):
             if any(c in dropped_conds for c in cont["CONDS"]):
-                logger.warning("Contrast '%s' depends on dropped conditions %s and will be SKIPPED.", 
-                               args.contrast_labels[i], [c for c in cont["CONDS"] if c in dropped_conds])
+                graded_warning(
+                    logger, 'medium', 'CONTRAST_DROPPED',
+                    f"Contrast '{config.contrast_labels[i]}' depends on dropped conditions "
+                    f"{[c for c in cont['CONDS'] if c in dropped_conds]} and will be skipped.",
+                    user_facing=True,
+                )
             else:
                 valid_contrasts.append(cont)
-                valid_labels.append(args.contrast_labels[i])
-        args.contrast_functions = valid_contrasts
-        args.contrast_labels = valid_labels
-
-    # Update extraction labels if any conditions were dropped
-    if args.extract and args.extract_labels:
-        original_extract = list(args.extract_labels)
-        args.extract_labels = [e for e in original_extract if e in args.cond_labels or e in args.contrast_labels]
-        dropped_extract = [e for e in original_extract if e not in args.extract_labels]
-        if dropped_extract:
-            logger.warning("The following extraction labels depend on dropped effects and will be SKIPPED: %s", dropped_extract)
-        if not args.extract_labels:
-            logger.warning("No valid effects left to extract. Disabling extraction.")
-            args.extract = False
+                valid_labels.append(config.contrast_labels[i])
+        config.contrast_functions = valid_contrasts
+        config.contrast_labels = valid_labels
 
     # Write onset files now that cond_labels reflects only surviving conditions
-    write_stim_onset_files(stim_data, args, logger)
+    write_stim_onset_files(stim_data, config, logger)
 
     # Pre-flight DOF check
-    n_regressors = use_cols + len(args.cond_labels)
-    if args.CSF_path is not None:
+    n_regressors = use_cols + len(config.cond_labels)
+    if config.CSF_path is not None:
         n_regressors += 1
-    if args.WM_path is not None:
+    if config.WM_path is not None:
         n_regressors += 1
-    if args.use_tissue_derivs:
-        if args.CSF_path is not None:
+    if config.use_tissue_derivs:
+        if config.CSF_path is not None:
             n_regressors += 1
-        if args.WM_path is not None:
+        if config.WM_path is not None:
             n_regressors += 1
-    dof = compute_dof(args.censor_path, n_regressors, logger)
+    dof = compute_dof(config.censor_path, n_regressors, logger, tr=config.tr)
 
     # Build QC summary data
     qc_data = {
         "analysis_type": "task_act",
-        "hrf_model": args.hrf_model if args.hrf_model != "custom" else f"custom ({args.custom_hrf})",
-        "fd_threshold": args.fd_threshold,
-        "censor_prev_tr": args.censor_prev_tr,
+        "hrf_model": config.hrf_model if config.hrf_model != "custom" else f"custom ({config.custom_hrf})",
+        "fd_threshold": config.fd_threshold,
+        "censor_prev_tr": config.censor_prev_tr,
     }
     try:
-        censor_data = np.loadtxt(args.censor_path)
+        censor_data = np.loadtxt(config.censor_path)
         qc_data["n_trs_total"] = len(censor_data)
         qc_data["n_trs_censored"] = int(np.sum(censor_data == 0))
         qc_data["pct_censored"] = round(100.0 * qc_data["n_trs_censored"] / qc_data["n_trs_total"], 2) if qc_data["n_trs_total"] > 0 else 0.0
     except Exception:
         pass
-    qc_data["per_condition_trial_counts"] = {c: int(len(stim_data[stim_data['CONDITION'] == c])) for c in args.cond_labels}
+    qc_data["per_condition_trial_counts"] = {c: int(len(stim_data[stim_data['trial_type'] == c])) for c in config.cond_labels}
     qc_data["per_condition_surviving_trials"] = trial_survival
     qc_data["dof"] = dof
 
-    # Run activation first-level analysis
-    run_first_level(stim_data, args, logger)
+    # Warn if censoring rate exceeds the high threshold
+    if qc_data.get("pct_censored", 0.0) > CENSOR_HIGH_THRESHOLD:
+        graded_warning(
+            logger, 'high', 'CENSOR_HIGH',
+            f"Censoring rate ({qc_data['pct_censored']:.1f}%) exceeds the {CENSOR_HIGH_THRESHOLD}% threshold.",
+            user_facing=True,
+        )
 
-    # Run extraction if indicated
-    if args.extract:
-        extract_effects(args, logger)
+    # Run activation first-level analysis
+    run_first_level(stim_data, config, logger)
+
+    # Generate bucket stats sub-brick index
+    bucket_stats_index_path = generate_bucket_stats_index(config, logger)
+
+    # Run stat bucket extraction if indicated
+    extraction_files = []
+    if config.stat_buckets:
+        extraction_files = extract_stat_buckets(config, logger)
 
     # Write QC summary
-    write_qc_summary(args.out_dir, args.out_file_pre, qc_data, logger)
+    write_qc_summary(config.out_dir, config.out_file_pre, qc_data, logger)
 
-def main():
-    """CLI entrypoint: parse --flags, call run()."""
+    # Collect output file paths
+    output_files: list[str] = []
+    psc_out = os.path.join(config.out_dir, f"{config.out_file_pre}_psc.nii.gz")
+    if os.path.exists(psc_out):
+        output_files.append(psc_out)
+    bucket_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"
+    resids_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_resids.nii.gz"
+    if os.path.exists(bucket_path):
+        output_files.append(bucket_path)
+    if os.path.exists(resids_path):
+        output_files.append(resids_path)
+    if os.path.exists(bucket_stats_index_path):
+        output_files.append(bucket_stats_index_path)
+    output_files.extend(extraction_files)
+    qc_path = os.path.join(config.out_dir, f"{config.out_file_pre}_qc_summary.json")
+    if os.path.exists(qc_path):
+        output_files.append(qc_path)
 
-    # Start the timer
-    start_time = time.time()
+    # Determine overall result status
+    status = "warning" if any(w.get("severity") == "high" for w in get_warnings()) else "success"
 
-    # ---------------------------------
-    # Parse arguments
-    # ---------------------------------
-    parser = argparse.ArgumentParser()
-    # required:
-    parser.add_argument("--scan_path", type=file_path_exists, required=True)
-    parser.add_argument("--task_timing_path", type=file_path_exists, required=True)
-    parser.add_argument("--motion_path", type=file_path_exists, required=True)
-    parser.add_argument("--cond_labels", type=valid_string_list, required=True)
-    parser.add_argument("--out_dir", type=dir_path_exists, required=True)
-    parser.add_argument("--out_file_pre", type=str, required=True)
-    parser.add_argument("--num_cores", type=int, required=True)
-    parser.add_argument("--fd_threshold", type=float, required=True,
-                        help="Framewise displacement threshold (mm) for motion censoring.")
-    parser.add_argument("--censor_prev_tr", action='store_true', default=False,
-                        help="Also censor the TR before each high-motion TR (default: False).")
-    parser.add_argument("--include_motion_derivs", action='store_true', default=False,
-                        help="Include temporal derivatives of motion regressors (12 columns instead of 6; default: False).")
-    parser.add_argument("--tr", type=float, required=True,
-                        help="Repetition time in seconds.")
-
-    # optional:
-    parser.add_argument("--hrf_model", type=str, choices=sorted(VALID_HRF_MODELS), default="GAM", required=False)
-    parser.add_argument("--custom_hrf", type=str, default=None, required=False)
-    parser.add_argument("--CSF_path", type=file_path_exists, default=None, required=False)
-    parser.add_argument("--WM_path", type=file_path_exists, default=None, required=False)
-    parser.add_argument("--remove_previous", action='store_true', required=False)
-    parser.add_argument("--contrast_functions", type=valid_string_list, required=False)
-    parser.add_argument("--contrast_labels", type=valid_string_list, required=False)
-    parser.add_argument("--extract", action='store_true', required=False)
-    parser.add_argument("--extract_labels", type=valid_string_list, required=False)
-    parser.add_argument("--extract_stat", type=valid_stat_type, required=False)
-    parser.add_argument("--extract_out_file_pre", type=str, required=False)
-    parser.add_argument("--template_path", type=file_path_exists, required=False)
-    parser.add_argument("--average_type", type=valid_ave_type, required=False)
-    parser.add_argument("--extract_resids", action='store_true', required=False)
-    parser.add_argument("--extract_raw_ptseries", action='store_true', default=False, required=False,
-                        help="Extract pre-regression parcellated time series (requires --template_path and --extract_out_file_pre).")
-    parser.add_argument("--force_diff_atlas", action='store_true', required=False)
-    parser.add_argument("--use_tissue_derivs", action='store_true', default=False, required=False,
-                        help="Include first temporal derivatives of tissue signals (CSF/WM) as additional nuisance regressors.")
-
-    args = parser.parse_args()
-    logger = setup_logging("task_act_first_level")
-
-    run(args, logger)
-
-    # Display total runtime
-    logger.info("Total runtime: %.2f seconds", time.time() - start_time)
-
-if __name__ == "__main__":
-    main()
+    return FirstLevelResult(
+        status=status,
+        output_dir=Path(config.out_dir),
+        warnings=get_warnings(),
+        qc_summary=qc_data,
+        output_files=output_files,
+    )

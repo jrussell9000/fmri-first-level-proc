@@ -1,7 +1,7 @@
 <brainstorm_report>
   <meta project="fmri_first_level_proc" mode="brainstorm" timestamp="2026-03-11T22:00:00Z" />
   <context_files>
-    <file path="FIX_fromOrch.txt" relevance="Upstream bug report from real-world testing (v2.2.0, sub-00CY2MDM)" />
+    <file path="FIX_fromOrch.txt" relevance="Upstream bug report from real-world testing (v2.2.0, sub-XXXXXXXX)" />
     <file path="fmri_first_level_proc/task_conn_first_level.py" relevance="Contains BUG-001 (sub-brick ordering) and BUG-002 (onset file flow) — get_stim_data, gen_design_matrix, gen_beta_series, run" />
     <file path="fmri_first_level_proc/first_level_utils.py" relevance="Contains BUG-003 (notch_filter_motion 1D transpose)" />
     <file path="fmri_first_level_proc/task_act_first_level.py" relevance="Harmonization target — condition-drop ordering consistency" />

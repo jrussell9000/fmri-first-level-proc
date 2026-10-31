@@ -8,7 +8,7 @@
 # 4. (optional) Runs functional connectivity analysis with AFNI's 3dNetCorr
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 2.5.0
+# Version: 3.0.0
 # Last updated: 05/01/26
 # ============================================================================
 '''
@@ -36,7 +36,7 @@ INPUTS:
 (optional)
 --GS_paths: list of global file paths to the average global BOLD signal time series (one per run); enables global signal regression (GSR)
     format = list(string(path_to_GS_TS_txt)); no headers; rows=TR/frame, single column = mean global signal for frame
-    NOTE: GSR is controversial — it can remove neural signal and introduce artifactual anti-correlations. Use with caution and report in methods.
+    NOTE: GSR is controversial -- it can remove neural signal and introduce artifactual anti-correlations. Use with caution and report in methods.
 --bandpass: bandpass filter frequencies [low high] in Hz (default: [0.01, 0.1]); set to null in YAML config to disable
 --polort: hardcoded to -1 (no explicit detrending; bandpass filtering in 3dTproject subsumes polynomial detrending)
 --use_tissue_derivs: (no value) include this option to add first temporal derivatives of tissue signals (CSF/WM, and GS when enabled) as additional nuisance regressors
@@ -74,15 +74,16 @@ OUTPUTS:
 
 # Imports
 import copy
+import logging
 import os
-import sys
-import argparse
-import time
 import shutil
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from .exceptions import ConfigError, InputError, ModelError, ToolExecutionError
+from .first_level_config import ResolvedConfig
 from .first_level_utils import (
     setup_logging,
     dir_path_exists,
@@ -104,11 +105,16 @@ from .first_level_utils import (
     validate_extract_options,
     validate_connectivity_options,
     gen_min_outlier_epi,
+    scale_to_psc,
     censor_interpolate_1d_afni,
     bandpass_filter_1d_afni,
+    graded_warning,
+    get_warnings,
+    clear_warnings,
+    FirstLevelResult,
 )
 
-def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared_motion, args, logger):
+def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared_motion, config, logger):
     """Generate per-run residual via simultaneous 3dTproject (regression + bandpass + censoring).
 
     Implements the default rest_conn denoising path: a single 3dTproject call with
@@ -126,8 +132,8 @@ def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared
         Path to the run's censor.1D file (binary 1=keep, 0=censor).
     prepared_motion : str
         Path to the run's prepared motion file (motion_deriv_degree*6 columns).
-    args : argparse.Namespace
-        Pipeline arguments. Must include CSF_paths, WM_paths, GS_paths,
+    config : ResolvedConfig
+        Pipeline configuration. Must include CSF_paths, WM_paths, GS_paths,
         use_tissue_derivs, polort handling (hardcoded -1), bandpass, out_dir,
         out_file_pre, tr.
     logger : logging.Logger
@@ -137,48 +143,48 @@ def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared
     str or None
         Path to the run's residual dtseries, or None on 3dTproject failure.
     """
-    run_out = os.path.join(args.out_dir, f"{args.out_file_pre}_run{run_idx+1}_residual_dtseries.nii.gz")
+    run_out = os.path.join(config.out_dir, f"{config.out_file_pre}_run{run_idx+1}_residual_dtseries.nii.gz")
 
     if os.path.exists(run_out):
         return run_out
 
     tproj_command = ["3dTproject", "-input", run_scan,
-        "-dt", str(args.tr),
+        "-dt", str(config.tr),
         "-censor", censor_path,
         "-cenmode", "ZERO",
         "-ort", prepared_motion,
-        "-ort", args.CSF_paths[run_idx],
-        "-ort", args.WM_paths[run_idx]]
-    if args.GS_paths is not None:
-        tproj_command.extend(["-ort", args.GS_paths[run_idx]])
-    if args.use_tissue_derivs:
-        csf_deriv = compute_tissue_derivative(args.CSF_paths[run_idx], args.out_dir, args.out_file_pre, f"run{run_idx+1}_CSF", logger)
+        "-ort", config.CSF_paths[run_idx],
+        "-ort", config.WM_paths[run_idx]]
+    if config.GS_paths is not None:
+        tproj_command.extend(["-ort", config.GS_paths[run_idx]])
+    if config.use_tissue_derivs:
+        csf_deriv = compute_tissue_derivative(config.CSF_paths[run_idx], config.out_dir, config.out_file_pre, f"run{run_idx+1}_CSF", logger)
         tproj_command.extend(["-ort", csf_deriv])
-        wm_deriv = compute_tissue_derivative(args.WM_paths[run_idx], args.out_dir, args.out_file_pre, f"run{run_idx+1}_WM", logger)
+        wm_deriv = compute_tissue_derivative(config.WM_paths[run_idx], config.out_dir, config.out_file_pre, f"run{run_idx+1}_WM", logger)
         tproj_command.extend(["-ort", wm_deriv])
-        if args.GS_paths is not None:
-            gs_deriv = compute_tissue_derivative(args.GS_paths[run_idx], args.out_dir, args.out_file_pre, f"run{run_idx+1}_GS", logger)
+        if config.GS_paths is not None:
+            gs_deriv = compute_tissue_derivative(config.GS_paths[run_idx], config.out_dir, config.out_file_pre, f"run{run_idx+1}_GS", logger)
             tproj_command.extend(["-ort", gs_deriv])
     tproj_command.extend(["-polort", "-1"])
-    if args.bandpass is not None:
-        tproj_command.extend(["-bandpass", str(args.bandpass[0]), str(args.bandpass[1])])
+    if config.bandpass is not None:
+        tproj_command.extend(["-bandpass", str(config.bandpass[0]), str(config.bandpass[1])])
     tproj_command.extend(["-prefix", run_out])
 
     try:
         run_afni_command(tproj_command, description=f"3dTproject run{run_idx+1}", logger=logger)
-    except Exception as e:
+    except ToolExecutionError as e:
         logger.error("3dTproject failed for run %d: %s", run_idx+1, e)
         return None
 
     if os.path.exists(run_out):
-        logger.info("Successfully created residual dtseries for %s_run%d.", args.out_file_pre, run_idx+1)
+        logger.info("Successfully created residual dtseries for %s_run%d.", config.out_file_pre, run_idx+1)
         return run_out
     else:
-        logger.error("Failed to create residual dtseries for %s_run%d.", args.out_file_pre, run_idx+1)
+        logger.error("Failed to create residual dtseries for %s_run%d.", config.out_file_pre, run_idx+1)
         return None
 
 
-def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_motion, args, logger):
+def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_motion, config, logger):
     """Generate per-run residual via sequenced denoising (Ciric-inspired).
 
     Six-step flow:
@@ -200,8 +206,8 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
     are frequency-equivalent to the BOLD passband (Hallquist 2013 doctrine).
 
     Per-run intermediate files are written to
-    {args.out_dir}/_sequenced_intermediates/run{N}/ and removed at the end of
-    this function unless args.keep_run_res_dtseries is True. On step-6 or
+    {config.out_dir}/_sequenced_intermediates/run{N}/ and removed at the end of
+    this function unless config.keep_run_res_dtseries is True. On step-6 or
     post-step failure, the directory is preserved regardless of flag value
     so the user can inspect the intermediate state.
 
@@ -211,7 +217,7 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
     run_scan : str
     censor_path : str
     prepared_motion : str
-    args : argparse.Namespace
+    config : ResolvedConfig
         Must include: CSF_paths, WM_paths, GS_paths, use_tissue_derivs,
         bandpass, keep_run_res_dtseries, out_dir, out_file_pre, tr.
     logger : logging.Logger
@@ -221,22 +227,22 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
     str or None
         Path to the run's residual dtseries, or None on failure.
     """
-    run_out = os.path.join(args.out_dir, f"{args.out_file_pre}_run{run_idx+1}_residual_dtseries.nii.gz")
+    run_out = os.path.join(config.out_dir, f"{config.out_file_pre}_run{run_idx+1}_residual_dtseries.nii.gz")
 
     if os.path.exists(run_out):
         return run_out
 
-    inter_dir = os.path.join(args.out_dir, "_sequenced_intermediates", f"run{run_idx+1}")
+    inter_dir = os.path.join(config.out_dir, "_sequenced_intermediates", f"run{run_idx+1}")
     os.makedirs(inter_dir, exist_ok=True)
 
     label = f"run{run_idx+1}"
     success = False
     try:
         # Step 2-3: NTRP interpolate BOLD
-        bold_interp = os.path.join(inter_dir, f"{args.out_file_pre}_{label}_bold_interp.nii.gz")
+        bold_interp = os.path.join(inter_dir, f"{config.out_file_pre}_{label}_bold_interp.nii.gz")
         interp_cmd = ["3dTproject",
                       "-polort", "-1",
-                      "-dt", str(args.tr),
+                      "-dt", str(config.tr),
                       "-input", run_scan,
                       "-censor", censor_path,
                       "-cenmode", "NTRP",
@@ -247,12 +253,12 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
             return None
 
         # Step 4: 3dBandpass BOLD
-        bold_bp = os.path.join(inter_dir, f"{args.out_file_pre}_{label}_bold_bp.nii.gz")
+        bold_bp = os.path.join(inter_dir, f"{config.out_file_pre}_{label}_bold_bp.nii.gz")
         bp_cmd = ["3dBandpass",
                   "-nodetrend",
-                  "-dt", str(args.tr),
+                  "-dt", str(config.tr),
                   "-prefix", bold_bp,
-                  str(args.bandpass[0]), str(args.bandpass[1]),
+                  str(config.bandpass[0]), str(config.bandpass[1]),
                   bold_interp]
         run_afni_command(bp_cmd, description=f"3dBandpass BOLD {label}", logger=logger)
         if not os.path.exists(bold_bp):
@@ -264,42 +270,42 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
         # through the same filter pipeline as base regressors.
         def _filter_1d(src_path, lbl):
             interp_path = censor_interpolate_1d_afni(
-                src_path, args.tr, censor_path, inter_dir, args.out_file_pre, lbl, logger)
+                src_path, config.tr, censor_path, inter_dir, config.out_file_pre, lbl, logger)
             bp_path = bandpass_filter_1d_afni(
-                interp_path, args.tr, args.bandpass, inter_dir, args.out_file_pre, lbl, logger)
+                interp_path, config.tr, config.bandpass, inter_dir, config.out_file_pre, lbl, logger)
             return bp_path
 
         filtered_motion = _filter_1d(prepared_motion, f"{label}_motion")
-        filtered_csf = _filter_1d(args.CSF_paths[run_idx], f"{label}_CSF")
-        filtered_wm = _filter_1d(args.WM_paths[run_idx], f"{label}_WM")
+        filtered_csf = _filter_1d(config.CSF_paths[run_idx], f"{label}_CSF")
+        filtered_wm = _filter_1d(config.WM_paths[run_idx], f"{label}_WM")
 
         ort_args = ["-ort", filtered_motion, "-ort", filtered_csf, "-ort", filtered_wm]
 
-        if args.GS_paths is not None:
-            filtered_gs = _filter_1d(args.GS_paths[run_idx], f"{label}_GS")
+        if config.GS_paths is not None:
+            filtered_gs = _filter_1d(config.GS_paths[run_idx], f"{label}_GS")
             ort_args.extend(["-ort", filtered_gs])
 
-        if args.use_tissue_derivs:
+        if config.use_tissue_derivs:
             csf_deriv_raw = compute_tissue_derivative(
-                args.CSF_paths[run_idx], inter_dir, args.out_file_pre, f"{label}_CSF_deriv_raw", logger)
+                config.CSF_paths[run_idx], inter_dir, config.out_file_pre, f"{label}_CSF_deriv_raw", logger)
             filtered_csf_deriv = _filter_1d(csf_deriv_raw, f"{label}_CSF_deriv")
             ort_args.extend(["-ort", filtered_csf_deriv])
             wm_deriv_raw = compute_tissue_derivative(
-                args.WM_paths[run_idx], inter_dir, args.out_file_pre, f"{label}_WM_deriv_raw", logger)
+                config.WM_paths[run_idx], inter_dir, config.out_file_pre, f"{label}_WM_deriv_raw", logger)
             filtered_wm_deriv = _filter_1d(wm_deriv_raw, f"{label}_WM_deriv")
             ort_args.extend(["-ort", filtered_wm_deriv])
-            if args.GS_paths is not None:
+            if config.GS_paths is not None:
                 gs_deriv_raw = compute_tissue_derivative(
-                    args.GS_paths[run_idx], inter_dir, args.out_file_pre, f"{label}_GS_deriv_raw", logger)
+                    config.GS_paths[run_idx], inter_dir, config.out_file_pre, f"{label}_GS_deriv_raw", logger)
                 filtered_gs_deriv = _filter_1d(gs_deriv_raw, f"{label}_GS_deriv")
                 ort_args.extend(["-ort", filtered_gs_deriv])
 
         # Step 6: nuisance regression on filtered BOLD with filtered orts.
         # No -bandpass, no -censor; -polort -1 (rest_conn convention).
-        residual_pre_mask = os.path.join(inter_dir, f"{args.out_file_pre}_{label}_residual_premask.nii.gz")
+        residual_pre_mask = os.path.join(inter_dir, f"{config.out_file_pre}_{label}_residual_premask.nii.gz")
         reg_cmd = ["3dTproject",
                    "-polort", "-1",
-                   "-dt", str(args.tr),
+                   "-dt", str(config.tr),
                    "-input", bold_bp] + ort_args + ["-prefix", residual_pre_mask]
         run_afni_command(reg_cmd, description=f"3dTproject sequenced regression {label}", logger=logger)
         if not os.path.exists(residual_pre_mask):
@@ -318,17 +324,17 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
             logger.error("Sequenced post-step failed: censored-zero residual missing for %s.", label)
             return None
 
-        logger.info("Successfully created sequenced residual dtseries for %s_run%d.", args.out_file_pre, run_idx+1)
+        logger.info("Successfully created sequenced residual dtseries for %s_run%d.", config.out_file_pre, run_idx+1)
         success = True
         return run_out
 
-    except Exception as e:
+    except (ToolExecutionError, OSError) as e:
         logger.error("Sequenced denoising failed for run %d: %s", run_idx+1, e)
         return None
 
     finally:
         # Cleanup intermediates per S5b-ii. Preserve on failure regardless of flag.
-        if success and not args.keep_run_res_dtseries:
+        if success and not config.keep_run_res_dtseries:
             try:
                 shutil.rmtree(inter_dir)
                 logger.info("Removed sequenced intermediates for %s.", label)
@@ -340,16 +346,17 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
             logger.info("Keeping sequenced intermediates at %s (keep_run_res_dtseries=True).", inter_dir)
 
 
-def gen_residual_ts(args, logger):
+def gen_residual_ts(config, logger):
     """Generate per-run residual dense time series and concatenate across runs.
 
     For each run: optionally notch-filters motion parameters, generates an FD-based
-    censor file, runs a DOF check (warns and skips runs with DOF < 1), then calls
-    3dTproject to regress out motion, tissue signals, and optional bandpass filtering.
-    Surviving runs are concatenated via 3dTcat.
+    censor file, runs a DOF check (emits RUN_SKIPPED graded_warning and skips runs
+    where compute_dof raises ModelError), then calls 3dTproject to regress out
+    motion, tissue signals, and optional bandpass filtering. Surviving runs are
+    concatenated via 3dTcat.
 
     The per-run residual generation dispatches to one of two backends based on
-    args.use_sequenced_bandpass: simultaneous (default; single 3dTproject call
+    config.use_sequenced_bandpass: simultaneous (default; single 3dTproject call
     with -ort, -bandpass, -censor, -cenmode ZERO) or sequenced (Ciric-inspired
     six-step flow: NTRP-interpolate, 3dBandpass, filter nuisance, regress, mask
     censored TRs). Shared setup (motion preparation, censor generation, DOF
@@ -357,71 +364,85 @@ def gen_residual_ts(args, logger):
 
     Parameters
     ----------
-    args : argparse.Namespace
-        Pipeline arguments (scan_paths, motion_paths, CSF_paths, WM_paths,
+    config : ResolvedConfig
+        Pipeline configuration (scan_paths, motion_paths, CSF_paths, WM_paths,
         GS_paths, out_dir, out_file_pre, tr, fd_threshold, censor_prev_tr,
         notch_filter_band, bandpass, use_tissue_derivs, keep_run_res_dtseries).
     logger : logging.Logger
 
     Returns
     -------
-    list of int or None
-        Per-run DOF estimates (None for runs where DOF could not be computed).
+    list[int | None]
+        Per-run DOF estimates (None for runs where DOF could not be computed
+        or where ModelError was raised). Warnings are accumulated via the
+        module-level warning accumulator (get_warnings).
+
+    Raises
+    ------
+    ToolExecutionError
+        If no runs were successfully processed, or if 3dTcat concatenation fails.
     """
     # Check if concatenated residual dtseries exists
-    concat_path = os.path.join(args.out_dir, f"{args.out_file_pre}_concat_residual_dtseries.nii.gz")
+    concat_path = os.path.join(config.out_dir, f"{config.out_file_pre}_concat_residual_dtseries.nii.gz")
     per_run_dof = []
     if not os.path.exists(concat_path):
 
         # Validate and prepare motion files, generate censor files per run
-        use_cols = 6 * args.motion_deriv_degree
+        use_cols = 6 * config.motion_deriv_degree
         prepared_motion = []
         censor_paths = []
-        for i, mot_path in enumerate(args.motion_paths):
+        skip_run = []
+        for i, mot_path in enumerate(config.motion_paths):
             # Optionally notch-filter motion for respiratory artifact removal
             censor_motion_src = mot_path
-            if args.notch_filter_band is not None:
+            if config.notch_filter_band is not None:
                 censor_motion_src = notch_filter_motion(
-                    mot_path, args.tr, args.notch_filter_band,
-                    args.out_dir, args.out_file_pre, f"run{i+1}", logger)
+                    mot_path, config.tr, config.notch_filter_band,
+                    config.out_dir, config.out_file_pre, f"run{i+1}", logger)
             # Generate censor file from (possibly filtered) motion
             censor_path = create_censor_file(
-                censor_motion_src, args.fd_threshold, args.censor_prev_tr,
-                args.out_dir, args.out_file_pre, f"run{i+1}", logger)
+                censor_motion_src, config.fd_threshold, config.censor_prev_tr,
+                config.out_dir, config.out_file_pre, f"run{i+1}", logger)
             censor_paths.append(censor_path)
             # Prepare motion for regression (original, unfiltered)
             prepared = prepare_motion_file(
-                mot_path, use_cols, args.out_dir, args.out_file_pre, f"run{i+1}", logger)
+                mot_path, use_cols, config.out_dir, config.out_file_pre, f"run{i+1}", logger)
             prepared_motion.append(prepared)
 
             # Per-run DOF check
-            n_regressors = use_cols  # polort -1 -> 0 polynomial regressors (bandpass subsumes detrending in simultaneous path; sequenced path applies bandpass to BOLD/orts separately at step 4-5, so step-6 ort count matches)
+            n_regressors = use_cols  # polort -1 -> 0 polynomial regressors
             n_regressors += 2  # CSF + WM (always present)
-            if args.GS_paths is not None:
+            if config.GS_paths is not None:
                 n_regressors += 1
-            if args.use_tissue_derivs:
+            if config.use_tissue_derivs:
                 n_regressors += 2  # CSF_deriv + WM_deriv
-                if args.GS_paths is not None:
+                if config.GS_paths is not None:
                     n_regressors += 1  # GS_deriv
-            run_dof = compute_dof(censor_path, n_regressors, logger, exit_on_error=False)
-            per_run_dof.append(run_dof)
+            try:
+                run_dof = compute_dof(censor_path, n_regressors, logger)
+                per_run_dof.append(run_dof)
+                skip_run.append(False)
+            except ModelError as e:
+                msg = f"Run {i+1}: {e}"
+                graded_warning(logger, 'high', 'RUN_SKIPPED', msg, user_facing=True)
+                per_run_dof.append(None)
+                skip_run.append(True)
 
         completed_runs = []
 
         # Iterate individual resting-state runs
-        for i, run_scan in enumerate(args.scan_paths):
+        for i, run_scan in enumerate(config.scan_paths):
 
-            if per_run_dof[i] is not None and per_run_dof[i] < 1:
-                logger.warning("Run %d has insufficient degrees of freedom (DOF=%d). Skipping this run.", i+1, per_run_dof[i])
+            if skip_run[i]:
                 continue
 
-            # Dispatch to selected backend based on args.use_sequenced_bandpass
-            if args.use_sequenced_bandpass:
+            # Dispatch to selected backend based on config.use_sequenced_bandpass
+            if config.use_sequenced_bandpass:
                 run_out = _generate_run_residual_sequenced(
-                    i, run_scan, censor_paths[i], prepared_motion[i], args, logger)
+                    i, run_scan, censor_paths[i], prepared_motion[i], config, logger)
             else:
                 run_out = _generate_run_residual_simultaneous(
-                    i, run_scan, censor_paths[i], prepared_motion[i], args, logger)
+                    i, run_scan, censor_paths[i], prepared_motion[i], config, logger)
 
             if run_out is None:
                 # Backend logged the specific failure; skip this run.
@@ -430,20 +451,23 @@ def gen_residual_ts(args, logger):
             completed_runs.append(run_out)
 
         if not completed_runs:
-            logger.error("No runs were successfully processed for %s. Aborting.", args.out_file_pre)
-            sys.exit(1)
+            raise ToolExecutionError(
+                f"No runs were successfully processed for {config.out_file_pre}. "
+                "All runs either failed AFNI processing or were skipped due to insufficient DOF."
+            )
 
         # Concatenate residual time series runs
-        cat_command = ["3dTcat", "-TR", str(args.tr), "-prefix", concat_path] + completed_runs
+        cat_command = ["3dTcat", "-TR", str(config.tr), "-prefix", concat_path] + completed_runs
         run_afni_command(cat_command, description="3dTcat concat residuals", logger=logger)
         if os.path.exists(concat_path):
-            logger.info("Successfully created concatenated residual dtseries for %s.", args.out_file_pre)
+            logger.info("Successfully created concatenated residual dtseries for %s.", config.out_file_pre)
         else:
-            logger.error("Failed to create concatenated residual dtseries for %s.", args.out_file_pre)
-            sys.exit(1)
+            raise ToolExecutionError(
+                f"Failed to create concatenated residual dtseries for {config.out_file_pre}."
+            )
 
         # If keep_run_res_dtseries is False (default True), remove per-run residual files
-        if not args.keep_run_res_dtseries:
+        if not config.keep_run_res_dtseries:
             for comp_run in completed_runs:
                 os.remove(comp_run)
             all_removed = all(not os.path.exists(cr) for cr in completed_runs)
@@ -456,7 +480,7 @@ def gen_residual_ts(args, logger):
 
     return per_run_dof
 
-def gen_ptseries(args, logger):
+def gen_ptseries(config, logger):
     """Extract ROI-level residual parcel time series from the concatenated dtseries.
 
     Uses the concatenated residual dtseries and the provided template to extract
@@ -465,136 +489,170 @@ def gen_ptseries(args, logger):
 
     Parameters
     ----------
-    args : argparse.Namespace
+    config : ResolvedConfig
         Must include: out_dir, out_file_pre, extract_out_file_pre, template_path,
         average_type.
     logger : logging.Logger
+
+    Raises
+    ------
+    ToolExecutionError
+        If ptseries CSV could not be written after extraction.
     """
     # Check if output already exists
-    if not os.path.exists(f"{args.out_dir}/{args.extract_out_file_pre}_residual_ptseries.csv"):
+    if not os.path.exists(f"{config.out_dir}/{config.extract_out_file_pre}_residual_ptseries.csv"):
 
-        inset_path = os.path.join(args.out_dir, f"{args.out_file_pre}_concat_residual_dtseries.nii.gz")
-        new_df = extract_roi_stats(inset_path, args.template_path, args.average_type, logger=logger)
+        inset_path = os.path.join(config.out_dir, f"{config.out_file_pre}_concat_residual_dtseries.nii.gz")
+        new_df = extract_roi_stats(inset_path, config.template_path, config.average_type, logger=logger)
 
         # Save ptseries
-        new_df.to_csv(f"{args.out_dir}/{args.extract_out_file_pre}_residual_ptseries.csv")
-        if os.path.exists(f"{args.out_dir}/{args.extract_out_file_pre}_residual_ptseries.csv"):
+        new_df.to_csv(f"{config.out_dir}/{config.extract_out_file_pre}_residual_ptseries.csv")
+        if os.path.exists(f"{config.out_dir}/{config.extract_out_file_pre}_residual_ptseries.csv"):
             logger.info("Successfully extracted ptseries using ROI template.")
         else:
-            logger.error("Could not extract ptseries using ROI template.")
-            sys.exit(1)
+            raise ToolExecutionError(
+                f"Could not extract ptseries using ROI template for {config.out_file_pre}."
+            )
     else:
-        logger.info("%s/%s_residual_ptseries.csv already exists.", args.out_dir, args.extract_out_file_pre)
+        logger.info("%s/%s_residual_ptseries.csv already exists.", config.out_dir, config.extract_out_file_pre)
 
-def gen_conn(args, logger):
+def gen_conn(config, logger):
     """Compute functional connectivity from the concatenated residual dtseries.
 
     Dispatches to either parcellated_conn (ROI-to-ROI matrix via 3dNetCorr) or
     seed_to_voxel_conn (whole-brain voxelwise map via 3dNetCorr) based on
-    args.calc_conn. For resting-state, no condition label is used.
+    config.calc_conn. For resting-state, no condition label is used.
 
     Parameters
     ----------
-    args : argparse.Namespace
+    config : ResolvedConfig
         Must include: out_dir, out_file_pre, calc_conn, conn_out_file_pre,
         template_path, fishZ, pcorr.
     logger : logging.Logger
     """
-    inset_path = os.path.join(args.out_dir, f"{args.out_file_pre}_concat_residual_dtseries.nii.gz")
+    inset_path = os.path.join(config.out_dir, f"{config.out_file_pre}_concat_residual_dtseries.nii.gz")
 
-    # Run connectivity analyses based on the specified flavor (no condition — resting-state)
-    if args.calc_conn == "parcellated":
+    # Run connectivity analyses based on the specified flavor (no condition -- resting-state)
+    if config.calc_conn == "parcellated":
         parcellated_conn(
             inset_path=inset_path,
-            out_dir=args.out_dir,
-            conn_out_file_pre=args.conn_out_file_pre,
-            template_path=args.template_path,
-            fishZ=args.fishZ,
-            pcorr=args.pcorr,
+            out_dir=config.out_dir,
+            conn_out_file_pre=config.conn_out_file_pre,
+            template_path=config.template_path,
+            fishZ=config.fishZ,
+            pcorr=config.pcorr,
             condition=None,
             logger=logger,
         )
     else:
         seed_to_voxel_conn(
             inset_path=inset_path,
-            out_dir=args.out_dir,
-            conn_out_file_pre=args.conn_out_file_pre,
-            template_path=args.template_path,
-            fishZ=args.fishZ,
-            pcorr=args.pcorr,
+            out_dir=config.out_dir,
+            conn_out_file_pre=config.conn_out_file_pre,
+            template_path=config.template_path,
+            fishZ=config.fishZ,
+            pcorr=config.pcorr,
             condition=None,
             logger=logger,
         )
 
-def run(args, logger):
-    """Validate args and execute the resting-state connectivity pipeline.
+def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLevelResult:
+    """Validate config and execute the resting-state connectivity pipeline.
 
     Orchestrates the full rest_conn pipeline in the following order:
     1. Validate that all run-level path lists are the same length.
-    2. Log GSR warning if GS_paths is provided.
+    2. Log GSR warning if GS_paths is provided; emit GS_MISSING graded_warning if not.
     3. Optionally clear out_dir (if remove_previous is set).
     4. Validate extraction and connectivity arguments.
     5. Extract minimum-outlier EPI frame per run (gen_min_outlier_epi; mandatory).
     6. Optionally extract pre-regression parcellated time series per run (extract_raw_ptseries).
     7. Generate per-run residual dense time series via 3dTproject (gen_residual_ts),
        which internally: optionally notch-filters motion, generates per-run censor
-       files, runs per-run DOF checks (skip runs with DOF < 1), and concatenates
-       surviving runs via 3dTcat.
-    8. Collect per-run censoring statistics for QC.
+       files, runs per-run DOF checks (emits RUN_SKIPPED graded_warning and skips
+       runs where ModelError is raised), and concatenates surviving runs via 3dTcat.
+    8. Collect per-run censoring statistics for QC; emit CENSOR_HIGH graded_warning
+       if aggregate censoring exceeds 50%.
     9. Optionally extract parcel time series from the concatenated residuals (gen_ptseries).
     10. Optionally compute functional connectivity from the concatenated residuals (gen_conn).
     11. Write QC summary JSON.
+    12. Return FirstLevelResult with status, warnings, qc_summary, and output_files.
 
-    Works from both the CLI (main()) and the config-driven dispatch runner
+    Works from the config-driven dispatch runner
     (run_first_level.py / DISPATCH["rest_conn"]).
 
     Parameters
     ----------
-    args : argparse.Namespace
-        All pipeline arguments (see main() argparse block or first_level_config.py
-        build_namespace for the full attribute list).
-    logger : logging.Logger
-    """
-    args = copy.copy(args)
+    config : ResolvedConfig
+        All pipeline configuration (see first_level_config.py ResolvedConfig for
+        the full attribute list).
+    logger : logging.Logger or None
+        If None, a default logger is created via setup_logging.
 
-    # Validate all path lists are the same length (CLI usage may skip config validation)
-    path_lengths = {"scan_paths": len(args.scan_paths), "motion_paths": len(args.motion_paths),
-                    "CSF_paths": len(args.CSF_paths), "WM_paths": len(args.WM_paths)}
-    if args.GS_paths is not None:
-        path_lengths["GS_paths"] = len(args.GS_paths)
+    Returns
+    -------
+    FirstLevelResult
+        Pipeline result with status ('success' or 'warning'),
+        output_dir, accumulated warnings, qc_summary, and output_files.
+
+    Raises
+    ------
+    ConfigError
+        For invalid option combinations or path list length mismatches.
+    InputError
+        For missing required input files.
+    ToolExecutionError
+        For AFNI command failures or missing expected output files.
+    """
+    if logger is None:
+        logger = setup_logging("rest_conn_first_level")
+
+    config = copy.copy(config)
+    clear_warnings()
+
+    # Validate all path lists are the same length (config-driven dispatch validates
+    # this upstream, but guard here for direct programmatic callers)
+    path_lengths = {"scan_paths": len(config.scan_paths), "motion_paths": len(config.motion_paths),
+                    "CSF_paths": len(config.CSF_paths), "WM_paths": len(config.WM_paths)}
+    if config.GS_paths is not None:
+        path_lengths["GS_paths"] = len(config.GS_paths)
     if len(set(path_lengths.values())) > 1:
-        logger.error("All path lists must be the same length. Got: %s", path_lengths)
-        sys.exit(1)
+        raise ConfigError(
+            f"All path lists must be the same length. Got: {path_lengths}"
+        )
 
     logger.info("Residual dense time series will be created for resting-state fMRI.")
-    if args.use_tissue_derivs:
+    if config.use_tissue_derivs:
         tissue_parts = ["CSF", "WM"]
-        if args.GS_paths is not None:
+        if config.GS_paths is not None:
             tissue_parts.append("GS")
         logger.info("Tissue signal derivatives will be included as additional regressors: %s", ", ".join(tissue_parts))
-    if args.GS_paths is not None:
-        logger.warning("Global signal regression (GSR) is enabled. Note: GSR is controversial — "
+    if config.GS_paths is not None:
+        logger.warning("Global signal regression (GSR) is enabled. Note: GSR is controversial -- "
                        "it can remove neural signal and introduce artifactual anti-correlations. "
                        "Use with caution and report in methods.")
+    else:
+        graded_warning(logger, 'low', 'GS_MISSING',
+                       "Global signal paths (GS_paths) not provided; global signal regression (GSR) disabled.",
+                       user_facing=False)
 
     # If --remove_previous is provided, clear-out the output dir (before template
     # resampling or any other file creation in out_dir)
-    if args.remove_previous:
-        logger.info("Removing all files from previous analyses in %s (if they exist).", args.out_dir)
-        remove_files_from_dir(args.out_dir, logger=logger)
+    if config.remove_previous:
+        logger.info("Removing all files from previous analyses in %s (if they exist).", config.out_dir)
+        remove_files_from_dir(config.out_dir, logger=logger)
 
     # Make sure optional args exist if --extract_ptseries is provided
-    if args.extract_ptseries:
-        args.template_path = validate_extract_options(
-            "--extract_ptseries", args.average_type, args.extract_out_file_pre,
-            args.template_path, args.scan_paths[0], args.out_dir, args.force_diff_atlas,
+    if config.extract_ptseries:
+        config.template_path = validate_extract_options(
+            "--extract_ptseries", config.average_type, config.extract_out_file_pre,
+            config.template_path, config.scan_paths[0], config.out_dir, config.force_diff_atlas,
             logger=logger)
 
     # Make sure optional args exist if --calc_conn is provided
-    if args.calc_conn is not None:
-        args.template_path = validate_connectivity_options(
-            args.calc_conn, args.conn_out_file_pre, args.template_path,
-            args.scan_paths[0], args.out_dir, args.force_diff_atlas,
+    if config.calc_conn is not None:
+        config.template_path = validate_connectivity_options(
+            config.calc_conn, config.conn_out_file_pre, config.template_path,
+            config.scan_paths[0], config.out_dir, config.force_diff_atlas,
             data_label="residual time series", logger=logger)
     else:
         logger.info("Connectivity will not be output after generating residual time series.")
@@ -602,50 +660,61 @@ def run(args, logger):
     # ---------------------------------
 
     # Extract minimum-outlier representative EPI frame per run (mandatory, before regression)
-    for i, scan in enumerate(args.scan_paths):
-        gen_min_outlier_epi(scan, args.out_dir, args.out_file_pre, f"run{i+1}", logger)
+    for i, scan in enumerate(config.scan_paths):
+        gen_min_outlier_epi(scan, config.out_dir, config.out_file_pre, f"run{i+1}", logger)
+
+    # PSC scaling per run (after min-outlier EPI, before regression)
+    if config.scale_to_psc:
+        config.scan_paths = list(config.scan_paths)
+        for i, scan in enumerate(config.scan_paths):
+            psc_path = scale_to_psc(
+                scan, config.out_dir, config.out_file_pre, f"run{i+1}", logger)
+            config.scan_paths[i] = psc_path
 
     # Extract pre-regression parcellated time series per run if requested
-    if getattr(args, 'extract_raw_ptseries', False):
-        if args.extract_out_file_pre is None:
-            logger.error("extract_raw_ptseries requires extract_out_file_pre to be set.")
-            sys.exit(1)
-        if args.template_path is None:
-            logger.error("extract_raw_ptseries requires a valid template_path.")
-            sys.exit(1)
-        validated_tpl = validate_template(args.scan_paths[0], args.template_path,
-            args.out_dir, args.force_diff_atlas, conn_type="extract", logger=logger)
-        for i, scan in enumerate(args.scan_paths):
-            raw_out = os.path.join(args.out_dir,
-                f"{args.extract_out_file_pre}_run{i+1}_raw_ptseries.csv")
+    if getattr(config, 'extract_raw_ptseries', False):
+        if config.extract_out_file_pre is None:
+            raise ConfigError(
+                "extract_raw_ptseries requires extract_out_file_pre to be set."
+            )
+        if config.template_path is None:
+            raise ConfigError(
+                "extract_raw_ptseries requires a valid template_path."
+            )
+        validated_tpl = validate_template(config.scan_paths[0], config.template_path,
+            config.out_dir, config.force_diff_atlas, conn_type="extract", logger=logger)
+        for i, scan in enumerate(config.scan_paths):
+            raw_out = os.path.join(config.out_dir,
+                f"{config.extract_out_file_pre}_run{i+1}_raw_ptseries.csv")
             if not os.path.exists(raw_out):
-                raw_df = extract_roi_stats(scan, validated_tpl, args.average_type, logger=logger)
+                raw_df = extract_roi_stats(scan, validated_tpl, config.average_type, logger=logger)
                 raw_df.to_csv(raw_out)
                 if os.path.exists(raw_out):
                     logger.info("Extracted raw ptseries for run %d to %s.", i+1, raw_out)
                 else:
-                    logger.error("Failed to extract raw ptseries for run %d.", i+1)
-                    sys.exit(1)
+                    raise ToolExecutionError(
+                        f"Failed to extract raw ptseries for run {i+1}."
+                    )
             else:
                 logger.info("Raw ptseries for run %d already exists: %s", i+1, raw_out)
 
     # Build QC summary data with per-run censoring stats
     qc_data = {
         "analysis_type": "rest_conn",
-        "fd_threshold": args.fd_threshold,
-        "censor_prev_tr": args.censor_prev_tr,
-        "bandpass": args.bandpass,
+        "fd_threshold": config.fd_threshold,
+        "censor_prev_tr": config.censor_prev_tr,
+        "bandpass": config.bandpass,
         "per_run_censoring": [],
     }
 
     # Generate residual dense time series (regression for denoising, censoring, and temporal filtering)
-    per_run_dof = gen_residual_ts(args, logger)
+    per_run_dof = gen_residual_ts(config, logger)
     if per_run_dof:
         qc_data["per_run_dof"] = per_run_dof
 
     # Collect per-run censor stats (censor files were created inside gen_residual_ts)
-    for i in range(len(args.scan_paths)):
-        censor_path = os.path.join(args.out_dir, f"{args.out_file_pre}_run{i+1}_censor.1D")
+    for i in range(len(config.scan_paths)):
+        censor_path = os.path.join(config.out_dir, f"{config.out_file_pre}_run{i+1}_censor.1D")
         run_stats = {"run": i + 1}
         try:
             censor_data = np.loadtxt(censor_path)
@@ -665,75 +734,60 @@ def run(args, logger):
     qc_data["n_trs_censored"] = total_censored
     qc_data["pct_censored"] = round(100.0 * total_censored / total_trs, 2) if total_trs > 0 else 0.0
 
+    # Emit CENSOR_HIGH graded_warning if aggregate censoring exceeds 50%
+    if qc_data["pct_censored"] > 50.0:
+        graded_warning(
+            logger, 'high', 'CENSOR_HIGH',
+            f"Aggregate censoring is {qc_data['pct_censored']:.1f}% (>{50.0}% threshold). "
+            "Results may be unreliable; consider relaxing the FD threshold.",
+            user_facing=True,
+        )
+
     # Extract ptseries if user provided option
-    if args.extract_ptseries:
-        gen_ptseries(args, logger)
+    if config.extract_ptseries:
+        gen_ptseries(config, logger)
 
     # Generate connectivity from residual time series if user provided option
-    if args.calc_conn is not None:
-        gen_conn(args, logger)
+    if config.calc_conn is not None:
+        gen_conn(config, logger)
 
     # Write QC summary
-    write_qc_summary(args.out_dir, args.out_file_pre, qc_data, logger)
+    write_qc_summary(config.out_dir, config.out_file_pre, qc_data, logger)
 
-def main():
-    """CLI entrypoint: parse --flags, call run()."""
+    # Collect output_files
+    output_files: list[str] = []
+    for i in range(len(config.scan_paths)):
+        psc_out = os.path.join(config.out_dir, f"{config.out_file_pre}_run{i+1}_psc.nii.gz")
+        if os.path.exists(psc_out):
+            output_files.append(psc_out)
+    concat_path = os.path.join(config.out_dir, f"{config.out_file_pre}_concat_residual_dtseries.nii.gz")
+    if os.path.exists(concat_path):
+        output_files.append(concat_path)
+    if config.keep_run_res_dtseries:
+        for i in range(len(config.scan_paths)):
+            run_res = os.path.join(config.out_dir, f"{config.out_file_pre}_run{i+1}_residual_dtseries.nii.gz")
+            if os.path.exists(run_res):
+                output_files.append(run_res)
+    if getattr(config, 'extract_raw_ptseries', False) and config.extract_out_file_pre is not None:
+        for i in range(len(config.scan_paths)):
+            raw_out = os.path.join(config.out_dir, f"{config.extract_out_file_pre}_run{i+1}_raw_ptseries.csv")
+            if os.path.exists(raw_out):
+                output_files.append(raw_out)
+    if config.extract_ptseries and config.extract_out_file_pre is not None:
+        pts_path = os.path.join(config.out_dir, f"{config.extract_out_file_pre}_residual_ptseries.csv")
+        if os.path.exists(pts_path):
+            output_files.append(pts_path)
+    qc_path = os.path.join(config.out_dir, f"{config.out_file_pre}_qc_summary.json")
+    if os.path.exists(qc_path):
+        output_files.append(qc_path)
 
-    # Start the timer
-    start_time = time.time()
+    # Determine result status
+    status = "warning" if any(w.get("severity") == "high" for w in get_warnings()) else "success"
 
-    # ---------------------------------
-    # Parse arguments
-    # ---------------------------------
-    parser = argparse.ArgumentParser()
-    # required:
-    parser.add_argument("--scan_paths", type=file_path_exists, nargs='+', required=True)
-    parser.add_argument("--motion_paths", type=file_path_exists, nargs='+', required=True)
-    parser.add_argument("--CSF_paths", type=file_path_exists, nargs='+', required=True)
-    parser.add_argument("--WM_paths", type=file_path_exists, nargs='+', required=True)
-    parser.add_argument("--GS_paths", type=file_path_exists, nargs='+', default=None, required=False,
-                        help="Optional global signal regressors (one per run). Enables global signal regression.")
-    parser.add_argument("--out_dir", type=dir_path_exists, required=True)
-    parser.add_argument("--out_file_pre", type=str, required=True)
-    parser.add_argument("--num_cores", type=int, required=True)
-    parser.add_argument("--fd_threshold", type=float, required=True,
-                        help="Framewise displacement threshold (mm) for motion censoring.")
-    parser.add_argument("--censor_prev_tr", action='store_true', default=False,
-                        help="Also censor the TR before each high-motion TR (default: False).")
-    parser.add_argument("--notch_filter_band", type=float, nargs=2, default=None, required=False,
-                        help="Notch filter Hz band [low high] for respiratory artifact removal (default: disabled).")
-    parser.add_argument("--tr", type=float, required=True,
-                        help="Repetition time in seconds.")
-
-    # optional:
-    parser.add_argument("--bandpass", type=float, nargs=2, default=[0.01, 0.1], required=False,
-                        help="Bandpass filter frequencies [low high] in Hz. Omit to use default [0.01, 0.1].")
-    parser.add_argument("--remove_previous", action='store_true', required=False)
-    parser.add_argument("--extract_ptseries", action='store_true', required=False)
-    parser.add_argument("--average_type", type=valid_ave_type, required=False)
-    parser.add_argument("--extract_out_file_pre", type=str, required=False)
-    parser.add_argument("--calc_conn", type=valid_conn_type, required=False)
-    parser.add_argument("--conn_out_file_pre", type=str, required=False)
-    parser.add_argument("--template_path", type=file_path_exists, required=False)
-    parser.add_argument("--extract_raw_ptseries", action='store_true', default=False, required=False,
-                        help="Extract pre-regression parcellated time series per run (requires --template_path and --extract_out_file_pre).")
-    parser.add_argument("--force_diff_atlas", action='store_true', required=False)
-    parser.add_argument("--pcorr", action='store_true', required=False)
-    parser.add_argument("--fishZ", action='store_true', required=False)
-    parser.add_argument("--keep_run_res_dtseries", action=argparse.BooleanOptionalAction, default=True,
-                        help="Keep per-run residual dtseries files after concatenation (default: True). Use --no-keep_run_res_dtseries to remove them.")
-    parser.add_argument("--use_tissue_derivs", action='store_true', default=False, required=False,
-                        help="Include first temporal derivatives of tissue signals (CSF/WM/GS) as additional nuisance regressors.")
-    parser.add_argument("--use_sequenced_bandpass", action='store_true', default=False, required=False,
-                        help="Use sequenced denoising path: censor-interpolate, bandpass, then nuisance-regress (Ciric-inspired). Default False = simultaneous 3dTproject path. Opt in when DOF pressure from -bandpass implied regressors is excessive.")
-
-    args = parser.parse_args()
-    logger = setup_logging("rest_conn_first_level")
-
-    run(args, logger)
-
-    # Display total runtime
-    logger.info("Total runtime: %.2f seconds", time.time() - start_time)
-
-if __name__ == "__main__":
-    main()
+    return FirstLevelResult(
+        status=status,
+        output_dir=Path(config.out_dir),
+        warnings=get_warnings(),
+        qc_summary=qc_data,
+        output_files=output_files,
+    )

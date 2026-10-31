@@ -1,6 +1,6 @@
 # Input Specification
 
-Complete reference for all inputs accepted by `fmri-first-level-proc`. This document covers the YAML config structure, every parameter and its allowed values, and the exact format requirements for each input file.
+Complete reference for all inputs accepted by `fmri-first-level-proc`. This document covers the YAML config structure, every parameter and its allowed values, the exact format requirements for each input file, all output files, runtime validation, and exit codes.
 
 ---
 
@@ -14,14 +14,19 @@ Complete reference for all inputs accepted by `fmri-first-level-proc`. This docu
 - [Analysis Block: rest\_conn](#analysis-block-rest_conn)
 - [Input File Formats](#input-file-formats)
   - [Scan File](#scan-file)
-  - [Task Timing CSV](#task-timing-csv)
+  - [Task Timing File](#task-timing-file)
   - [Motion Regressor File](#motion-regressor-file)
   - [Censor File (Generated Internally)](#censor-file-generated-internally)
   - [Tissue Regressor Files (CSF, WM, GS)](#tissue-regressor-files-csf-wm-gs)
   - [ROI Template File](#roi-template-file)
+  - [Tools Lockfile](#tools-lockfile)
+- [BIDS Input Discovery](#bids-input-discovery)
 - [Output Files](#output-files)
 - [Quality Control](#quality-control)
+- [Runtime Validation](#runtime-validation)
+- [Exit Codes](#exit-codes)
 - [CLI Flags](#cli-flags)
+- [Exception Hierarchy](#exception-hierarchy)
 
 ---
 
@@ -52,8 +57,9 @@ analyses:
 | `tr` | float | (required) | Repetition time in seconds. Applies to all scans across all analysis blocks. |
 | `template_path` | str or null | `null` | Path to a shared ROI template NIfTI file (`.nii.gz`). Required if any block uses extraction or connectivity. See [ROI Template File](#roi-template-file). |
 | `force_diff_atlas` | bool | `false` | Allow atlas space/orientation mismatch between scan and template. Use with caution. |
+| `derivatives_dirs` | list of str or null | `null` | Ordered list of BIDS derivatives directories for input discovery. See [BIDS Input Discovery](#bids-input-discovery). Can also be set per-block. |
 
-These four keys are **global-only**. If they appear inside an analysis block, the block value is ignored and a warning is logged.
+These keys are **global-only** (except `derivatives_dirs`, which can also be set per-block; block-level overrides global). If `num_cores`, `tr`, `template_path`, or `force_diff_atlas` appear inside an analysis block, the block value is ignored and a warning is logged.
 
 ---
 
@@ -65,13 +71,15 @@ Every analysis block must contain these fields:
 |---|---|---|---|
 | `name` | str | No | Human-readable label for the block. Defaults to `analyses[<index>]`. |
 | `type` | str | Yes | One of: `task_act`, `task_conn`, `rest_conn`. |
-| `paths` | dict | Yes | Input file paths. Required sub-keys vary by type (see below). |
+| `paths` | dict | Conditional | Input file paths. Required unless BIDS discovery is active (`derivatives_dirs` is set). Required sub-keys vary by type (see below). |
 | `out_dir` | str | Yes | Output directory. Created automatically if it does not exist. |
 | `out_file_pre` | str | Yes | Output filename prefix for all generated files. |
 | `remove_previous` | bool | No | `true` = delete all files in `out_dir` before running. Default: `false`. |
 | `average_type` | str | Yes | `"mean"` or `"median"`. Controls parcel-level averaging during extraction. |
 | `fd_threshold` | float | Yes | Framewise displacement threshold in mm for motion censoring. TRs with FD above this value are censored. |
 | `censor_prev_tr` | bool | No | `true` = also censor the TR immediately before each high-motion TR. Default: `false`. |
+| `scale_to_psc` | bool | No | `true` = scale BOLD to percent signal change before regression. Default: `true`. PSC scaling computes voxelwise temporal mean, divides each time series by its mean, and multiplies by 100 (with a 200% ceiling and zero-guard). Available for all three analysis types. |
+| `derivatives_dirs` | list of str or null | No | Per-block override for BIDS derivatives directories. |
 
 ---
 
@@ -83,7 +91,7 @@ First-level GLM via AFNI `3dDeconvolve`.
 
 | Key | Type | Description |
 |---|---|---|
-| `cond_labels` | list of str | Condition labels. Must match entries in the `CONDITION` column of the timing CSV. |
+| `cond_labels` | list of str | Condition labels. Must match entries in the `trial_type` column of the timing file (BIDS) or `CONDITION` column (legacy CSV). |
 | `hrf_model` | str | HRF model. One of: `GAM`, `BLOCK`, `dmBLOCK`, `SPMG1`, `custom`. |
 | `include_motion_derivs` | bool | `false` = 6 motion columns. `true` = 12 motion columns (6 base + 6 temporal derivatives). |
 
@@ -92,8 +100,10 @@ First-level GLM via AFNI `3dDeconvolve`.
 | Key | Type | Description |
 |---|---|---|
 | `paths.scan_path` | str | Path to preprocessed, run-concatenated NIfTI scan. See [Scan File](#scan-file). |
-| `paths.task_timing_path` | str | Path to task timing CSV. See [Task Timing CSV](#task-timing-csv). |
+| `paths.task_timing_path` | str | Path to task timing file. See [Task Timing File](#task-timing-file). |
 | `paths.motion_path` | str | Path to motion regressor file. See [Motion Regressor File](#motion-regressor-file). |
+
+All required paths may be omitted when BIDS discovery is active (`derivatives_dirs` is set); see [BIDS Input Discovery](#bids-input-discovery).
 
 ### Optional Paths
 
@@ -109,7 +119,7 @@ First-level GLM via AFNI `3dDeconvolve`.
 | `custom_hrf` | str or null | `null` | Custom AFNI HRF model string (e.g. `"TENT(0,14,8)"`). Required when `hrf_model: custom`. |
 | `use_tissue_derivs` | bool | `false` | `true` = include first temporal derivatives of tissue signals (CSF, WM) as additional nuisance regressors. Only computed for tissue paths that are not null. |
 | `contrasts` | dict or null | `null` | Linear contrast specification. See below. |
-| `extraction` | dict or null | `null` | Parcel-level stat extraction. See below. |
+| `extraction` | dict or null | `null` | Stat-bucket extraction. See below. |
 
 ### Contrasts
 
@@ -126,23 +136,29 @@ contrasts:
 - `functions`: list of AFNI-style contrast equations using condition labels. Set to `null` to disable.
 - `labels`: human-readable names for each contrast. Same length as `functions`.
 
-### Extraction
+### Extraction (stat_buckets API)
 
 ```yaml
 extraction:
-  extract: true                    # bool; true = enable, false = skip
-  extract_labels:                  # list of str; condition and/or contrast labels to extract
-    - "stimFear"
-    - "Fear-Neutral"
-  extract_stat: "z"                # str; one of: "z", "t", "r"
-  extract_out_file_pre: "subj001"  # str; output filename prefix for extracted values
-  extract_resids: false            # bool; true = also extract residuals
-  extract_raw_ptseries: false      # bool; true = extract pre-regression parcellated time series
+  stat_buckets: ["Tstat", "Zstat"]     # list of stat types; valid: "Coef", "Tstat", "Fstat", "R^2", "Zstat"; null = disabled
+  extract_out_file_pre: "subj001"      # str; output filename prefix for extracted values
+  extract_resids: false                # bool; true = also extract residuals
+  extract_raw_ptseries: false          # bool; true = extract pre-regression parcellated time series
 ```
 
-When `extract: true`, all sub-keys (`extract_labels`, `extract_stat`, `extract_out_file_pre`) are required. Requires `template_path` in global settings.
+When `stat_buckets` is set (non-null, non-empty list), for each stat type:
+1. All matching sub-bricks are discovered in the 3dDeconvolve bucket dataset.
+2. Matched sub-bricks are extracted into a multi-sub-brick NIfTI: `{extract_out_file_pre}_{StatType}_bucket.nii.gz`.
+3. A JSON index mapping condition/contrast labels to sub-brick indices is written: `{extract_out_file_pre}_{StatType}_index.json`.
+4. When `template_path` is available (not null and not `"WB"`), a parcellated CSV is written (rows = conditions/contrasts, columns = ROIs).
 
-When `extract_raw_ptseries: true`, `extract_out_file_pre` and `template_path` are required. Extracts ROI-level time series from the raw (pre-regression) scan. Output: `{extract_out_file_pre}_raw_ptseries.csv`. Uses skip-if-exists logic (task_act and task_conn produce identical output when run on the same scan/template).
+For `"Zstat"`: Tstat sub-bricks are located, converted to Z-scores via AFNI's `fitt_t2z()`, then assembled into the Z bucket.
+
+Requires `extract_out_file_pre`. Requires `template_path` in global settings when parcellated CSVs are desired. Requires `average_type` when `template_path` is set.
+
+A master sub-brick index for the full bucket stats dataset is always generated: `{out_file_pre}_concat_bucket_stats_index.json`.
+
+When `extract_raw_ptseries: true`, `extract_out_file_pre` and `template_path` are required. Extracts ROI-level time series from the raw (pre-regression) scan. Output: `{extract_out_file_pre}_raw_ptseries.csv`. Uses skip-if-exists logic.
 
 ---
 
@@ -154,13 +170,13 @@ Beta series estimation via AFNI `3dDeconvolve` + `3dLSS`.
 
 | Key | Type | Description |
 |---|---|---|
-| `cond_beta_labels` | list of str | Conditions for trial-level beta series estimation. Must match entries in the `CONDITION` column of the timing CSV. |
+| `cond_beta_labels` | list of str | Conditions for trial-level beta series estimation. Must match entries in the `trial_type` column of the timing file (BIDS) or `CONDITION` column (legacy CSV). |
 | `hrf_model` | str | HRF model. One of: `GAM`, `BLOCK`, `dmBLOCK`, `SPMG1`, `custom`. |
 | `include_motion_derivs` | bool | `false` = 6 motion columns. `true` = 12 motion columns. |
 
 ### Required Paths
 
-Same as `task_act`: `scan_path`, `task_timing_path`, `motion_path`.
+Same as `task_act`: `scan_path`, `task_timing_path`, `motion_path`. All may be omitted when BIDS discovery is active.
 
 ### Optional Paths
 
@@ -261,6 +277,8 @@ All path keys are **lists** with one entry per run. All lists must be the **same
 | `paths.CSF_paths` | list of str | Mean CSF BOLD signal per TR, per run. See [Tissue Regressor Files](#tissue-regressor-files-csf-wm-gs). |
 | `paths.WM_paths` | list of str | Mean WM BOLD signal per TR, per run. See [Tissue Regressor Files](#tissue-regressor-files-csf-wm-gs). |
 
+All required paths may be omitted when BIDS discovery is active.
+
 ### Optional Paths
 
 | Key | Type | Default | Description |
@@ -313,36 +331,35 @@ connectivity:
 - **Task analyses (`task_act`, `task_conn`):** A single file containing all runs concatenated along the time dimension.
 - **Resting-state (`rest_conn`):** One file per run (not concatenated; the pipeline concatenates residuals internally).
 
-### Task Timing CSV
+### Task Timing File
 
-- **Format:** CSV (comma-delimited) with a header row
-- **Reader:** `pandas.read_csv(path, sep=',')`
-- **Required columns (exact names):**
+The pipeline accepts two formats, detected by inspecting the file header (content-authoritative detection). BIDS format is preferred; legacy CSV format is deprecated and will be removed in v4.0.0.
+
+**BIDS format** (preferred): Tab-separated values (`.tsv`).
 
 | Column | Type | Description |
 |---|---|---|
-| `CONDITION` | str | Trial condition label. Must match entries in `cond_labels` (task_act) or `cond_beta_labels` (task_conn). |
-| `ONSET` | float | Trial onset time in seconds, relative to the start of the concatenated scan. |
+| `onset` | float | Trial onset time in seconds, relative to the start of the concatenated scan. |
+| `duration` | float | Trial duration in seconds. |
+| `trial_type` | str | Trial condition label. Must match entries in `cond_labels` (task_act) or `cond_beta_labels` (task_conn). |
+
+Optional BIDS columns (e.g. `amplitude`) are preserved but only `onset`, `duration`, and `trial_type` are used.
+
+**Legacy CSV format** (deprecated): Comma-separated values (`.csv`).
+
+| Column | Type | Description |
+|---|---|---|
+| `CONDITION` | str | Trial condition label. Mapped internally to `trial_type`. |
+| `ONSET` | float | Trial onset time in seconds. |
 | `DURATION` | float | Trial duration in seconds. |
+| `AMP` | float (optional) | Amplitude modulator. Used by `dmBLOCK` and amplitude-modulated HRF models. |
 
-- **Optional column:**
+**Detection logic:** The file extension determines the delimiter (`.tsv` = tab; `.csv`/other = comma). Then the header columns are inspected: if `onset`, `duration`, `trial_type` are present (case-insensitive), the file is treated as BIDS format. If `CONDITION`, `ONSET`, `DURATION` are present (case-insensitive), it is treated as legacy CSV and a deprecation warning is emitted. All internal processing uses BIDS column names (`onset`, `duration`, `trial_type`) regardless of input format.
 
-| Column | Type | Description |
-|---|---|---|
-| `AMP` | float | Amplitude modulator. Used by `dmBLOCK` and amplitude-modulated HRF models. |
-
-- **Row ordering:** Rows are sorted by `ONSET` internally; input order does not matter.
+**Common rules:**
+- **Row ordering:** Rows are sorted by `onset` internally; input order does not matter.
 - **Condition coverage:** Every label in `cond_labels`/`cond_beta_labels` must appear at least once. A warning is logged for conditions with fewer than 3 trials.
 - **Extra conditions:** The timing file may contain conditions not listed in `cond_labels`/`cond_beta_labels`; they are ignored.
-
-Example:
-
-```csv
-CONDITION,ONSET,DURATION,AMP
-stimFear,25.879,3.985,1
-stimSad,5.663,3.968,1
-stimNeu,66.462,3.967,1
-```
 
 ### Motion Regressor File
 
@@ -357,14 +374,6 @@ stimNeu,66.462,3.967,1
   - `rest_conn` with `motion_deriv_degree: N` -> minimum `6 * N` columns used
 - **Truncation:** If the file contains more columns than needed, extra columns are silently truncated to the required count. A log message is emitted when this occurs.
 - **Prepared file:** The pipeline writes a validated, truncated copy to `out_dir` as `{out_file_pre}_concat_motion_prepared.1D` (task) or `{out_file_pre}_run{N}_motion_prepared.1D` (rest_conn). The prepared file is tab-delimited with 8 decimal places.
-
-Example (6-column):
-
-```
-0.0123    0.0456    0.0789    -0.0012    0.0034    -0.0056
-0.0130    0.0460    0.0792    -0.0010    0.0032    -0.0054
-...
-```
 
 ### Censor File (Generated Internally)
 
@@ -387,15 +396,6 @@ Applies to: `CSF_path`/`CSF_paths`, `WM_path`/`WM_paths`, `GS_paths`
   - `task_act`, `task_conn`: CSF and WM are optional (`null` to skip)
   - `rest_conn`: CSF and WM are **required**; GS is optional (`null` to skip global signal regression)
 
-Example:
-
-```
-1023.456
-1025.789
-1022.123
-...
-```
-
 ### ROI Template File
 
 - **Format:** NIfTI (`.nii` or `.nii.gz`)
@@ -406,6 +406,47 @@ Example:
   - Must contain at least one non-zero voxel
   - For `seed_to_voxel` connectivity: must be a binary mask (max label = 1)
   - For `parcellated` connectivity or extraction: must have >= 2 distinct ROI labels
+
+### Tools Lockfile
+
+- **File:** `tools.lock.yaml` (at repository root)
+- **Format:** YAML
+- **Purpose:** Pins expected versions of external tools and the Python runtime for reproducibility.
+- **Schema:**
+  ```yaml
+  lockfile_version: "1.0.0"
+  python: "3.14.3"          # major.minor.patch; minor-series match enforced
+  binaries:
+    AFNI: "26.0.09"         # exact match enforced; "PLACEHOLDER" to skip
+  ```
+- **Behavior:** When present, the pipeline reads the lockfile at startup and validates installed versions. Version mismatches raise `ToolVersionError` (exit code 4). When absent (e.g., pip-install users), a low-severity `LOCKFILE_ABSENT` warning is emitted and version pinning is skipped. The lockfile resolves relative to the repository root (`__file__.parent.parent`), not `site-packages`, so pip-installed users always hit the graceful-absence path.
+
+---
+
+## BIDS Input Discovery
+
+When `derivatives_dirs` is set (in `global` or in a specific analysis block), the pipeline can automatically discover preprocessed input files from BIDS derivatives directories. This reduces per-subject path boilerplate.
+
+**Activation:** Set `derivatives_dirs` to an ordered list of BIDS derivatives root directories. When active, the `paths` block in each analysis becomes optional: any path slot not explicitly provided is filled by BIDS discovery.
+
+**Discovery rules:**
+- Directories are searched in list order. For each slot, the first directory that yields matches wins.
+- If a slot matches in more than one directory, a `DISCOVERY_COLLISION` warning (severity `medium`) is emitted.
+- Slots with no matches in any directory are returned as `None`; mandatory-slot enforcement happens during config resolution.
+
+**Required block keys when discovery is active:** The block must include a `subject` key (BIDS subject label without the `sub-` prefix). Optional: `session` (without `ses-` prefix), `task` (without `task-` prefix).
+
+**Slot definitions:**
+
+| Slot | BIDS desc | BIDS suffix | Extension | Mandatory |
+|------|-----------|-------------|-----------|-----------|
+| scan_path/paths | preproc | bold | .nii.gz | all types |
+| motion_path/paths | confounds | regressors | .tsv | all types |
+| task_timing_path | -- | events | .tsv | task_act, task_conn |
+| CSF_path/paths | CSF | timeseries | .1D | rest_conn |
+| WM_path/paths | WM | timeseries | .1D | rest_conn |
+| GS_paths | GS | timeseries | .1D | optional |
+| template_path | -- | dseg | .nii.gz | optional |
 
 ---
 
@@ -446,39 +487,48 @@ Schema varies by analysis type:
 
 ### Task Activation (`task_act`)
 
-- `{out_file_pre}_min_outlier_epi.nii.gz` — single-volume EPI frame with the lowest voxelwise outlier fraction (mandatory)
-- `{out_file_pre}_concat_bucket_stats.nii.gz` — AFNI bucket dataset with condition betas, t-stats, and contrasts
-- `{out_file_pre}_concat_censor.1D` — generated censor file
-- `{out_file_pre}_concat_motion_prepared.1D` — validated/truncated motion regressors
-- `{out_file_pre}_concat_{label}_onsets.txt` — per-condition AFNI onset files
-- `{out_file_pre}_qc_summary.json` — QC summary
-- Extracted parcel stats (if `extraction` enabled): CSV files with parcel-level statistics
-- `{extract_out_file_pre}_raw_ptseries.csv` (if `extract_raw_ptseries: true`) — pre-regression parcellated time series
+- `{out_file_pre}_min_outlier_epi.nii.gz` -- single-volume EPI frame with the lowest voxelwise outlier fraction (mandatory)
+- `{out_file_pre}_psc.nii.gz` -- PSC-scaled 4D scan (when `scale_to_psc: true`)
+- `{out_file_pre}_mean.nii.gz` -- voxelwise temporal mean (when `scale_to_psc: true`)
+- `{out_file_pre}_concat_bucket_stats.nii.gz` -- AFNI bucket dataset with condition betas, t-stats, and contrasts
+- `{out_file_pre}_concat_bucket_stats_index.json` -- JSON mapping every sub-brick label to its 0-based index
+- `{out_file_pre}_concat_censor.1D` -- generated censor file
+- `{out_file_pre}_concat_motion_prepared.1D` -- validated/truncated motion regressors
+- `{out_file_pre}_concat_{label}_onsets.txt` -- per-condition AFNI onset files
+- `{out_file_pre}_qc_summary.json` -- QC summary
+- `{extract_out_file_pre}_{StatType}_bucket.nii.gz` (if `stat_buckets` enabled) -- multi-sub-brick NIfTI per stat type
+- `{extract_out_file_pre}_{StatType}_index.json` (if `stat_buckets` enabled) -- JSON mapping condition/contrast labels to sub-brick indices per stat type
+- `{extract_out_file_pre}_{StatType}_{average_type}_ptseries.csv` (if `stat_buckets` enabled and `template_path` set) -- parcellated CSV per stat type
+- `{extract_out_file_pre}_raw_ptseries.csv` (if `extract_raw_ptseries: true`) -- pre-regression parcellated time series
 
 ### Task Connectivity (`task_conn`)
 
-- `{out_file_pre}_min_outlier_epi.nii.gz` — single-volume EPI frame with the lowest voxelwise outlier fraction (mandatory)
-- `{out_file_pre}_concat_bseries_{condition}.nii.gz` — per-condition trial-level beta series from 3dLSS
-- `{out_file_pre}_concat_censor.1D` — generated censor file
-- `{out_file_pre}_concat_motion_prepared.1D` — validated/truncated motion regressors
-- `{out_file_pre}_qc_summary.json` — QC summary
+- `{out_file_pre}_min_outlier_epi.nii.gz` -- single-volume EPI frame with the lowest voxelwise outlier fraction (mandatory)
+- `{out_file_pre}_psc.nii.gz` -- PSC-scaled 4D scan (when `scale_to_psc: true`)
+- `{out_file_pre}_mean.nii.gz` -- voxelwise temporal mean (when `scale_to_psc: true`)
+- `{out_file_pre}_concat_bseries_{condition}.nii.gz` -- per-condition trial-level beta series from 3dLSS
+- `{out_file_pre}_concat_censor.1D` -- generated censor file
+- `{out_file_pre}_concat_motion_prepared.1D` -- validated/truncated motion regressors
+- `{out_file_pre}_qc_summary.json` -- QC summary
 - Extracted parcel beta series (if `extraction` enabled): CSV files
-- `{extract_out_file_pre}_raw_ptseries.csv` (if `extract_raw_ptseries: true`) — pre-regression parcellated time series
+- `{extract_out_file_pre}_raw_ptseries.csv` (if `extract_raw_ptseries: true`) -- pre-regression parcellated time series
 - Connectivity matrices (if `connectivity` enabled): tab-delimited text files
 - Connectivity contrast outputs (if `contrasts` enabled with connectivity): contrast-level matrices (parcellated) or NIfTI maps (seed-to-voxel), using same naming convention as condition outputs with the sanitized contrast label
 
 ### Resting-State Connectivity (`rest_conn`)
 
-- `{out_file_pre}_run{N}_min_outlier_epi.nii.gz` — per-run single-volume EPI frame with the lowest voxelwise outlier fraction (mandatory)
-- `{out_file_pre}_run{N}_residual_dtseries.nii.gz` — per-run residual time series from 3dTproject
-- `{out_file_pre}_concat_residual_dtseries.nii.gz` — concatenated residual time series
-- `{out_file_pre}_run{N}_censor.1D` — per-run generated censor files
-- `{out_file_pre}_run{N}_motion_prepared.1D` — per-run validated/truncated motion regressors
-- `{out_file_pre}_qc_summary.json` — QC summary
+- `{out_file_pre}_run{N}_min_outlier_epi.nii.gz` -- per-run single-volume EPI frame with the lowest voxelwise outlier fraction (mandatory)
+- `{out_file_pre}_run{N}_psc.nii.gz` -- per-run PSC-scaled 4D scan (when `scale_to_psc: true`)
+- `{out_file_pre}_run{N}_mean.nii.gz` -- per-run voxelwise temporal mean (when `scale_to_psc: true`)
+- `{out_file_pre}_run{N}_residual_dtseries.nii.gz` -- per-run residual time series from 3dTproject
+- `{out_file_pre}_concat_residual_dtseries.nii.gz` -- concatenated residual time series
+- `{out_file_pre}_run{N}_censor.1D` -- per-run generated censor files
+- `{out_file_pre}_run{N}_motion_prepared.1D` -- per-run validated/truncated motion regressors
+- `{out_file_pre}_qc_summary.json` -- QC summary
 - Extracted parcel time series (if `extraction` enabled): CSV files
-- `{extract_out_file_pre}_run{N}_raw_ptseries.csv` (if `extract_raw_ptseries: true`) — per-run pre-regression parcellated time series
+- `{extract_out_file_pre}_run{N}_raw_ptseries.csv` (if `extract_raw_ptseries: true`) -- per-run pre-regression parcellated time series
 - Connectivity matrices (if `connectivity` enabled): tab-delimited text files
-- `{out_dir}/_sequenced_intermediates/run{N}/` (if `use_sequenced_bandpass: true`) — per-run intermediate files (NTRP-interpolated BOLD, bandpass-filtered BOLD, NTRP-interpolated and bandpass-filtered nuisance regressors). Removed after each run unless `keep_run_res_dtseries: true`; preserved on failure regardless of flag.
+- `{out_dir}/_sequenced_intermediates/run{N}/` (if `use_sequenced_bandpass: true`) -- per-run intermediate files (NTRP-interpolated BOLD, bandpass-filtered BOLD, NTRP-interpolated and bandpass-filtered nuisance regressors). Removed after each run unless `keep_run_res_dtseries: true`; preserved on failure regardless of flag.
 
 ---
 
@@ -504,14 +554,47 @@ Before running the main AFNI regression, the pipeline computes estimated degrees
 
 `DOF = (uncensored TRs) - (number of regressors)`
 
-- **DOF < 1:** The analysis aborts with an error. This prevents AFNI from producing statistically invalid output. Consider relaxing the FD threshold or reducing model complexity.
+- **DOF < 1:** The analysis aborts with a `ModelError` (exit code 5). This prevents AFNI from producing statistically invalid output. Consider relaxing the FD threshold or reducing model complexity.
+
+---
+
+## Runtime Validation
+
+The pipeline performs two validation checks at startup, before any analysis blocks execute:
+
+### 1. AFNI Binary Preflight
+
+All 15 required AFNI binaries are checked for reachability. Discovery order for the AFNI home directory: (1) explicit `afni_home` parameter (programmatic API only), (2) parent directory of `shutil.which('afni')`, (3) `~/abin`. Unreachable binaries are accumulated and a single `ToolUnavailableError` (exit code 4) is raised listing all missing tools.
+
+Required binaries: `3dDeconvolve`, `3dTproject`, `3dTstat`, `3dBandpass`, `3dROIstats`, `3dNetCorr`, `3dresample`, `3dinfo`, `3dToutcount`, `3dbucket`, `3dcalc`, `3dLSS`, `3dTcat`, `1d_tool.py`, `1dtranspose`.
+
+### 2. Version Lock Validation
+
+When `tools.lock.yaml` is present at the repository root:
+- **AFNI:** Runs `afni -ver`, parses the version string, and enforces strict exact-match comparison against the lockfile pin. `"PLACEHOLDER"` in the lockfile skips the check.
+- **Python:** Compares `sys.version_info` major.minor against the lockfile's `python` field (minor-series match; patch version is ignored per PEP 440 compatibility semantics).
+
+Version mismatches raise `ToolVersionError` (exit code 4). When the lockfile is absent, a low-severity `LOCKFILE_ABSENT` warning is emitted and version pinning is skipped.
+
+---
+
+## Exit Codes
+
+| Code | Exception(s) | Meaning |
+|------|-------------|---------|
+| 0 | (none) | All analyses completed with no high-severity warnings |
+| 1 | `GuardError` | Pipeline invariant violation; indicates a bug |
+| 2 | `ConfigError`, `InputError` | Configuration or input error |
+| 3 | (none; warning check) | All analyses completed but one or more high-severity warnings were raised |
+| 4 | `ToolUnavailableError`, `ToolVersionError`, `ToolExecutionError` | External tool unavailable, version mismatch, or execution failure |
+| 5 | `ModelError` | Model estimation failure: singularity, insufficient DOF, no surviving trials |
 
 ---
 
 ## CLI Flags
 
 ```
-run-first-level --config <path> [options]
+fmri-first-level-proc --config <path> [options]
 ```
 
 | Flag | Type | Default | Description |
@@ -521,3 +604,21 @@ run-first-level --config <path> [options]
 | `--analyses` | list of int | all | Run only specific analysis block indices (0-based). E.g. `--analyses 0 2` runs the first and third blocks. |
 | `--log-file` | str | none | Path to a log file. When set, logs are written to both console and file. |
 
+The legacy `run-first-level` command is a deprecated alias for `fmri-first-level-proc`. It emits a `CLI_DEPRECATED` warning before delegating.
+
+---
+
+## Exception Hierarchy
+
+All pipeline exceptions inherit from `FmriFirstLevelError`, which carries an optional `context` dict for structured error metadata:
+
+```
+FmriFirstLevelError(Exception)
+├── ConfigError          # Invalid config: missing required fields, incompatible options, schema violations
+├── InputError           # Input file missing, malformed, wrong dimensions, or unreadable
+├── ToolUnavailableError # External tool binary not found on PATH
+├── ToolVersionError     # External tool binary found but version does not match lockfile pin
+├── ToolExecutionError   # External tool command returned non-zero or failed to produce expected output
+├── ModelError           # Data quality prevents model estimation: singularity, insufficient DOF, no surviving trials
+└── GuardError           # Pipeline invariant violation: unexpected state indicating a bug
+```
