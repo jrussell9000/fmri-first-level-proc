@@ -4,6 +4,21 @@ All notable changes to this fork of fmri-first-level-proc. Versions follow
 [Semantic Versioning](https://semver.org/). Issue numbers refer to
 `jrussell9000/fmri-first-level-proc`.
 
+## [4.0.1] — 2026-11-02
+
+### Changed
+
+- **Python version mismatch is now a warning** (#3). A Python minor version that
+  differs from the `tools.lock.yaml` pin emits a medium-severity
+  `PYTHON_VERSION_MISMATCH` warning and the run continues. In 4.0.0 it exited 4,
+  which made every run fail on interpreters that `requires-python` allows (3.12,
+  3.13). The AFNI pin is still enforced strictly.
+
+### Fixed
+
+- `docs/input_specification.md` no longer says the lockfile is read from the
+  repository root.
+
 ## [4.0.0] — 2026-11-01
 
 Major because the module layout changed with no compatibility shims, and because
