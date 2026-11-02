@@ -6,7 +6,7 @@ fMRI analyses including task activation, task connectivity (beta series),
 and resting-state connectivity. Built on AFNI.
 """
 
-__version__ = "3.1.0"
+__version__ = "4.0.0"
 
 # Public API
 from .config import load_and_validate, ResolvedConfig
