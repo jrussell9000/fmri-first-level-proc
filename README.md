@@ -34,8 +34,18 @@ For development:
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-pytest
+ruff check src tests
+pytest                      # unit + fake-AFNI pipeline tests; real-AFNI tests skip
 ```
+
+Real-AFNI tests (`-m afni`) run against AFNI 26.3.07 in a container that mirrors the cloudpipe image:
+
+```bash
+docker build -t fflp-afni:26.3.07 tests/docker
+docker run --rm -v "$PWD":/src:ro -w /tmp fflp-afni:26.3.07 pytest /src/tests -m afni -p no:cacheprovider
+```
+
+CI (`.github/workflows/ci.yml`) runs lint and tests on Python 3.12 and 3.14, plus the real-AFNI suite.
 
 ## Quick Start
 
