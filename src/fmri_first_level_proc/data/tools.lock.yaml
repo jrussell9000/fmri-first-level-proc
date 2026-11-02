@@ -1,4 +1,4 @@
 lockfile_version: "1.0.0"
 python: "3.14.3"
 binaries:
-  AFNI: "26.0.09"
+  AFNI: "26.3.07"

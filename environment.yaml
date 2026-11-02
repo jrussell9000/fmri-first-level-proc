@@ -16,7 +16,7 @@ channels:
   - defaults
 
 dependencies:
-  - python>=3.8
+  - python=3.14              # must match the minor version pinned in tools.lock.yaml
   - numpy
   - pandas
   - pyyaml

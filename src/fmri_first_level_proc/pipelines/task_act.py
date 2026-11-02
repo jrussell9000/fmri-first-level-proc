@@ -7,8 +7,6 @@
 # 3. (optional) Extract parcel-level/ROI activation with a provided template with AFNI's 3dROIstats
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.0.0
-# Last updated: 05/01/26
 # ============================================================================
 '''
 REQUIREMENTS:
@@ -75,53 +73,47 @@ OUTPUTS:
 import copy
 import json
 import logging
-import os
-import subprocess
+import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
-from .first_level_config import ResolvedConfig
-from .first_level_utils import (
-    FirstLevelResult,
-    graded_warning,
-    get_warnings,
-    clear_warnings,
-    setup_logging,
-    dir_path_exists,
-    file_path_exists,
-    valid_string_list,
-    valid_ave_type,
-    run_afni_command,
-    validate_template,
-    remove_files_from_dir,
-    extract_roi_stats,
-    build_hrf_string,
-    needs_married_timing,
-    read_and_validate_stim_data,
-    write_onset_file,
+from ..afni import clean_deconvolve_err, run_afni_command, uses_num_cores
+from ..manifest import manifested
+from ..config import ResolvedConfig
+from ..design import (
+    HRF_DURATION_MODELS,
     build_decon_base_command,
-    clean_deconvolve_err,
+    build_hrf_string,
+    check_trial_survival,
+    compute_dof,
     log_hrf_model,
     log_nuisance_model,
-    prepare_motion_file,
+    needs_married_timing,
+    read_and_validate_stim_data,
+    valid_contrast_functions,
+    write_onset_file,
+)
+from ..exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
+from ..fileutils import remove_files_from_dir, sanitize_filename_label
+from ..preprocessing import (
+    CENSOR_HIGH_THRESHOLD,
     compute_tissue_derivative,
     create_censor_file,
-    check_trial_survival,
-    write_qc_summary,
-    compute_dof,
-    valid_contrast_functions,
     gen_min_outlier_epi,
+    prepare_motion_file,
     scale_to_psc,
-    CENSOR_WARN_THRESHOLD,
-    CENSOR_HIGH_THRESHOLD,
-    HRF_DM_MODELS,
-    HRF_IMPULSE_MODELS,
-    HRF_DURATION_MODELS,
-    VALID_HRF_MODELS,
 )
+from ..reporting import (
+    FirstLevelResult,
+    clear_warnings,
+    get_warnings,
+    graded_warning,
+    setup_logging,
+    write_qc_summary,
+)
+from ..templates import extract_roi_stats, validate_template
 
 # Surviving trial count below which TRIALS_FEW warning is emitted (condition still included)
 _TRIALS_FEW_THRESHOLD = 10
@@ -168,8 +160,20 @@ def write_stim_onset_files(stim_data: pd.DataFrame, config: ResolvedConfig, logg
     for cond in stim_data['trial_type'].unique():
         cond_df = stim_data[stim_data['trial_type'] == cond]
         if cond in config.cond_labels:
-            onset_file = f"{config.out_dir}/{config.out_file_pre}_concat_{cond}_onsets.txt"
-            write_onset_file(cond_df, onset_file, config.hrf_model, config.custom_hrf, logger=logger)
+            write_onset_file(cond_df, _onset_path(config, cond), config.hrf_model, config.custom_hrf, logger=logger)
+
+
+def _onset_path(config: ResolvedConfig, cond: str) -> Path:
+    return Path(config.out_dir) / f"{config.out_file_pre}_concat_{cond}_onsets.txt"
+
+
+def _bucket_stats_path(config: ResolvedConfig) -> Path:
+    return Path(config.out_dir) / f"{config.out_file_pre}_concat_bucket_stats.nii.gz"
+
+
+def _bucket_resids_path(config: ResolvedConfig) -> Path:
+    return Path(config.out_dir) / f"{config.out_file_pre}_concat_bucket_resids.nii.gz"
+
 
 def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: logging.Logger) -> None:
     """Execute the 3dDeconvolve activation first-level regression.
@@ -195,8 +199,10 @@ def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: log
     ToolExecutionError
         If 3dDeconvolve fails or does not produce the expected bucket stats file.
     """
+    bucket_path = _bucket_stats_path(config)
+
     # Check if outputs exist
-    if not os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"):
+    if not bucket_path.exists():
 
         # Compute tissue signal derivatives if requested
         CSF_deriv_path = None
@@ -224,7 +230,7 @@ def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: log
 
             # dmBLOCK-family models require -stim_times_AM1 for married timing
             stim_flag = "-stim_times_AM1" if needs_married_timing(config.hrf_model, config.custom_hrf) else "-stim_times"
-            decon_command.extend([stim_flag, f"{i+1}", f"{config.out_dir}/{config.out_file_pre}_concat_{cond}_onsets.txt",
+            decon_command.extend([stim_flag, f"{i+1}", _onset_path(config, cond),
                                  hrf_string, "-stim_label", f"{i+1}", f"{cond}"])
 
         # Iteratively add contrasts
@@ -238,15 +244,15 @@ def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: log
                                       "-glt_label", f"{ci+1}", f"{config.contrast_labels[ci]}"])
 
         # Add statistics output
-        decon_command.extend(["-errts", f"{config.out_dir}/{config.out_file_pre}_concat_bucket_resids.nii.gz",
+        decon_command.extend(["-errts", _bucket_resids_path(config),
                               "-fout", "-rout", "-tout",
-                              "-bucket", f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz",
+                              "-bucket", bucket_path,
                               "-jobs", f"{config.num_cores}"])
 
         # Run command
         run_afni_command(decon_command, description="3dDeconvolve activation", logger=logger)
 
-        if os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"):
+        if bucket_path.exists():
             logger.info("Successfully created first level activation stats for %s", config.out_file_pre)
         else:
             raise ToolExecutionError(
@@ -257,6 +263,53 @@ def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: log
 
     # Remove err file that always seems to be output
     clean_deconvolve_err(config.out_dir)
+
+# 3dDeconvolve bucket labels: per-basis coefficients/t-stats are '<name>#<k>_<stat>';
+# per-term F-stats/R^2 are '<name>_<stat>' (including 'Full_Fstat', 'Full_R^2').
+_BASIS_LABEL = re.compile(r"^(?P<name>.+)#(?P<k>\d+)_(?P<stat>Coef|Tstat)$")
+_TERM_LABEL = re.compile(r"^(?P<name>.+)_(?P<stat>Fstat|R\^2)$")
+
+
+def parse_bucket_labels(labels, contrast_labels=()):
+    """Group 3dDeconvolve bucket sub-bricks by statistic.
+
+    Parameters
+    ----------
+    labels : list of str
+        Sub-brick labels in bucket order (``3dinfo -label`` split on '|').
+    contrast_labels : iterable of str
+        GLT labels; 3dDeconvolve appends '_GLT' to them, which is stripped so
+        the index uses the label the user configured.
+
+    Returns
+    -------
+    dict
+        {'Coef'|'Tstat'|'Fstat'|'R^2': [(label, sub_brick_index), ...]} in bucket
+        order. A condition with several basis functions gets one entry per basis,
+        labelled '<name>#<k>'; a single-basis condition is labelled '<name>'.
+    """
+    contrasts = set(contrast_labels)
+
+    def clean(name):
+        if name.endswith("_GLT") and name[:-4] in contrasts:
+            return name[:-4]
+        return name
+
+    basis = {"Coef": [], "Tstat": []}
+    by_stat = {"Coef": [], "Tstat": [], "Fstat": [], "R^2": []}
+    for idx, raw in enumerate(label.strip() for label in labels):
+        if m := _BASIS_LABEL.match(raw):
+            basis[m["stat"]].append((clean(m["name"]), int(m["k"]), idx))
+        elif m := _TERM_LABEL.match(raw):
+            by_stat[m["stat"]].append((clean(m["name"]), idx))
+
+    for stat, entries in basis.items():
+        n_basis = {}
+        for name, _, _ in entries:
+            n_basis[name] = n_basis.get(name, 0) + 1
+        by_stat[stat] = [(name if n_basis[name] == 1 else f"{name}#{k}", idx) for name, k, idx in entries]
+    return by_stat
+
 
 def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
     """Get the statistical auxiliary parameters (e.g. DOF) for a sub-brick.
@@ -283,7 +336,7 @@ def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
     while i < len(tokens):
         try:
             idx = int(tokens[i])
-            stype = int(tokens[i + 1])
+            int(tokens[i + 1])  # stat type code: parsed to validate the record, otherwise unused
             npar = int(tokens[i + 2])
             params = [float(tokens[i + 3 + j]) for j in range(npar)]
             if idx == subbrik_index:
@@ -294,7 +347,7 @@ def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
     return []
 
 
-def generate_bucket_stats_index(config: ResolvedConfig, logger: logging.Logger) -> str:
+def generate_bucket_stats_index(config: ResolvedConfig, logger: logging.Logger) -> Path:
     """Generate a JSON index mapping every sub-brick label in the bucket stats output to its 0-based index.
 
     Parameters
@@ -305,19 +358,17 @@ def generate_bucket_stats_index(config: ResolvedConfig, logger: logging.Logger) 
 
     Returns
     -------
-    str
+    pathlib.Path
         Path to the written index JSON file.
     """
-    bucket_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"
-    index_path = os.path.join(
-        config.out_dir, f"{config.out_file_pre}_concat_bucket_stats_index.json")
+    index_path = Path(config.out_dir) / f"{config.out_file_pre}_concat_bucket_stats_index.json"
 
-    if os.path.exists(index_path):
+    if index_path.exists():
         logger.info("Bucket stats index already exists: %s", index_path)
         return index_path
 
     info = run_afni_command(
-        ['3dinfo', '-label', bucket_path],
+        ['3dinfo', '-label', _bucket_stats_path(config)],
         capture_output=True,
         description="3dinfo label for bucket stats index",
         logger=logger,
@@ -325,8 +376,7 @@ def generate_bucket_stats_index(config: ResolvedConfig, logger: logging.Logger) 
     labels = [l.strip() for l in info.strip().split('|') if l.strip()]
     index_map = {label: i for i, label in enumerate(labels)}
 
-    with open(index_path, "w") as f:
-        json.dump(index_map, f, indent=2)
+    index_path.write_text(json.dumps(index_map, indent=2))
     logger.info("Wrote bucket stats index: %s", index_path)
 
     return index_path
@@ -336,7 +386,8 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
     """Extract stat-type-based bucket outputs from the 3dDeconvolve bucket dataset.
 
     For each stat type in config.stat_buckets, this function:
-    1. Discovers all sub-bricks matching that stat type via 3dinfo -subbrick_info.
+    1. Discovers all sub-bricks matching that stat type from 3dinfo -label (see
+       parse_bucket_labels).
     2. Extracts them into a single multi-sub-brick NIfTI via 3dbucket.
     3. Writes a JSON index mapping condition/contrast labels to sub-brick indices.
     4. When template_path is available and not 'WB', writes a parcellated CSV
@@ -357,39 +408,25 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
     list[str]
         Paths of all output files created.
     """
-    bucket_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"
+    out_dir = Path(config.out_dir)
+    bucket_path = _bucket_stats_path(config)
     output_files = []
 
-    bucket_info = run_afni_command(
-        ['3dinfo', '-subbrick_info', bucket_path],
+    labels_out = run_afni_command(
+        ['3dinfo', '-label', bucket_path],
         capture_output=True,
-        description="3dinfo subbrick_info for stat bucket extraction",
+        description="3dinfo label for stat bucket extraction",
         logger=logger,
     )
-    bucket_split = bucket_info.split()
-
-    available_stats = set()
-    for token in bucket_split:
-        for st in ("Coef", "Tstat", "Fstat", "R^2"):
-            if st in token:
-                available_stats.add(st)
-    if any("Tstat" in token for token in bucket_split):
+    by_stat = parse_bucket_labels(labels_out.strip().split('|'), config.contrast_labels or [])
+    available_stats = {st for st, subs in by_stat.items() if subs}
+    if by_stat["Tstat"]:
         available_stats.add("Zstat")
     logger.info("Available stat types in bucket: %s", sorted(available_stats))
 
     for stat_type in config.stat_buckets:
-        search_stat = "Tstat" if stat_type == "Zstat" else stat_type
         need_t2z = (stat_type == "Zstat")
-
-        matched = []
-        for i, token in enumerate(bucket_split):
-            if search_stat in token and "#" in token:
-                label_part = token.split("#")[0]
-                try:
-                    idx = int(bucket_split[i - 1][1:])
-                    matched.append((label_part, idx))
-                except (ValueError, IndexError):
-                    continue
+        matched = by_stat["Tstat" if need_t2z else stat_type]
 
         if not matched:
             logger.warning(
@@ -400,14 +437,10 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
         logger.info("Found %d sub-bricks for stat type '%s': %s",
                     len(matched), stat_type, [m[0] for m in matched])
 
-        bucket_out = os.path.join(
-            config.out_dir,
-            f"{config.extract_out_file_pre}_{stat_type}_bucket.nii.gz")
-        index_out = os.path.join(
-            config.out_dir,
-            f"{config.extract_out_file_pre}_{stat_type}_index.json")
+        bucket_out = out_dir / f"{config.extract_out_file_pre}_{stat_type}_bucket.nii.gz"
+        index_out = out_dir / f"{config.extract_out_file_pre}_{stat_type}_index.json"
 
-        if not os.path.exists(bucket_out):
+        if not bucket_out.exists():
             if need_t2z:
                 z_vols = []
                 for label, idx in matched:
@@ -417,9 +450,7 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
                             f"Could not retrieve DOF for sub-brick {idx} ({label}) in "
                             f"{bucket_path}; cannot convert T to Z.")
                     dof = int(aux_params[0])
-                    z_tmp = os.path.join(
-                        config.out_dir,
-                        f"{config.out_file_pre}_{label}_zconv_tmp.nii.gz")
+                    z_tmp = out_dir / f"{config.out_file_pre}_{sanitize_filename_label(label)}_zconv_tmp.nii.gz"
                     run_afni_command(
                         ["3dcalc", "-a", f"{bucket_path}[{idx}]",
                          "-expr", f"fitt_t2z(a,{dof})",
@@ -434,8 +465,7 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
                     logger=logger)
 
                 for zv in z_vols:
-                    if os.path.exists(zv):
-                        os.remove(zv)
+                    zv.unlink(missing_ok=True)
             else:
                 sub_brik_selectors = [f"{bucket_path}[{idx}]" for _, idx in matched]
                 bucket_cmd = ["3dbucket", "-prefix", bucket_out] + sub_brik_selectors
@@ -443,26 +473,23 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
                     description=f"3dbucket extract {stat_type} bucket",
                     logger=logger)
 
-            if not os.path.exists(bucket_out):
+            if not bucket_out.exists():
                 raise ToolExecutionError(
                     f"Failed to create {stat_type} bucket: {bucket_out}")
             logger.info("Created %s bucket: %s", stat_type, bucket_out)
         else:
             logger.info("%s bucket already exists: %s", stat_type, bucket_out)
 
-        output_files.append(bucket_out)
+        output_files.append(str(bucket_out))
 
         index_map = {label: i for i, (label, _) in enumerate(matched)}
-        with open(index_out, "w") as f:
-            json.dump(index_map, f, indent=2)
-        output_files.append(index_out)
+        index_out.write_text(json.dumps(index_map, indent=2))
+        output_files.append(str(index_out))
         logger.info("Wrote %s index: %s", stat_type, index_out)
 
         if config.template_path is not None and config.template_path != "WB":
-            csv_out = os.path.join(
-                config.out_dir,
-                f"{config.extract_out_file_pre}_{stat_type}_parcellated.csv")
-            if not os.path.exists(csv_out):
+            csv_out = out_dir / f"{config.extract_out_file_pre}_{stat_type}_parcellated.csv"
+            if not csv_out.exists():
                 rows = {}
                 for new_idx, (label, _) in enumerate(matched):
                     roi_df = extract_roi_stats(
@@ -475,23 +502,24 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
                 logger.info("Wrote %s parcellated CSV: %s", stat_type, csv_out)
             else:
                 logger.info("%s parcellated CSV already exists: %s", stat_type, csv_out)
-            output_files.append(csv_out)
+            output_files.append(str(csv_out))
 
     if config.extract_resids:
-        resid_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_resids.nii.gz"
-        resid_csv = f"{config.out_dir}/{config.extract_out_file_pre}_resids.csv"
-        if not os.path.exists(resid_csv):
+        resid_csv = out_dir / f"{config.extract_out_file_pre}_resids.csv"
+        if not resid_csv.exists():
             resid_df = extract_roi_stats(
-                resid_path, config.template_path, config.average_type, logger=logger)
+                _bucket_resids_path(config), config.template_path, config.average_type, logger=logger)
             resid_df.to_csv(resid_csv)
-            if os.path.exists(resid_csv):
+            if resid_csv.exists():
                 logger.info("Extracted residuals to %s", resid_csv)
             else:
                 raise ToolExecutionError("Could not extract residuals using ROI template.")
-        output_files.append(resid_csv)
+        output_files.append(str(resid_csv))
 
     return output_files
 
+@manifested
+@uses_num_cores
 def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLevelResult:
     """Validate config and execute the task activation pipeline.
 
@@ -517,12 +545,12 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     19. Return FirstLevelResult with status, warnings, qc_summary, and output_files.
 
     Works from the config-driven dispatch runner
-    (run_first_level.py / DISPATCH["task_act"]).
+    (cli.py / DISPATCH["task_act"]).
 
     Parameters
     ----------
     config : ResolvedConfig
-        All pipeline parameters (see first_level_config.py ResolvedConfig for
+        All pipeline parameters (see config.py ResolvedConfig for
         the full attribute list).
     logger : logging.Logger or None, optional
         Logger instance. A default logger is created if None is provided.
@@ -604,8 +632,8 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     if getattr(config, 'extract_raw_ptseries', False):
         if config.extract_out_file_pre is None:
             raise ConfigError("extract_raw_ptseries requires extract_out_file_pre to be set.")
-        raw_out = os.path.join(config.out_dir, f"{config.extract_out_file_pre}_raw_ptseries.csv")
-        if not os.path.exists(raw_out):
+        raw_out = Path(config.out_dir) / f"{config.extract_out_file_pre}_raw_ptseries.csv"
+        if not raw_out.exists():
             if config.template_path is None or config.template_path == "WB":
                 raise ConfigError("extract_raw_ptseries requires a valid template_path (not whole-brain).")
             # Validate template if not already validated by the extract block above
@@ -615,7 +643,7 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
             )
             raw_df = extract_roi_stats(config.scan_path, validated_tpl, config.average_type, logger=logger)
             raw_df.to_csv(raw_out)
-            if os.path.exists(raw_out):
+            if raw_out.exists():
                 logger.info("Extracted raw (pre-regression) ptseries to %s.", raw_out)
             else:
                 raise InputError("Failed to extract raw ptseries.")
@@ -631,17 +659,17 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     if config.scale_to_psc:
         psc_path = scale_to_psc(
             config.scan_path, config.out_dir, config.out_file_pre, "", logger)
-        config.scan_path = psc_path
+        config.scan_path = str(psc_path)
 
     # Generate censor file from motion regressors (before prepare_motion_file overwrites path)
-    config.censor_path = create_censor_file(
+    config.censor_path = str(create_censor_file(
         config.motion_path, config.fd_threshold, config.censor_prev_tr,
-        config.out_dir, config.out_file_pre, "concat", logger)
+        config.out_dir, config.out_file_pre, "concat", logger))
 
     # Validate and prepare motion regressors
     use_cols = 12 if config.include_motion_derivs else 6
-    config.motion_path = prepare_motion_file(
-        config.motion_path, use_cols, config.out_dir, config.out_file_pre, "concat", logger)
+    config.motion_path = str(prepare_motion_file(
+        config.motion_path, use_cols, config.out_dir, config.out_file_pre, "concat", logger))
 
     # Read and validate stimulus timing data (no file I/O yet)
     stim_data = read_stim_data(config, logger)
@@ -749,22 +777,18 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     write_qc_summary(config.out_dir, config.out_file_pre, qc_data, logger)
 
     # Collect output file paths
-    output_files: list[str] = []
-    psc_out = os.path.join(config.out_dir, f"{config.out_file_pre}_psc.nii.gz")
-    if os.path.exists(psc_out):
-        output_files.append(psc_out)
-    bucket_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"
-    resids_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_resids.nii.gz"
-    if os.path.exists(bucket_path):
-        output_files.append(bucket_path)
-    if os.path.exists(resids_path):
-        output_files.append(resids_path)
-    if os.path.exists(bucket_stats_index_path):
-        output_files.append(bucket_stats_index_path)
+    out_dir = Path(config.out_dir)
+    candidates = [
+        out_dir / f"{config.out_file_pre}_psc.nii.gz",
+        _bucket_stats_path(config),
+        _bucket_resids_path(config),
+        bucket_stats_index_path,
+    ]
+    output_files = [str(p) for p in candidates if p.exists()]
     output_files.extend(extraction_files)
-    qc_path = os.path.join(config.out_dir, f"{config.out_file_pre}_qc_summary.json")
-    if os.path.exists(qc_path):
-        output_files.append(qc_path)
+    qc_path = out_dir / f"{config.out_file_pre}_qc_summary.json"
+    if qc_path.exists():
+        output_files.append(str(qc_path))
 
     # Determine overall result status
     status = "warning" if any(w.get("severity") == "high" for w in get_warnings()) else "success"

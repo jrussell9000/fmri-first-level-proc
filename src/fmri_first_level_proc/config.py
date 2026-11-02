@@ -8,8 +8,6 @@ from __future__ import annotations
 # objects for each analysis block.
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.0.0
-# Last updated: 08/12/26
 # ============================================================================
 """
 YAML configuration loader, validator, and resolver for fmri_first_level_proc.
@@ -29,7 +27,7 @@ Config Schema Overview
 ----------------------
 global:
     tr           : float (required) -- repetition time in seconds
-    num_cores    : int -- CPU cores for parallel processing
+    num_cores    : int | 'auto' -- CPU budget; 'auto' reads OMP_NUM_THREADS, then the cgroup limit
     template_path: str -- shared ROI template for all analyses
     force_diff_atlas: bool -- allow atlas space mismatches
     derivatives_dirs: list[str] -- BIDS derivatives directories (optional)
@@ -40,7 +38,7 @@ analyses:
       out_dir     : str
       out_file_pre: str
       paths       : dict of required/optional file paths (type-dependent)
-      ... (type-specific keys; see INPUT_SPECIFICATION.md for full schema)
+      ... (type-specific keys; see docs/input_specification.md for full schema)
 
 Validation enforces: required keys, file existence, enum ranges, bandpass
 bounds, HRF model compatibility, contrast length parity, and unique
@@ -50,14 +48,15 @@ errors; raises InputError for missing user-specified files.
 
 import dataclasses
 import logging
-import os
+from pathlib import Path
 from typing import NoReturn
 
 import yaml
 
 from .bids import discover_inputs
 from .exceptions import ConfigError, InputError
-from .first_level_utils import VALID_HRF_MODELS, validate_custom_hrf, needs_married_timing
+from .design import VALID_HRF_MODELS, validate_custom_hrf, needs_married_timing
+from .runtime import available_cpus
 
 VALID_TYPES = {"task_act", "task_conn", "rest_conn"}
 VALID_STAT_BUCKET_TYPES = {"Coef", "Tstat", "Fstat", "R^2", "Zstat"}
@@ -187,7 +186,7 @@ def load_config(config_path: str) -> dict:
 
     Raises ConfigError on missing file or YAML parse failure.
     """
-    if not os.path.isfile(config_path):
+    if not Path(config_path).is_file():
         raise ConfigError(f"Config file not found: {config_path}")
     with open(config_path, "r") as f:
         try:
@@ -264,6 +263,12 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
     if tr_float <= 0:
         _cfg_err(logger, "global.tr must be a positive number, got %s.", tr_val)
 
+    # -- Validate global.num_cores (positive int or 'auto'; default 1) --
+    nc_val = global_cfg.get("num_cores")
+    if nc_val is not None and nc_val != "auto":
+        if isinstance(nc_val, bool) or not isinstance(nc_val, int) or nc_val < 1:
+            _cfg_err(logger, "global.num_cores must be a positive integer or 'auto', got %r.", nc_val)
+
     # -- Validate each analysis block --
     for idx, block in enumerate(raw_config["analyses"]):
         label = block.get("name", f"analyses[{idx}]")
@@ -306,12 +311,12 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
             for pkey in required_paths[atype]:
                 if pkey in paths:
                     fpath = paths[pkey]
-                    if not os.path.isfile(fpath):
+                    if not Path(fpath).is_file():
                         _inp_err(logger, "[%s] File does not exist: paths.%s = '%s'.", label, pkey, fpath)
             # Optional tissue regressor paths (skip if null)
             for opt_pkey in ("CSF_path", "WM_path"):
                 if opt_pkey in paths and paths[opt_pkey] is not None:
-                    if not os.path.isfile(paths[opt_pkey]):
+                    if not Path(paths[opt_pkey]).is_file():
                         _inp_err(logger, "[%s] File does not exist: paths.%s = '%s'.",
                                  label, opt_pkey, paths[opt_pkey])
             # Warn if use_tissue_derivs but no tissue paths
@@ -331,7 +336,7 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                 if not isinstance(plist, list) or len(plist) == 0:
                     _cfg_err(logger, "[%s] paths.%s must be a non-empty list for rest_conn.", label, pkey)
                 for fpath in plist:
-                    if not os.path.isfile(fpath):
+                    if not Path(fpath).is_file():
                         _inp_err(logger, "[%s] File does not exist: paths.%s entry '%s'.", label, pkey, fpath)
 
             # Optional GS_paths
@@ -340,7 +345,7 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                 if not isinstance(gs_list, list) or len(gs_list) == 0:
                     _cfg_err(logger, "[%s] paths.GS_paths must be a non-empty list for rest_conn.", label)
                 for fpath in gs_list:
-                    if not os.path.isfile(fpath):
+                    if not Path(fpath).is_file():
                         _inp_err(logger, "[%s] File does not exist: paths.GS_paths entry '%s'.", label, fpath)
 
             # All explicitly-provided rest_conn path lists must be the same length.
@@ -430,9 +435,9 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
 
         # -- Validate out_dir can be created --
         out_dir = block["out_dir"]
-        if not os.path.isdir(out_dir):
+        if not Path(out_dir).is_dir():
             try:
-                os.makedirs(out_dir, exist_ok=True)
+                Path(out_dir).mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 _cfg_err(logger, "[%s] Cannot create out_dir '%s': %s", label, out_dir, e)
 
@@ -549,7 +554,7 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
 
         # -- Template path validation (global-only) --
         tpl = global_cfg.get("template_path")
-        if tpl is not None and not os.path.isfile(tpl):
+        if tpl is not None and not Path(tpl).is_file():
             _inp_err(logger, "[%s] template_path file does not exist: '%s'.", label, tpl)
 
     # -- Duplicate (out_dir, out_file_pre) pair check --
@@ -606,7 +611,12 @@ def resolve_config(
 
     # -- Global-sourced fields --
     num_cores_raw = global_cfg.get("num_cores")
-    num_cores = int(num_cores_raw) if num_cores_raw is not None else 1
+    if num_cores_raw == "auto":
+        num_cores, source = available_cpus()
+        if logger is not None:
+            logger.info("num_cores: auto -> %d (%s).", num_cores, source)
+    else:
+        num_cores = int(num_cores_raw) if num_cores_raw is not None else 1
     template_path = global_cfg.get("template_path", None)
     force_diff_atlas = bool(global_cfg.get("force_diff_atlas", False))
     tr = float(global_cfg["tr"])

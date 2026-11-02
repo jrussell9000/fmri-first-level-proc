@@ -53,7 +53,7 @@ analyses:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `num_cores` | int | `1` | CPU cores for AFNI parallel processing. |
+| `num_cores` | int or `"auto"` | `1` | CPU budget per analysis block. Passed to `3dDeconvolve -jobs`, exported to every AFNI call as `OMP_NUM_THREADS`, and split across independent per-run (`rest_conn`) and per-condition (`task_conn` extraction/connectivity) steps that run concurrently. `"auto"` resolves at load time, in order: `OMP_NUM_THREADS` if it is a positive integer (e.g. a Kubernetes downward-API projection of the pod's CPU request), capped at the cgroup CPU limit; else the cgroup CPU limit (`cpu.max`, rounded down, minimum 1); else the CPUs schedulable for the process. The resolved value and its source are logged. |
 | `tr` | float | (required) | Repetition time in seconds. Applies to all scans across all analysis blocks. |
 | `template_path` | str or null | `null` | Path to a shared ROI template NIfTI file (`.nii.gz`). Required if any block uses extraction or connectivity. See [ROI Template File](#roi-template-file). |
 | `force_diff_atlas` | bool | `false` | Allow atlas space/orientation mismatch between scan and template. Use with caution. |
@@ -253,6 +253,17 @@ connectivity:
 
 Requires `template_path` in global settings. For `seed_to_voxel`, the template must be a binary mask (single ROI). For `parcellated`, the template must contain >= 2 integer-labeled ROIs.
 
+<a id="parcellated-matrix-contents"></a>**Parcellated matrix contents** (from 3dNetCorr's `.netcc`; the same applies to `rest_conn`):
+
+| `pcorr` | `fishZ` | Matrix written |
+|---|---|---|
+| false | false | `CC`: Pearson correlation |
+| false | true | `FZ`: AFNI's Fisher Z of `CC` (arctanh, \|z\| capped at 4.0; diagonal 4.0) |
+| true | false | `PC`: partial correlation (AFNI's diagonal is -1) |
+| true | true | Fisher Z of `PC`, computed by the package with the same cap as AFNI's `FZ` (diagonal -4.0). AFNI writes no Fisher-Z partial correlation; its `PCB` section holds asymmetric regression coefficients and is not used. |
+
+Diagonals carry no connectivity information.
+
 ---
 
 ## Analysis Block: `rest_conn`
@@ -409,7 +420,7 @@ Applies to: `CSF_path`/`CSF_paths`, `WM_path`/`WM_paths`, `GS_paths`
 
 ### Tools Lockfile
 
-- **File:** `tools.lock.yaml` (at repository root)
+- **File:** `src/fmri_first_level_proc/data/tools.lock.yaml` (shipped as package data)
 - **Format:** YAML
 - **Purpose:** Pins expected versions of external tools and the Python runtime for reproducibility.
 - **Schema:**
@@ -417,7 +428,7 @@ Applies to: `CSF_path`/`CSF_paths`, `WM_path`/`WM_paths`, `GS_paths`
   lockfile_version: "1.0.0"
   python: "3.14.3"          # major.minor.patch; minor-series match enforced
   binaries:
-    AFNI: "26.0.09"         # exact match enforced; "PLACEHOLDER" to skip
+    AFNI: "26.3.07"         # exact match enforced; "PLACEHOLDER" to skip
   ```
 - **Behavior:** When present, the pipeline reads the lockfile at startup and validates installed versions. Version mismatches raise `ToolVersionError` (exit code 4). When absent (e.g., pip-install users), a low-severity `LOCKFILE_ABSENT` warning is emitted and version pinning is skipped. The lockfile resolves relative to the repository root (`__file__.parent.parent`), not `site-packages`, so pip-installed users always hit the graceful-absence path.
 
@@ -452,7 +463,26 @@ When `derivatives_dirs` is set (in `global` or in a specific analysis block), th
 
 ## Output Files
 
-All outputs are written to `out_dir` using the `out_file_pre` prefix. Every analysis type writes a QC summary JSON.
+All outputs are written to `out_dir` using the `out_file_pre` prefix. Every analysis type writes a QC summary JSON and a run manifest.
+
+### Run Manifest
+
+**File:** `{out_file_pre}_manifest.json`
+
+Records each run of a block: a SHA-256 hash of the output-affecting config (every `ResolvedConfig` field except `num_cores`, `remove_previous`, and `analysis_name`), the package version, start/finish times, `status` (`started`, `failed` with an `error` message, or `completed`), the files this block created (`owned_files`, relative to `out_dir`), and on completion the result (`status`, `output_files`, `warnings`, `qc_summary`). It doubles as a machine-readable result record for workflow engines.
+
+On rerun:
+
+| Previous manifest | Behavior |
+|---|---|
+| none | Run normally. |
+| `completed`, same config, all `output_files` present | Skip the block and return the recorded result. |
+| `completed`, same config, some outputs missing | Rerun; stages regenerate missing files. |
+| `started` / `failed`, same config | A previous attempt crashed: delete the files it created (possibly partial), then rerun. |
+| different config | Fail with `ConfigError` (exit 2). With `--force`, delete this block's previous outputs and rerun. |
+| any, with `remove_previous: true` | Ignored; `out_dir` is cleared as before. |
+
+Ownership is tracked per block, so blocks that share an `out_dir` are never touched by each other's cleanup. Blocks sharing an `out_dir` must not run concurrently.
 
 ### QC Summary JSON
 
@@ -570,7 +600,7 @@ Required binaries: `3dDeconvolve`, `3dTproject`, `3dTstat`, `3dBandpass`, `3dROI
 
 ### 2. Version Lock Validation
 
-When `tools.lock.yaml` is present at the repository root:
+Using the `tools.lock.yaml` shipped inside the installed package:
 - **AFNI:** Runs `afni -ver`, parses the version string, and enforces strict exact-match comparison against the lockfile pin. `"PLACEHOLDER"` in the lockfile skips the check.
 - **Python:** Compares `sys.version_info` major.minor against the lockfile's `python` field (minor-series match; patch version is ignored per PEP 440 compatibility semantics).
 
@@ -603,6 +633,7 @@ fmri-first-level-proc --config <path> [options]
 | `--dry-run` | flag | off | Validate the config and print the analysis plan without executing any analyses. |
 | `--analyses` | list of int | all | Run only specific analysis block indices (0-based). E.g. `--analyses 0 2` runs the first and third blocks. |
 | `--log-file` | str | none | Path to a log file. When set, logs are written to both console and file. |
+| `--force` | flag | off | If a block's `out_dir` holds outputs from a different configuration (see [Run Manifest](#run-manifest)), delete that block's previous outputs and rerun instead of failing with a `ConfigError`. |
 
 The legacy `run-first-level` command is a deprecated alias for `fmri-first-level-proc`. It emits a `CLI_DEPRECATED` warning before delegating.
 

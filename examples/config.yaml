@@ -3,9 +3,9 @@
 # ============================================================================
 #
 # Usage:
-#   run-first-level --config example_config.yaml --dry-run
-#   run-first-level --config example_config.yaml
-#   run-first-level --config example_config.yaml --analyses 0 2
+#   fmri-first-level-proc --config examples/config.yaml --dry-run
+#   fmri-first-level-proc --config examples/config.yaml
+#   fmri-first-level-proc --config examples/config.yaml --analyses 0 2
 #      --analyses 0 2 => only first and third analysis blocks will be run
 #
 # This file demonstrates all three analysis types with every available option.
@@ -20,7 +20,7 @@
 # overridden per-block.
 
 global:
-  num_cores: 1                   # CPU cores for AFNI parallel processing
+  num_cores: 1                   # CPU budget per block; "auto" = OMP_NUM_THREADS, else the container's CPU limit
   tr: 0.8                        # Repetition time in seconds (applies to all scans)
   template_path: null            # Path to shared ROI template (.nii.gz), or null
   force_diff_atlas: false        # true = allow atlas mismatch (USE WITH CAUTION)
