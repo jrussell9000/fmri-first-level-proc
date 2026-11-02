@@ -253,6 +253,17 @@ connectivity:
 
 Requires `template_path` in global settings. For `seed_to_voxel`, the template must be a binary mask (single ROI). For `parcellated`, the template must contain >= 2 integer-labeled ROIs.
 
+<a id="parcellated-matrix-contents"></a>**Parcellated matrix contents** (from 3dNetCorr's `.netcc`; the same applies to `rest_conn`):
+
+| `pcorr` | `fishZ` | Matrix written |
+|---|---|---|
+| false | false | `CC`: Pearson correlation |
+| false | true | `FZ`: AFNI's Fisher Z of `CC` (arctanh, \|z\| capped at 4.0; diagonal 4.0) |
+| true | false | `PC`: partial correlation (AFNI's diagonal is -1) |
+| true | true | Fisher Z of `PC`, computed by the package with the same cap as AFNI's `FZ` (diagonal -4.0). AFNI writes no Fisher-Z partial correlation; its `PCB` section holds asymmetric regression coefficients and is not used. |
+
+Diagonals carry no connectivity information.
+
 ---
 
 ## Analysis Block: `rest_conn`

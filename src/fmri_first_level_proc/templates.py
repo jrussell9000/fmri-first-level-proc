@@ -262,9 +262,7 @@ def extract_roi_stats(nifti_path, template_path, average_type, logger=None):
     if len(cols_to_keep) == 0:
         raise GuardError(f"No columns matching '{ave_type_flag}' found in 3dROIstats output. Available columns: {list(out_df.columns)}")
 
-    new_df = out_df[cols_to_keep].copy()
-    new_df.rename(
-        columns={oldname: "ROI_" + str(oldname).split("_")[1] for oldname in new_df.columns},
-        inplace=True,
+    new_df = out_df[cols_to_keep].rename(
+        columns={oldname: "ROI_" + str(oldname).split("_")[1] for oldname in cols_to_keep},
     )
     return new_df

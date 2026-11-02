@@ -172,15 +172,44 @@ def seed_to_voxel_conn(inset_path, out_dir, conn_out_file_pre, template_path, fi
         _log.warning("Could not move functional connectivity file for seed %s. Check permissions and rerun.", template_path)
 
 
+# 3dNetCorr's FZ section is arctanh with |z| capped at 4.0 (r = 1 -> 4.0). Partial
+# correlations are transformed with the same cap so both Fisher-Z outputs agree.
+_FISHER_Z_CAP = 4.0
+
+
+def _netcc_sections(netcorr_file):
+    """Split a .netcc file into {section name: rows of tokens}.
+
+    Section headers are '# NAME' lines (e.g. '# CC'); the ROI label/index rows
+    that follow '# WITH_ROI_LABELS' land in that pseudo-section and are ignored.
+    """
+    sections, current = {}, None
+    for line in Path(netcorr_file).read_text().splitlines():
+        tokens = line.split()
+        if not tokens:
+            continue
+        if tokens[0] == "#":
+            current = tokens[1] if len(tokens) == 2 else None
+            if current is not None:
+                sections[current] = []
+        elif current is not None:
+            sections[current].append(tokens)
+    return sections
+
+
 def format_netcorr_mat(netcorr_file, fishZ, pcorr, curr_out_path):
     """Parse a 3dNetCorr .netcc output file and save the desired matrix as tab-delimited text.
 
-    The .netcc file contains multiple labeled matrix sections. The section to extract
-    depends on the fishZ and pcorr flags:
-    - fishZ=False, pcorr=False  → CC (Pearson correlation)
-    - fishZ=False, pcorr=True   → PC (partial correlation)
-    - fishZ=True,  pcorr=False  → FZ (Fisher Z-transformed correlation)
-    - fishZ=True,  pcorr=True   → PCB (Fisher Z-transformed partial correlation)
+    3dNetCorr writes CC always, FZ with -fish_z, and PC and PCB with -part_corr.
+    The flags select:
+    - fishZ=False, pcorr=False  -> CC (Pearson correlation), verbatim
+    - fishZ=False, pcorr=True   -> PC (partial correlation), verbatim
+    - fishZ=True,  pcorr=False  -> FZ (Fisher Z of CC), verbatim
+    - fishZ=True,  pcorr=True   -> Fisher Z of PC, computed here as arctanh with
+      |z| capped at 4.0 like AFNI's FZ. AFNI writes no Fisher-Z partial
+      correlation; PCB holds asymmetric partial-correlation regression
+      coefficients and is never used. AFNI's PC diagonal is -1, so this
+      matrix's diagonal is -4.0; it carries no connectivity information.
 
     Parameters
     ----------
@@ -192,37 +221,25 @@ def format_netcorr_mat(netcorr_file, fishZ, pcorr, curr_out_path):
         Whether partial correlation was requested.
     curr_out_path : str or os.PathLike
         Destination path for the tab-delimited matrix text file.
+
+    Raises
+    ------
+    ToolExecutionError
+        If the .netcc file lacks the section the flags require.
     """
-    if not fishZ and not pcorr:
-        entry_to_check = "CC"
-        end_to_check = "Z"
-    elif not fishZ and pcorr:
-        entry_to_check = "PC"
-        end_to_check = "PCB"
-    elif fishZ and not pcorr:
-        entry_to_check = "FZ"
-        end_to_check = "Z"
-    else:
-        entry_to_check = "PCB"
-        end_to_check = "Z"
+    name = "PC" if pcorr else ("FZ" if fishZ else "CC")
+    sections = _netcc_sections(netcorr_file)
+    if not sections.get(name):
+        raise ToolExecutionError(f"3dNetCorr output {netcorr_file} has no '{name}' matrix.")
+    rows = sections[name]
 
-    conn_mat = [line.split() for line in Path(netcorr_file).read_text().splitlines()]
+    if fishZ and pcorr:
+        r = np.array(rows, dtype=float)
+        limit = np.tanh(_FISHER_Z_CAP)
+        z = np.arctanh(np.clip(r, -limit, limit))
+        rows = [[f"{v:.4f}" for v in row] for row in z]
 
-    start_row = 0
-    end_row = 0
-    for i, entry in enumerate(conn_mat):
-        if len(entry) == 2 and entry[1] == entry_to_check:
-            start_row = i + 1
-            for j, next_entry in enumerate(conn_mat[i + 1:]):
-                if len(next_entry) == 2 and next_entry[1] == end_to_check:
-                    end_row = j + i + 1
-                    break
-            if end_row == 0:
-                end_row = len(conn_mat)
-            break
-
-    out_conn_mat = conn_mat[start_row:end_row]
-    Path(curr_out_path).write_text("".join("\t".join(row) + "\n" for row in out_conn_mat))
+    Path(curr_out_path).write_text("".join("\t".join(row) + "\n" for row in rows))
 
 
 def parcellated_conn(inset_path, out_dir, conn_out_file_pre, template_path, fishZ, pcorr, condition=None, logger=None):

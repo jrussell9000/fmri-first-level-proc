@@ -18,36 +18,53 @@ from fmri_first_level_proc.templates import extract_roi_stats
 
 pytestmark = pytest.mark.level0_unit
 
+# Layout of a real 3dNetCorr -fish_z -part_corr .netcc (AFNI 26.3.07): CC, FZ, PC, PCB
 NETCC = """\
 # 2  # Number of network ROIs
-# 2  # Number of netcc matrices
+# 4  # Number of netcc matrices
 # WITH_ROI_LABELS
-         1         2
-     ROI_1     ROI_2
+        001 	        002
+          1 	          2
 # CC
-  1.000000  0.500000
-  0.500000  1.000000
+      1.0000	      0.5000
+      0.5000	      1.0000
 # FZ
-  4.000000  0.549306
-  0.549306  4.000000
+      4.0000	      0.5493
+      0.5493	      4.0000
+# PC
+     -1.0000	      0.3000
+      0.3000	     -1.0000
+# PCB
+     -1.0000	      0.3100
+      0.2900	     -1.0000
 """
 
 
 @pytest.mark.parametrize(
-    "fishZ, expected",
+    "fishZ, pcorr, expected",
     [
-        (False, "1.000000\t0.500000\n0.500000\t1.000000\n#\tFZ\n4.000000\t0.549306\n0.549306\t4.000000\n"),
-        (True, "4.000000\t0.549306\n0.549306\t4.000000\n"),
+        (False, False, "1.0000\t0.5000\n0.5000\t1.0000\n"),
+        (True, False, "4.0000\t0.5493\n0.5493\t4.0000\n"),
+        (False, True, "-1.0000\t0.3000\n0.3000\t-1.0000\n"),
+        # Fisher Z of PC, capped at |z| = 4 like AFNI's FZ; PCB (betas) is never used
+        (True, True, "-4.0000\t0.3095\n0.3095\t-4.0000\n"),
     ],
 )
-def test_format_netcorr_mat(tmp_path, fishZ, expected):
-    # Characterizes current behavior: the CC section ends at a '# Z' header or EOF,
-    # so without -fish_z (no FZ section in real output) CC runs to EOF.
+def test_format_netcorr_mat(tmp_path, fishZ, pcorr, expected):
     src = tmp_path / "x_000.netcc"
     src.write_text(NETCC)
     out = tmp_path / "mat.txt"
-    format_netcorr_mat(str(src), fishZ, False, str(out))
+    format_netcorr_mat(str(src), fishZ, pcorr, str(out))
     assert out.read_text() == expected
+
+
+def test_format_netcorr_mat_missing_section(tmp_path):
+    from fmri_first_level_proc.exceptions import ToolExecutionError
+
+    src = tmp_path / "x_000.netcc"
+    src.write_text(NETCC.split("# FZ")[0])  # CC only, as without -fish_z / -part_corr
+    with pytest.raises(ToolExecutionError, match="'PC'"):
+        format_netcorr_mat(src, True, True, tmp_path / "mat.txt")
 
 
 def test_compute_matrix_contrast(tmp_path, logger):

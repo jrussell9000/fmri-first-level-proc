@@ -43,6 +43,8 @@ select = ["F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Deprecations (e.g. pandas' Pandas4Warning) fail the suite instead of scrolling past
+filterwarnings = ["error"]
 markers = [
     "level0_unit: Pure-function unit tests",
     "level1_internal_integration: Cross-function integration within a module",

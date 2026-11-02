@@ -140,17 +140,24 @@ def test_format_netcorr_mat_extracts_symmetric_matrix(data, tmp_path, fishZ, pco
     np.testing.assert_allclose(mat, mat.T, atol=1e-4)
 
 
-@pytest.mark.xfail(strict=True, reason="issue #1: fishZ+pcorr extracts PCB (partial-correlation "
-                   "betas, asymmetric); AFNI writes no Fisher-Z partial correlation")
-def test_format_netcorr_mat_fishz_pcorr_is_not_pcb(data, tmp_path):
+def test_format_netcorr_mat_fishz_pcorr_is_fisher_z_of_pc(data, tmp_path):
+    """Issue #1: fishZ+pcorr is arctanh(PC) with AFNI's |z| <= 4 cap, not the PCB betas."""
     _afni("3dNetCorr", "-prefix", tmp_path / "nc", "-inset", data / "scan.nii.gz",
           "-in_rois", data / "parc.nii.gz", "-push_thru_many_zeros", "-fish_z", "-part_corr", cwd=tmp_path)
     netcc = (tmp_path / "nc_000.netcc").read_text().splitlines()
-    pcb = [ln.split() for ln in netcc[netcc.index("# PCB") + 1:] if ln.strip()]
+    start, stop = netcc.index("# PC") + 1, netcc.index("# PCB")
+    pc = np.array([ln.split() for ln in netcc[start:stop] if ln.strip()], dtype=float)
+    cc = np.array([ln.split() for ln in netcc[netcc.index("# CC") + 1:netcc.index("# FZ")]], dtype=float)
+    fz = np.array([ln.split() for ln in netcc[netcc.index("# FZ") + 1:start - 1]], dtype=float)
+    # Same transform reproduces AFNI's own FZ from CC, so the cap matches AFNI's
+    np.testing.assert_allclose(np.arctanh(np.clip(cc, -np.tanh(4), np.tanh(4))), fz, atol=1e-4)
+
     out = tmp_path / "mat.txt"
     format_netcorr_mat(tmp_path / "nc_000.netcc", True, True, out)
-    extracted = [ln.split("\t") for ln in out.read_text().splitlines()]
-    assert extracted != pcb  # PCB holds regression betas, not Fisher-Z partial correlations
+    mat = np.loadtxt(out, delimiter="\t")
+    np.testing.assert_allclose(mat, np.arctanh(np.clip(pc, -np.tanh(4), np.tanh(4))), atol=1e-4)
+    np.testing.assert_allclose(mat, mat.T, atol=1e-4)
+    np.testing.assert_allclose(np.diag(mat), -4.0)
 
 
 # ---------------------------------------------------------------------------
