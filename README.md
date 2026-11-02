@@ -91,7 +91,7 @@ FmriFirstLevelError
 ├── ConfigError          # Invalid config: missing fields, schema violations
 ├── InputError           # Input file missing, malformed, or unreadable
 ├── ToolUnavailableError # AFNI binary not found on PATH
-├── ToolVersionError     # AFNI/Python version does not match lockfile pin
+├── ToolVersionError     # AFNI version does not match lockfile pin
 ├── ToolExecutionError   # AFNI command returned non-zero or missing output
 ├── ModelError           # Singularity, insufficient DOF, no surviving trials
 └── GuardError           # Pipeline invariant violation (bug)
@@ -140,7 +140,7 @@ The package exposes these names in `__init__.py`:
 
 ## Runtime Validation
 
-The package ships `fmri_first_level_proc/data/tools.lock.yaml`. At startup the pipeline validates installed AFNI and Python versions against its pinned values. Version mismatches raise `ToolVersionError` (exit code 4). If the lockfile is missing from the installation, a low-severity warning is emitted and version pinning is skipped.
+The package ships `fmri_first_level_proc/data/tools.lock.yaml`. At startup the pipeline checks installed versions against its pinned values. An AFNI mismatch raises `ToolVersionError` (exit code 4). A Python minor-version mismatch logs a medium-severity `PYTHON_VERSION_MISMATCH` warning and continues, because `requires-python` defines which interpreters are supported; the pin records the version results were validated on. If the lockfile is missing from the installation, a low-severity warning is emitted and version pinning is skipped.
 
 ## Repository Layout
 

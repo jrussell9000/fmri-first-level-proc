@@ -426,11 +426,11 @@ Applies to: `CSF_path`/`CSF_paths`, `WM_path`/`WM_paths`, `GS_paths`
 - **Schema:**
   ```yaml
   lockfile_version: "1.0.0"
-  python: "3.14.3"          # major.minor.patch; minor-series match enforced
+  python: "3.14.3"          # validated interpreter; major.minor compared, mismatch warns
   binaries:
     AFNI: "26.3.07"         # exact match enforced; "PLACEHOLDER" to skip
   ```
-- **Behavior:** When present, the pipeline reads the lockfile at startup and validates installed versions. Version mismatches raise `ToolVersionError` (exit code 4). When absent (e.g., pip-install users), a low-severity `LOCKFILE_ABSENT` warning is emitted and version pinning is skipped. The lockfile resolves relative to the repository root (`__file__.parent.parent`), not `site-packages`, so pip-installed users always hit the graceful-absence path.
+- **Behavior:** The pipeline reads the lockfile at startup from the installed package. See [Version Lock Validation](#2-version-lock-validation).
 
 ---
 
@@ -602,9 +602,9 @@ Required binaries: `3dDeconvolve`, `3dTproject`, `3dTstat`, `3dBandpass`, `3dROI
 
 Using the `tools.lock.yaml` shipped inside the installed package:
 - **AFNI:** Runs `afni -ver`, parses the version string, and enforces strict exact-match comparison against the lockfile pin. `"PLACEHOLDER"` in the lockfile skips the check.
-- **Python:** Compares `sys.version_info` major.minor against the lockfile's `python` field (minor-series match; patch version is ignored per PEP 440 compatibility semantics).
+- **Python:** Compares `sys.version_info` major.minor against the lockfile's `python` field (patch ignored). A mismatch is advisory: it emits a medium-severity `PYTHON_VERSION_MISMATCH` warning and the run continues. `requires-python` in `pyproject.toml` defines which interpreters are supported; the pin records the version results were validated on. Deployments that need an exact interpreter should pin it in their environment (e.g. the container image).
 
-Version mismatches raise `ToolVersionError` (exit code 4). When the lockfile is absent, a low-severity `LOCKFILE_ABSENT` warning is emitted and version pinning is skipped.
+An AFNI mismatch raises `ToolVersionError` (exit code 4). If the lockfile is missing from the installation, a low-severity `LOCKFILE_ABSENT` warning is emitted and version pinning is skipped.
 
 ---
 

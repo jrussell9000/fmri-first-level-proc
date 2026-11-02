@@ -94,14 +94,31 @@ def test_parse_afni_version():
     assert runtime._parse_afni_version("nothing", "") is None
 
 
-def test_probe_tool_versions_python_mismatch(tmp_path, logger):
+def test_probe_tool_versions_python_mismatch_warns(tmp_path, logger):
+    """Issue #3: a Python minor mismatch is advisory (requires-python is the contract)."""
+    from fmri_first_level_proc.reporting import get_warnings
+
     lock = tmp_path / "tools.lock.yaml"
     lock.write_text(yaml.safe_dump({"python": "2.7.0", "binaries": {"AFNI": "PLACEHOLDER"}}))
-    with pytest.raises(ToolVersionError):
-        runtime.probe_tool_versions(str(lock), logger=logger)
+    runtime.probe_tool_versions(str(lock), logger=logger)  # does not raise
+    [w] = get_warnings()
+    assert (w["code"], w["severity"]) == ("PYTHON_VERSION_MISMATCH", "medium")
+
     here = f"{sys.version_info.major}.{sys.version_info.minor}.0"
     lock.write_text(yaml.safe_dump({"python": here, "binaries": {"AFNI": "PLACEHOLDER"}}))
     runtime.probe_tool_versions(str(lock), logger=logger)
+    assert len(get_warnings()) == 1  # matching minor adds nothing
+
+
+def test_probe_tool_versions_afni_mismatch_still_fails(tmp_path, monkeypatch, logger):
+    import subprocess
+
+    lock = tmp_path / "tools.lock.yaml"
+    lock.write_text(yaml.safe_dump({"binaries": {"AFNI": "26.3.07"}}))
+    fake = subprocess.CompletedProcess([], 0, stdout="Precompiled binary x: (Version AFNI_26.0.09 'X')", stderr="")
+    monkeypatch.setattr(runtime.subprocess, "run", lambda *a, **k: fake)
+    with pytest.raises(ToolVersionError, match="AFNI: expected 26.3.07, got 26.0.09"):
+        runtime.probe_tool_versions(str(lock), logger=logger)
 
 
 def test_lockfile_ships_as_package_data():

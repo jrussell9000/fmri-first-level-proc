@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 from .exceptions import ToolUnavailableError, ToolVersionError
+from .reporting import graded_warning
 
 
 def _cgroup_cpu_limit(cgroup_root: Path) -> int | None:
@@ -177,9 +178,10 @@ def probe_tool_versions(
     ``PLACEHOLDER`` for the AFNI version, the check is skipped with an INFO log.
 
     **Python**: compares ``sys.version_info`` major.minor against the lockfile's
-    top-level ``python`` field (minor-series match: patch version is ignored per
-    PEP 440 compatibility semantics). If the lockfile has no ``python`` field,
-    the check is skipped with an INFO log.
+    top-level ``python`` field (patch version ignored). A mismatch is advisory:
+    it emits a medium-severity ``PYTHON_VERSION_MISMATCH`` graded warning and
+    the run continues, since ``requires-python`` defines what is supported. If
+    the lockfile has no ``python`` field, the check is skipped with an INFO log.
 
     Parameters
     ----------
@@ -195,7 +197,7 @@ def probe_tool_versions(
     ToolUnavailableError
         If a tool binary is unreachable or its version output is unparseable.
     ToolVersionError
-        If a tool's installed version does not match its lockfile pin.
+        If the installed AFNI version does not match its lockfile pin.
     """
     if logger is None:
         logger = logging.getLogger(__name__)
@@ -243,7 +245,7 @@ def probe_tool_versions(
 
         tools_verified += 1
 
-    # --- Python version check (minor-series match) ---
+    # --- Python version check (major.minor; advisory) ---
     expected_python: str | None = lockfile.get("python")
 
     if expected_python is None:
@@ -263,12 +265,17 @@ def probe_tool_versions(
             )
 
         if sys.version_info.major != pin_major or sys.version_info.minor != pin_minor:
-            raise ToolVersionError(
-                f"Python: expected {pin_major}.{pin_minor}.x, "
-                f"got {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+            # Advisory only: pyproject's requires-python is the support contract, and a
+            # different interpreter minor rarely changes numerics. AFNI stays strict above.
+            graded_warning(
+                logger, 'medium', 'PYTHON_VERSION_MISMATCH',
+                f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} "
+                f"differs from the {pin_major}.{pin_minor}.x pinned in tools.lock.yaml; results "
+                "were validated on the pinned version.",
+                user_facing=True,
             )
-
-        tools_verified += 1
+        else:
+            tools_verified += 1
 
     if tools_verified > 0:
         logger.info("Startup version probe passed: %d pinned tool(s) verified.", tools_verified)
