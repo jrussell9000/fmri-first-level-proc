@@ -79,6 +79,7 @@ from pathlib import Path
 import numpy as np
 
 from ..afni import parallel_map, run_afni_command, uses_num_cores
+from ..manifest import manifested
 from ..config import ResolvedConfig
 from ..connectivity import parcellated_conn, seed_to_voxel_conn
 from ..design import compute_dof
@@ -554,6 +555,7 @@ def gen_conn(config, logger):
             logger=logger,
         )
 
+@manifested
 @uses_num_cores
 def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLevelResult:
     """Validate config and execute the resting-state connectivity pipeline.

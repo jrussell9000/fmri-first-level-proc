@@ -82,6 +82,7 @@ import numpy as np
 import pandas as pd
 
 from ..afni import clean_deconvolve_err, parallel_map, run_afni_command, uses_num_cores
+from ..manifest import manifested
 from ..config import ResolvedConfig
 from ..connectivity import (
     build_conn_output_path,
@@ -553,6 +554,7 @@ def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, config: 
                 logger.error("Failed to create seed-to-voxel connectivity contrast '%s'.", label)
 
 
+@manifested
 @uses_num_cores
 def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLevelResult:
     """Validate config and execute the task connectivity pipeline.

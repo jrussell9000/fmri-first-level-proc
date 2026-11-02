@@ -32,7 +32,7 @@ Public API
 ----------
 main(cli_name)
     CLI entry point registered as the ``fmri-first-level-proc`` console script.
-    Parses --config, --dry-run, --analyses, and --log-file flags.
+    Parses --config, --dry-run, --analyses, --log-file, and --force flags.
 
 _main_deprecated()
     Deprecated alias for main() registered as the ``run-first-level`` console
@@ -112,6 +112,11 @@ def main(cli_name: str = 'fmri-first-level-proc') -> None:
         "--log-file", type=str, default=None,
         help="Optional path to a log file (useful for parallel runs)."
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="If a block's out_dir holds outputs from a different configuration, "
+             "delete that block's previous outputs and rerun instead of failing."
+    )
 
     args = parser.parse_args()
     logger = setup_logging('fmri_first_level_proc', log_file=args.log_file)
@@ -174,7 +179,7 @@ def main(cli_name: str = 'fmri-first-level-proc') -> None:
             )
             logger.info("-" * 60)
             block_start = time.time()
-            result = DISPATCH[config.analysis_type](config, logger)
+            result = DISPATCH[config.analysis_type](config, logger, force=args.force)
             all_warnings.extend(result.warnings)
             logger.info(
                 "Analysis [%d] '%s' completed in %.2f seconds.",

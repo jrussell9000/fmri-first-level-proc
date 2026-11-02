@@ -13,7 +13,7 @@ A YAML-driven Python framework for first-level fMRI analysis (Task Activation, T
 - **Robustness:** Automated QC, motion censoring (degrees-only convention; column order `[tx, ty, tz, rx, ry, rz]`), trial survival checks, DOF pre-flight verification, and mandatory minimum-outlier EPI frame extraction for alignment QC.
 - **Runtime Validation:** Preflight binary reachability checks for all required AFNI tools. Version pinning for AFNI and Python via the `tools.lock.yaml` shipped inside the package.
 - **Warning Accumulator:** Graded warning system (`low`/`medium`/`high` severity) with structured records accessible via the `get_warnings()`/`clear_warnings()` API. High-severity warnings trigger exit code 3.
-- **Resumable Outputs:** Stages whose output files already exist are skipped on rerun. (A config-hash checkpoint ledger exists in `checkpoint.py` but is not yet wired into the pipelines.)
+- **Safe Reruns:** Each block writes `{out_file_pre}_manifest.json` with a config hash and the files it created. Completed blocks with an unchanged config are skipped; crashed attempts have their partial outputs discarded; a changed config fails instead of silently reusing stale outputs (`--force` to rerun).
 - **Exception Hierarchy:** Typed exceptions (`ConfigError`, `InputError`, `ToolUnavailableError`, `ToolVersionError`, `ToolExecutionError`, `ModelError`, `GuardError`) map to distinct exit codes for programmatic error handling.
 - **Pre-Regression Extraction:** Optional `extract_raw_ptseries` toggle to capture parcellated time series before nuisance regression.
 - **Parallel Processing:** `num_cores` sets one CPU budget per block: `3dDeconvolve -jobs`, `OMP_NUM_THREADS` for every AFNI call, and concurrent processing of independent runs/conditions within that budget.
@@ -59,6 +59,7 @@ The primary CLI entry point is `fmri-first-level-proc` (also runnable as `python
 | `--dry-run` | Validate config and print plan without executing |
 | `--analyses` | Run only specific block indices (0-based), e.g. `--analyses 0 2` |
 | `--log-file` | Write logs to file in addition to console |
+| `--force` | Rerun a block whose `out_dir` holds outputs from a different config, deleting that block's previous outputs |
 
 ## Exit Codes
 
@@ -144,7 +145,8 @@ src/fmri_first_level_proc/
     connectivity.py   # 3dNetCorr wrappers, matrix contrasts
     afni.py           # AFNI subprocess wrapper
     reporting.py      # logging, graded warnings, results, QC JSON
-    bids.py  runtime.py  checkpoint.py  fileutils.py  exceptions.py
+    manifest.py       # per-block run manifest: stale-output guard, crash recovery
+    bids.py  runtime.py  fileutils.py  exceptions.py
     data/tools.lock.yaml
 tests/
 docs/input_specification.md

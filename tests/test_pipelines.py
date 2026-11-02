@@ -235,3 +235,137 @@ def test_rest_conn_failed_run_is_skipped(workdir, inputs, monkeypatch, logger):
     DISPATCH["rest_conn"](config, logger)
     tcat = fake.calls_to("3dTcat")[0]
     assert [Path(p).name for p in tcat[5:]] == ["sub01_run1_residual_dtseries.nii.gz"]
+
+
+# ---------------------------------------------------------------------------
+# Run manifest: stale-output guard and crash recovery
+# ---------------------------------------------------------------------------
+
+def _act_block(workdir, inputs, out_file_pre="sub01", **extra):
+    block = {
+        "name": out_file_pre, "type": "task_act",
+        "paths": {"scan_path": inputs["scan.nii.gz"], "task_timing_path": inputs["events.tsv"],
+                  "motion_path": inputs["motion.txt"]},
+        "out_dir": str(workdir / "out"), "out_file_pre": out_file_pre,
+        "cond_labels": ["A", "B"], "average_type": "mean", "hrf_model": "GAM",
+        "include_motion_derivs": False, "fd_threshold": 0.9,
+    }
+    block.update(extra)
+    return block
+
+
+def _manifest(workdir, pre="sub01"):
+    return json.loads((workdir / "out" / f"{pre}_manifest.json").read_text())
+
+
+def test_manifest_completed_run_is_skipped(workdir, inputs, fake_afni, logger):
+    config = _resolve(workdir, _act_block(workdir, inputs), None)
+    first = DISPATCH["task_act"](config, logger)
+    n_calls = len(fake_afni.calls)
+
+    manifest = _manifest(workdir)
+    assert manifest["status"] == "completed"
+    assert "sub01_concat_bucket_stats.nii.gz" in manifest["owned_files"]
+    assert "preexisting_files" not in manifest
+    assert manifest["result"]["output_files"] == first.output_files
+
+    second = DISPATCH["task_act"](config, logger)
+    assert len(fake_afni.calls) == n_calls  # no AFNI work at all
+    assert (second.status, second.output_files, second.qc_summary) == (first.status, first.output_files, first.qc_summary)
+
+
+def test_manifest_missing_output_is_regenerated(workdir, inputs, fake_afni, logger):
+    config = _resolve(workdir, _act_block(workdir, inputs), None)
+    DISPATCH["task_act"](config, logger)
+    (workdir / "out" / "sub01_concat_bucket_stats.nii.gz").unlink()
+    n_calls = len(fake_afni.calls)
+
+    DISPATCH["task_act"](config, logger)
+    assert "3dDeconvolve" in fake_afni.programs()[n_calls:]
+    assert "sub01_concat_bucket_stats.nii.gz" in _manifest(workdir)["owned_files"]
+
+
+def test_manifest_config_change_requires_force(workdir, inputs, fake_afni, logger):
+    from fmri_first_level_proc.exceptions import ConfigError
+
+    with_buckets = _act_block(workdir, inputs, extraction={"stat_buckets": ["Coef"], "extract_out_file_pre": "sub01_wb"})
+    DISPATCH["task_act"](_resolve(workdir, with_buckets, None), logger)
+    stale = workdir / "out" / "sub01_wb_Coef_bucket.nii.gz"
+    assert stale.exists()
+
+    changed = _resolve(workdir, _act_block(workdir, inputs), None)
+    with pytest.raises(ConfigError, match="different configuration"):
+        DISPATCH["task_act"](changed, logger)
+    assert stale.exists()  # nothing touched without force
+
+    n_calls = len(fake_afni.calls)
+    DISPATCH["task_act"](changed, logger, force=True)
+    assert not stale.exists()  # output only the old config produced is gone
+    assert "1d_tool.py" in fake_afni.programs()[n_calls:]  # censoring redone, not reused
+    assert _manifest(workdir)["status"] == "completed"
+
+
+def test_manifest_num_cores_change_is_not_a_config_change(workdir, inputs, fake_afni, logger):
+    DISPATCH["task_act"](_resolve(workdir, _act_block(workdir, inputs), None), logger)
+    n_calls = len(fake_afni.calls)
+    config = _resolve(workdir, _act_block(workdir, inputs), None)
+    config.num_cores = 8
+    DISPATCH["task_act"](config, logger)
+    assert len(fake_afni.calls) == n_calls
+
+
+def test_manifest_crashed_attempt_is_discarded(workdir, inputs, monkeypatch, logger):
+    from fmri_first_level_proc.exceptions import ToolExecutionError
+
+    config = _resolve(workdir, _act_block(workdir, inputs), None)
+    FakeAfni(n_trs=N_TRS, fail_on={"3dDeconvolve"}).install(monkeypatch)
+    with pytest.raises(ToolExecutionError):
+        DISPATCH["task_act"](config, logger)
+    manifest = _manifest(workdir)
+    assert manifest["status"] == "failed" and "ToolExecutionError" in manifest["error"]
+    censor = workdir / "out" / "sub01_concat_censor.1D"
+    censor.write_text("truncated")  # simulate a partial file left by the crash
+
+    retry = FakeAfni(n_trs=N_TRS).install(monkeypatch)
+    result = DISPATCH["task_act"](config, logger)
+    assert result.status == "success"
+    assert "1d_tool.py" in retry.programs()  # partial censor file was deleted and regenerated
+    assert censor.read_text() != "truncated"
+
+
+def test_manifest_force_leaves_other_blocks_in_shared_out_dir(workdir, inputs, fake_afni, logger):
+    # 'sub01' is a prefix of 'sub01_b': ownership must come from the manifest, not filename globs
+    DISPATCH["task_act"](_resolve(workdir, _act_block(workdir, inputs, "sub01"), None), logger)
+    DISPATCH["task_act"](_resolve(workdir, _act_block(workdir, inputs, "sub01_b"), None), logger)
+    other_outputs = sorted(p.name for p in (workdir / "out").iterdir() if p.name.startswith("sub01_b_"))
+    assert len(other_outputs) > 5
+
+    changed = _resolve(workdir, _act_block(workdir, inputs, "sub01", fd_threshold=0.5), None)
+    n_calls = len(fake_afni.calls)
+    DISPATCH["task_act"](changed, logger, force=True)
+    redone = fake_afni.calls[n_calls:]
+    assert any(c[0] == "1d_tool.py" and "0.5" in c for c in redone)  # sub01 recomputed with new threshold
+
+    assert sorted(p.name for p in (workdir / "out").iterdir() if p.name.startswith("sub01_b_")) == other_outputs
+    assert _manifest(workdir, "sub01_b")["status"] == "completed"
+
+
+def test_cli_passes_force(workdir, inputs, monkeypatch):
+    import sys
+
+    from fmri_first_level_proc import cli
+    from fmri_first_level_proc.reporting import FirstLevelResult
+
+    seen = {}
+
+    def fake_run(config, logger, force=False):
+        seen["force"] = force
+        return FirstLevelResult("success", Path(config.out_dir), [], {}, [])
+
+    _resolve(workdir, _act_block(workdir, inputs), None)
+    monkeypatch.setitem(cli.DISPATCH, "task_act", fake_run)
+    monkeypatch.setattr(cli, "preflight_tool_environments", lambda **k: None)
+    monkeypatch.setattr(cli, "probe_tool_versions", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", ["fmri-first-level-proc", "--config", str(workdir / "config.yaml"), "--force"])
+    cli.main()
+    assert seen == {"force": True}

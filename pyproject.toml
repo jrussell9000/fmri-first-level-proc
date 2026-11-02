@@ -47,7 +47,7 @@ markers = [
     "level0_unit: Pure-function unit tests",
     "level1_internal_integration: Cross-function integration within a module",
     "level2_tool_equivalence: Verify tool wrapper output matches known reference",
-    "level3_checkpoint: Checkpoint/resume round-trip",
+    "level3_manifest: Run manifest rerun/resume behavior",
     "level4_stage_integration: Single pipeline stage end-to-end",
     "level5_adversarial: Edge cases, malformed input, boundary conditions",
     "level6_cross_stage: Multi-stage integration",

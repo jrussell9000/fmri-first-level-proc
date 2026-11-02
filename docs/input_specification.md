@@ -452,7 +452,26 @@ When `derivatives_dirs` is set (in `global` or in a specific analysis block), th
 
 ## Output Files
 
-All outputs are written to `out_dir` using the `out_file_pre` prefix. Every analysis type writes a QC summary JSON.
+All outputs are written to `out_dir` using the `out_file_pre` prefix. Every analysis type writes a QC summary JSON and a run manifest.
+
+### Run Manifest
+
+**File:** `{out_file_pre}_manifest.json`
+
+Records each run of a block: a SHA-256 hash of the output-affecting config (every `ResolvedConfig` field except `num_cores`, `remove_previous`, and `analysis_name`), the package version, start/finish times, `status` (`started`, `failed` with an `error` message, or `completed`), the files this block created (`owned_files`, relative to `out_dir`), and on completion the result (`status`, `output_files`, `warnings`, `qc_summary`). It doubles as a machine-readable result record for workflow engines.
+
+On rerun:
+
+| Previous manifest | Behavior |
+|---|---|
+| none | Run normally. |
+| `completed`, same config, all `output_files` present | Skip the block and return the recorded result. |
+| `completed`, same config, some outputs missing | Rerun; stages regenerate missing files. |
+| `started` / `failed`, same config | A previous attempt crashed: delete the files it created (possibly partial), then rerun. |
+| different config | Fail with `ConfigError` (exit 2). With `--force`, delete this block's previous outputs and rerun. |
+| any, with `remove_previous: true` | Ignored; `out_dir` is cleared as before. |
+
+Ownership is tracked per block, so blocks that share an `out_dir` are never touched by each other's cleanup. Blocks sharing an `out_dir` must not run concurrently.
 
 ### QC Summary JSON
 
@@ -603,6 +622,7 @@ fmri-first-level-proc --config <path> [options]
 | `--dry-run` | flag | off | Validate the config and print the analysis plan without executing any analyses. |
 | `--analyses` | list of int | all | Run only specific analysis block indices (0-based). E.g. `--analyses 0 2` runs the first and third blocks. |
 | `--log-file` | str | none | Path to a log file. When set, logs are written to both console and file. |
+| `--force` | flag | off | If a block's `out_dir` holds outputs from a different configuration (see [Run Manifest](#run-manifest)), delete that block's previous outputs and rerun instead of failing with a `ConfigError`. |
 
 The legacy `run-first-level` command is a deprecated alias for `fmri-first-level-proc`. It emits a `CLI_DEPRECATED` warning before delegating.
 
