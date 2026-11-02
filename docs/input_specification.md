@@ -417,7 +417,7 @@ Applies to: `CSF_path`/`CSF_paths`, `WM_path`/`WM_paths`, `GS_paths`
   lockfile_version: "1.0.0"
   python: "3.14.3"          # major.minor.patch; minor-series match enforced
   binaries:
-    AFNI: "26.0.09"         # exact match enforced; "PLACEHOLDER" to skip
+    AFNI: "26.3.07"         # exact match enforced; "PLACEHOLDER" to skip
   ```
 - **Behavior:** When present, the pipeline reads the lockfile at startup and validates installed versions. Version mismatches raise `ToolVersionError` (exit code 4). When absent (e.g., pip-install users), a low-severity `LOCKFILE_ABSENT` warning is emitted and version pinning is skipped. The lockfile resolves relative to the repository root (`__file__.parent.parent`), not `site-packages`, so pip-installed users always hit the graceful-absence path.
 
