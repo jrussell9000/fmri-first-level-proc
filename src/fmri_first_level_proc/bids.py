@@ -7,10 +7,9 @@ files from one or more derivatives directories.
 """
 
 import dataclasses
-import glob
 import json
 import logging
-import os
+from pathlib import Path
 
 from .exceptions import InputError  # noqa: F401 -- available for callers
 from .fileutils import sanitize_filename_label
@@ -53,15 +52,15 @@ class DiscoveredInputs:
 # Private discovery helpers
 # ---------------------------------------------------------------------------
 
-def _get_func_dir(deriv_dir: str, subject: str, session: str | None) -> str:
+def _get_func_dir(deriv_dir: str, subject: str, session: str | None) -> Path:
     """Return the BIDS func directory path within a derivatives root."""
     if session is not None:
-        return os.path.join(deriv_dir, f"sub-{subject}", f"ses-{session}", "func")
-    return os.path.join(deriv_dir, f"sub-{subject}", "func")
+        return Path(deriv_dir) / f"sub-{subject}" / f"ses-{session}" / "func"
+    return Path(deriv_dir) / f"sub-{subject}" / "func"
 
 
 def _glob_bids_files(
-    func_dir: str,
+    func_dir: Path,
     subject: str,
     task: str | None,
     desc: str | None,
@@ -76,7 +75,7 @@ def _glob_bids_files(
     Returns a sorted list of matching absolute paths, or an empty list when
     func_dir does not exist or no matches are found.
     """
-    if not os.path.isdir(func_dir):
+    if not func_dir.is_dir():
         return []
 
     if task is not None:
@@ -90,7 +89,8 @@ def _glob_bids_files(
         else:
             pattern = f"sub-{subject}*_{suffix}{ext}"
 
-    return sorted(glob.glob(os.path.join(func_dir, pattern)))
+    # Paths stay str: discovered values populate ResolvedConfig fields
+    return sorted(str(p) for p in func_dir.glob(pattern))
 
 
 # ---------------------------------------------------------------------------
@@ -262,18 +262,11 @@ def build_bids_output_path(
     sub_val = sanitize_filename_label(str(sub))
 
     # Build directory: output_dir/sub-{sub}[/ses-{ses}]/func/
+    func_dir = Path(output_dir) / f"sub-{sub_val}"
     ses = entities.get("ses")
     if ses is not None:
-        ses_val = sanitize_filename_label(str(ses))
-        func_dir = os.path.join(
-            output_dir,
-            f"sub-{sub_val}",
-            f"ses-{ses_val}",
-            "func",
-        )
-    else:
-        ses_val = None
-        func_dir = os.path.join(output_dir, f"sub-{sub_val}", "func")
+        func_dir /= f"ses-{sanitize_filename_label(str(ses))}"
+    func_dir /= "func"
 
     # Build filename from ordered entities.
     parts: list[str] = []
@@ -285,7 +278,7 @@ def build_bids_output_path(
         parts.append(f"{key}-{sanitized}")
 
     filename = "_".join(parts) + f"_{suffix}{ext}"
-    return os.path.join(func_dir, filename)
+    return str(func_dir / filename)
 
 
 def write_dataset_description(
@@ -314,8 +307,8 @@ def write_dataset_description(
         Optional list of BIDS SourceDatasets entries (each a dict with at
         minimum a ``"URL"`` key). Defaults to an empty list.
     """
-    out_path = os.path.join(derivatives_dir, "dataset_description.json")
-    if os.path.isfile(out_path):
+    out_path = Path(derivatives_dir) / "dataset_description.json"
+    if out_path.is_file():
         logger.debug(
             "dataset_description.json already exists at %s; skipping write.",
             out_path,
@@ -330,7 +323,6 @@ def write_dataset_description(
         "SourceDatasets": source_datasets if source_datasets is not None else [],
     }
 
-    os.makedirs(derivatives_dir, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(description, fh, indent=2)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(description, indent=2), encoding="utf-8")
     logger.info("Wrote dataset_description.json to %s", out_path)

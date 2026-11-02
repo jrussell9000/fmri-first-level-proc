@@ -73,7 +73,6 @@ OUTPUTS:
 # Imports
 import copy
 import logging
-import os
 import shutil
 from pathlib import Path
 
@@ -110,6 +109,15 @@ from ..templates import (
     validate_template,
 )
 
+
+def _run_residual_path(config, run_idx) -> Path:
+    return Path(config.out_dir) / f"{config.out_file_pre}_run{run_idx+1}_residual_dtseries.nii.gz"
+
+
+def _concat_residual_path(config) -> Path:
+    return Path(config.out_dir) / f"{config.out_file_pre}_concat_residual_dtseries.nii.gz"
+
+
 def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared_motion, config, logger):
     """Generate per-run residual via simultaneous 3dTproject (regression + bandpass + censoring).
 
@@ -136,12 +144,12 @@ def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared
 
     Returns
     -------
-    str or None
+    pathlib.Path or None
         Path to the run's residual dtseries, or None on 3dTproject failure.
     """
-    run_out = os.path.join(config.out_dir, f"{config.out_file_pre}_run{run_idx+1}_residual_dtseries.nii.gz")
+    run_out = _run_residual_path(config, run_idx)
 
-    if os.path.exists(run_out):
+    if run_out.exists():
         return run_out
 
     tproj_command = ["3dTproject", "-input", run_scan,
@@ -172,7 +180,7 @@ def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared
         logger.error("3dTproject failed for run %d: %s", run_idx+1, e)
         return None
 
-    if os.path.exists(run_out):
+    if run_out.exists():
         logger.info("Successfully created residual dtseries for %s_run%d.", config.out_file_pre, run_idx+1)
         return run_out
     else:
@@ -220,22 +228,22 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
 
     Returns
     -------
-    str or None
+    pathlib.Path or None
         Path to the run's residual dtseries, or None on failure.
     """
-    run_out = os.path.join(config.out_dir, f"{config.out_file_pre}_run{run_idx+1}_residual_dtseries.nii.gz")
+    run_out = _run_residual_path(config, run_idx)
 
-    if os.path.exists(run_out):
+    if run_out.exists():
         return run_out
 
-    inter_dir = os.path.join(config.out_dir, "_sequenced_intermediates", f"run{run_idx+1}")
-    os.makedirs(inter_dir, exist_ok=True)
+    inter_dir = Path(config.out_dir) / "_sequenced_intermediates" / f"run{run_idx+1}"
+    inter_dir.mkdir(parents=True, exist_ok=True)
 
     label = f"run{run_idx+1}"
     success = False
     try:
         # Step 2-3: NTRP interpolate BOLD
-        bold_interp = os.path.join(inter_dir, f"{config.out_file_pre}_{label}_bold_interp.nii.gz")
+        bold_interp = inter_dir / f"{config.out_file_pre}_{label}_bold_interp.nii.gz"
         interp_cmd = ["3dTproject",
                       "-polort", "-1",
                       "-dt", str(config.tr),
@@ -244,12 +252,12 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
                       "-cenmode", "NTRP",
                       "-prefix", bold_interp]
         run_afni_command(interp_cmd, description=f"3dTproject NTRP BOLD {label}", logger=logger)
-        if not os.path.exists(bold_interp):
+        if not bold_interp.exists():
             logger.error("Sequenced step 2-3 failed: BOLD interpolation missing for %s.", label)
             return None
 
         # Step 4: 3dBandpass BOLD
-        bold_bp = os.path.join(inter_dir, f"{config.out_file_pre}_{label}_bold_bp.nii.gz")
+        bold_bp = inter_dir / f"{config.out_file_pre}_{label}_bold_bp.nii.gz"
         bp_cmd = ["3dBandpass",
                   "-nodetrend",
                   "-dt", str(config.tr),
@@ -257,7 +265,7 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
                   str(config.bandpass[0]), str(config.bandpass[1]),
                   bold_interp]
         run_afni_command(bp_cmd, description=f"3dBandpass BOLD {label}", logger=logger)
-        if not os.path.exists(bold_bp):
+        if not bold_bp.exists():
             logger.error("Sequenced step 4 failed: BOLD bandpass missing for %s.", label)
             return None
 
@@ -298,13 +306,13 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
 
         # Step 6: nuisance regression on filtered BOLD with filtered orts.
         # No -bandpass, no -censor; -polort -1 (rest_conn convention).
-        residual_pre_mask = os.path.join(inter_dir, f"{config.out_file_pre}_{label}_residual_premask.nii.gz")
+        residual_pre_mask = inter_dir / f"{config.out_file_pre}_{label}_residual_premask.nii.gz"
         reg_cmd = ["3dTproject",
                    "-polort", "-1",
                    "-dt", str(config.tr),
                    "-input", bold_bp] + ort_args + ["-prefix", residual_pre_mask]
         run_afni_command(reg_cmd, description=f"3dTproject sequenced regression {label}", logger=logger)
-        if not os.path.exists(residual_pre_mask):
+        if not residual_pre_mask.exists():
             logger.error("Sequenced step 6 failed: regression output missing for %s.", label)
             return None
 
@@ -316,7 +324,7 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
                     "-expr", "a*b",
                     "-prefix", run_out]
         run_afni_command(calc_cmd, description=f"3dcalc post-step zero censored TRs {label}", logger=logger)
-        if not os.path.exists(run_out):
+        if not run_out.exists():
             logger.error("Sequenced post-step failed: censored-zero residual missing for %s.", label)
             return None
 
@@ -379,9 +387,9 @@ def gen_residual_ts(config, logger):
         If no runs were successfully processed, or if 3dTcat concatenation fails.
     """
     # Check if concatenated residual dtseries exists
-    concat_path = os.path.join(config.out_dir, f"{config.out_file_pre}_concat_residual_dtseries.nii.gz")
+    concat_path = _concat_residual_path(config)
     per_run_dof = []
-    if not os.path.exists(concat_path):
+    if not concat_path.exists():
 
         # Validate and prepare motion files, generate censor files per run
         use_cols = 6 * config.motion_deriv_degree
@@ -455,7 +463,7 @@ def gen_residual_ts(config, logger):
         # Concatenate residual time series runs
         cat_command = ["3dTcat", "-TR", str(config.tr), "-prefix", concat_path] + completed_runs
         run_afni_command(cat_command, description="3dTcat concat residuals", logger=logger)
-        if os.path.exists(concat_path):
+        if concat_path.exists():
             logger.info("Successfully created concatenated residual dtseries for %s.", config.out_file_pre)
         else:
             raise ToolExecutionError(
@@ -465,8 +473,8 @@ def gen_residual_ts(config, logger):
         # If keep_run_res_dtseries is False (default True), remove per-run residual files
         if not config.keep_run_res_dtseries:
             for comp_run in completed_runs:
-                os.remove(comp_run)
-            all_removed = all(not os.path.exists(cr) for cr in completed_runs)
+                comp_run.unlink()
+            all_removed = all(not cr.exists() for cr in completed_runs)
             if all_removed:
                 logger.info("Successfully removed run-specific residual dtseries.")
             else:
@@ -495,22 +503,23 @@ def gen_ptseries(config, logger):
     ToolExecutionError
         If ptseries CSV could not be written after extraction.
     """
-    # Check if output already exists
-    if not os.path.exists(f"{config.out_dir}/{config.extract_out_file_pre}_residual_ptseries.csv"):
+    ptseries_path = Path(config.out_dir) / f"{config.extract_out_file_pre}_residual_ptseries.csv"
 
-        inset_path = os.path.join(config.out_dir, f"{config.out_file_pre}_concat_residual_dtseries.nii.gz")
-        new_df = extract_roi_stats(inset_path, config.template_path, config.average_type, logger=logger)
+    # Check if output already exists
+    if not ptseries_path.exists():
+
+        new_df = extract_roi_stats(_concat_residual_path(config), config.template_path, config.average_type, logger=logger)
 
         # Save ptseries
-        new_df.to_csv(f"{config.out_dir}/{config.extract_out_file_pre}_residual_ptseries.csv")
-        if os.path.exists(f"{config.out_dir}/{config.extract_out_file_pre}_residual_ptseries.csv"):
+        new_df.to_csv(ptseries_path)
+        if ptseries_path.exists():
             logger.info("Successfully extracted ptseries using ROI template.")
         else:
             raise ToolExecutionError(
                 f"Could not extract ptseries using ROI template for {config.out_file_pre}."
             )
     else:
-        logger.info("%s/%s_residual_ptseries.csv already exists.", config.out_dir, config.extract_out_file_pre)
+        logger.info("%s already exists.", ptseries_path)
 
 def gen_conn(config, logger):
     """Compute functional connectivity from the concatenated residual dtseries.
@@ -526,7 +535,7 @@ def gen_conn(config, logger):
         template_path, fishZ, pcorr.
     logger : logging.Logger
     """
-    inset_path = os.path.join(config.out_dir, f"{config.out_file_pre}_concat_residual_dtseries.nii.gz")
+    inset_path = _concat_residual_path(config)
 
     # Run connectivity analyses based on the specified flavor (no condition -- resting-state)
     if config.calc_conn == "parcellated":
@@ -665,7 +674,7 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         for i, scan in enumerate(config.scan_paths):
             psc_path = scale_to_psc(
                 scan, config.out_dir, config.out_file_pre, f"run{i+1}", logger)
-            config.scan_paths[i] = psc_path
+            config.scan_paths[i] = str(psc_path)
 
     # Extract pre-regression parcellated time series per run if requested
     if getattr(config, 'extract_raw_ptseries', False):
@@ -680,12 +689,11 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         validated_tpl = validate_template(config.scan_paths[0], config.template_path,
             config.out_dir, config.force_diff_atlas, conn_type="extract", logger=logger)
         for i, scan in enumerate(config.scan_paths):
-            raw_out = os.path.join(config.out_dir,
-                f"{config.extract_out_file_pre}_run{i+1}_raw_ptseries.csv")
-            if not os.path.exists(raw_out):
+            raw_out = Path(config.out_dir) / f"{config.extract_out_file_pre}_run{i+1}_raw_ptseries.csv"
+            if not raw_out.exists():
                 raw_df = extract_roi_stats(scan, validated_tpl, config.average_type, logger=logger)
                 raw_df.to_csv(raw_out)
-                if os.path.exists(raw_out):
+                if raw_out.exists():
                     logger.info("Extracted raw ptseries for run %d to %s.", i+1, raw_out)
                 else:
                     raise ToolExecutionError(
@@ -710,7 +718,7 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
 
     # Collect per-run censor stats (censor files were created inside gen_residual_ts)
     for i in range(len(config.scan_paths)):
-        censor_path = os.path.join(config.out_dir, f"{config.out_file_pre}_run{i+1}_censor.1D")
+        censor_path = Path(config.out_dir) / f"{config.out_file_pre}_run{i+1}_censor.1D"
         run_stats = {"run": i + 1}
         try:
             censor_data = np.loadtxt(censor_path)
@@ -751,31 +759,18 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     write_qc_summary(config.out_dir, config.out_file_pre, qc_data, logger)
 
     # Collect output_files
-    output_files: list[str] = []
-    for i in range(len(config.scan_paths)):
-        psc_out = os.path.join(config.out_dir, f"{config.out_file_pre}_run{i+1}_psc.nii.gz")
-        if os.path.exists(psc_out):
-            output_files.append(psc_out)
-    concat_path = os.path.join(config.out_dir, f"{config.out_file_pre}_concat_residual_dtseries.nii.gz")
-    if os.path.exists(concat_path):
-        output_files.append(concat_path)
+    out_dir = Path(config.out_dir)
+    n_runs = len(config.scan_paths)
+    candidates = [out_dir / f"{config.out_file_pre}_run{i+1}_psc.nii.gz" for i in range(n_runs)]
+    candidates.append(_concat_residual_path(config))
     if config.keep_run_res_dtseries:
-        for i in range(len(config.scan_paths)):
-            run_res = os.path.join(config.out_dir, f"{config.out_file_pre}_run{i+1}_residual_dtseries.nii.gz")
-            if os.path.exists(run_res):
-                output_files.append(run_res)
+        candidates.extend(_run_residual_path(config, i) for i in range(n_runs))
     if getattr(config, 'extract_raw_ptseries', False) and config.extract_out_file_pre is not None:
-        for i in range(len(config.scan_paths)):
-            raw_out = os.path.join(config.out_dir, f"{config.extract_out_file_pre}_run{i+1}_raw_ptseries.csv")
-            if os.path.exists(raw_out):
-                output_files.append(raw_out)
+        candidates.extend(out_dir / f"{config.extract_out_file_pre}_run{i+1}_raw_ptseries.csv" for i in range(n_runs))
     if config.extract_ptseries and config.extract_out_file_pre is not None:
-        pts_path = os.path.join(config.out_dir, f"{config.extract_out_file_pre}_residual_ptseries.csv")
-        if os.path.exists(pts_path):
-            output_files.append(pts_path)
-    qc_path = os.path.join(config.out_dir, f"{config.out_file_pre}_qc_summary.json")
-    if os.path.exists(qc_path):
-        output_files.append(qc_path)
+        candidates.append(out_dir / f"{config.extract_out_file_pre}_residual_ptseries.csv")
+    candidates.append(out_dir / f"{config.out_file_pre}_qc_summary.json")
+    output_files = [str(p) for p in candidates if p.exists()]
 
     # Determine result status
     status = "warning" if any(w.get("severity") == "high" for w in get_warnings()) else "success"

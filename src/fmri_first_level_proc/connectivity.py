@@ -1,8 +1,8 @@
 """Seed-to-voxel and parcellated functional connectivity via 3dNetCorr, plus matrix contrasts."""
 
 import logging
-import os
 import shutil
+from pathlib import Path
 
 import numpy as np
 
@@ -10,17 +10,28 @@ from .afni import run_afni_command
 from .exceptions import InputError, ToolExecutionError
 
 
+def _conn_suffix(fishZ, pcorr, calc_conn):
+    """Filename suffix encoding the correlation type and output format."""
+    stat = {(True, True): "_pcorr_fishZ", (True, False): "_fishZ",
+            (False, True): "_pcorr", (False, False): "_corr"}[(bool(fishZ), bool(pcorr))]
+    return stat + ("_mat.txt" if calc_conn == "parcellated" else ".nii.gz")
+
+
+def _conn_prefix(conn_out_file_pre, condition):
+    return f"{conn_out_file_pre}_{condition}" if condition is not None else conn_out_file_pre
+
+
 def build_conn_output_path(out_dir, conn_out_file_pre, condition, fishZ, pcorr, calc_conn):
     """Construct the expected connectivity output path for a given condition.
 
     Parameters
     ----------
-    out_dir : str
+    out_dir : str or os.PathLike
         Output directory.
     conn_out_file_pre : str
         Connectivity output file prefix.
-    condition : str
-        Condition name.
+    condition : str or None
+        Condition name; None for resting-state (no condition in the filename).
     fishZ : bool
         Whether Fisher Z-transform was applied.
     pcorr : bool
@@ -30,32 +41,11 @@ def build_conn_output_path(out_dir, conn_out_file_pre, condition, fishZ, pcorr, 
 
     Returns
     -------
-    str
+    pathlib.Path
         Full path to the expected connectivity output file.
     """
-    prefix = f"{conn_out_file_pre}_{condition}"
-    out_path = os.path.join(out_dir, prefix)
-
-    if calc_conn == "parcellated":
-        if fishZ and pcorr:
-            out_path += "_pcorr_fishZ_mat.txt"
-        elif fishZ:
-            out_path += "_fishZ_mat.txt"
-        elif pcorr:
-            out_path += "_pcorr_mat.txt"
-        else:
-            out_path += "_corr_mat.txt"
-    else:  # seed_to_voxel
-        if fishZ and pcorr:
-            out_path += "_pcorr_fishZ.nii.gz"
-        elif fishZ:
-            out_path += "_fishZ.nii.gz"
-        elif pcorr:
-            out_path += "_pcorr.nii.gz"
-        else:
-            out_path += "_corr.nii.gz"
-
-    return out_path
+    prefix = _conn_prefix(conn_out_file_pre, condition)
+    return Path(out_dir) / (prefix + _conn_suffix(fishZ, pcorr, calc_conn))
 
 
 def compute_matrix_contrast(condition_matrix_paths, coefs, out_path, logger):
@@ -63,11 +53,11 @@ def compute_matrix_contrast(condition_matrix_paths, coefs, out_path, logger):
 
     Parameters
     ----------
-    condition_matrix_paths : list of str
+    condition_matrix_paths : list of str or os.PathLike
         Paths to the condition-specific connectivity matrices (tab-delimited text).
     coefs : list of str
         Coefficients corresponding to each matrix (as strings, will be cast to float).
-    out_path : str
+    out_path : str or os.PathLike
         Path to save the resulting contrast matrix.
     logger : logging.Logger
 
@@ -101,9 +91,7 @@ def compute_matrix_contrast(condition_matrix_paths, coefs, out_path, logger):
     # Write using standard I/O (avoids numpy DataSource path resolution issues)
     if result.ndim == 1:
         result = result.reshape(1, -1)
-    with open(out_path, 'w') as f:
-        for row in result:
-            f.write('\t'.join(f'{val:.8f}' for val in row) + '\n')
+    Path(out_path).write_text("".join('\t'.join(f'{val:.8f}' for val in row) + '\n' for row in result))
     logger.info("Connectivity contrast matrix saved to %s", out_path)
 
 
@@ -114,13 +102,13 @@ def seed_to_voxel_conn(inset_path, out_dir, conn_out_file_pre, template_path, fi
 
     Parameters
     ----------
-    inset_path : str
+    inset_path : str or os.PathLike
         Path to the input time series / beta series NIfTI.
-    out_dir : str
+    out_dir : str or os.PathLike
         Output directory.
     conn_out_file_pre : str
         Output file prefix.
-    template_path : str
+    template_path : str or os.PathLike
         Path to the binary seed mask.
     fishZ : bool
         Whether to Fisher Z-transform correlations.
@@ -133,28 +121,15 @@ def seed_to_voxel_conn(inset_path, out_dir, conn_out_file_pre, template_path, fi
     """
     _log = logger or logging.getLogger(__name__)
 
-    # Build output prefix and final path
-    if condition is not None:
-        prefix = f"{conn_out_file_pre}_{condition}"
-    else:
-        prefix = conn_out_file_pre
+    prefix = _conn_prefix(conn_out_file_pre, condition)
+    out_path = build_conn_output_path(out_dir, conn_out_file_pre, condition, fishZ, pcorr, "seed_to_voxel")
 
-    out_path = os.path.join(out_dir, prefix)
-    if fishZ and pcorr:
-        out_path += "_pcorr_fishZ.nii.gz"
-    elif fishZ:
-        out_path += "_fishZ.nii.gz"
-    elif pcorr:
-        out_path += "_pcorr.nii.gz"
-    else:
-        out_path += "_corr.nii.gz"
-
-    if os.path.exists(out_path):
+    if out_path.exists():
         _log.info("Functional connectivity for %s already exists.", prefix)
         return
 
     # Build and run 3dNetCorr
-    netcorr_prefix = os.path.join(out_dir, prefix)
+    netcorr_prefix = Path(out_dir) / prefix
     netCorr_command = [
         "3dNetCorr", "-prefix", netcorr_prefix,
         "-inset", inset_path,
@@ -174,41 +149,27 @@ def seed_to_voxel_conn(inset_path, out_dir, conn_out_file_pre, template_path, fi
 
     # Clean up auxiliary outputs
     for ext in ["_000.niml.dset", "_000.roidat", "_000.netcc"]:
-        aux = f"{netcorr_prefix}{ext}"
-        if os.path.exists(aux):
-            os.remove(aux)
+        netcorr_prefix.with_name(netcorr_prefix.name + ext).unlink(missing_ok=True)
 
     # Move the connectivity map from the INDIV directory
-    indiv_dir = f"{netcorr_prefix}_000_INDIV"
-    if os.path.isdir(indiv_dir):
-        if fishZ:
-            src_file = os.path.join(indiv_dir, "WB_Z_ROI_001.nii.gz")
-            alt_file = os.path.join(indiv_dir, "WB_CORR_ROI_001.nii.gz")
-            if os.path.exists(src_file):
-                os.rename(src_file, out_path)
-                if os.path.exists(alt_file):
-                    os.remove(alt_file)
-            else:
-                _log.warning("Could not create functional connectivity for seed %s.", template_path)
-        else:
-            src_file = os.path.join(indiv_dir, "WB_CORR_ROI_001.nii.gz")
-            if os.path.exists(src_file):
-                os.rename(src_file, out_path)
-            else:
-                _log.warning("Could not create functional connectivity for seed %s.", template_path)
+    indiv_dir = netcorr_prefix.with_name(netcorr_prefix.name + "_000_INDIV")
+    if not indiv_dir.is_dir():
+        _log.warning("Could not create functional connectivity for seed %s.", template_path)
+        return
 
-        # Remove the (now empty) INDIV directory
-        try:
-            os.rmdir(indiv_dir)
-        except OSError:
-            shutil.rmtree(indiv_dir, ignore_errors=True)
-
-        if os.path.exists(out_path):
-            _log.info("Seed-to-voxel functional connectivity maps created for %s with seed from template %s.", prefix, template_path)
-        else:
-            _log.warning("Could not move functional connectivity file for seed %s. Check permissions and rerun.", template_path)
+    src_file = indiv_dir / ("WB_Z_ROI_001.nii.gz" if fishZ else "WB_CORR_ROI_001.nii.gz")
+    if src_file.exists():
+        src_file.rename(out_path)
     else:
         _log.warning("Could not create functional connectivity for seed %s.", template_path)
+
+    # Remove the INDIV directory and anything left in it (e.g. the unused WB_CORR map)
+    shutil.rmtree(indiv_dir, ignore_errors=True)
+
+    if out_path.exists():
+        _log.info("Seed-to-voxel functional connectivity maps created for %s with seed from template %s.", prefix, template_path)
+    else:
+        _log.warning("Could not move functional connectivity file for seed %s. Check permissions and rerun.", template_path)
 
 
 def format_netcorr_mat(netcorr_file, fishZ, pcorr, curr_out_path):
@@ -223,13 +184,13 @@ def format_netcorr_mat(netcorr_file, fishZ, pcorr, curr_out_path):
 
     Parameters
     ----------
-    netcorr_file : str
+    netcorr_file : str or os.PathLike
         Path to the 3dNetCorr .netcc output file.
     fishZ : bool
         Whether Fisher Z-transform was requested.
     pcorr : bool
         Whether partial correlation was requested.
-    curr_out_path : str
+    curr_out_path : str or os.PathLike
         Destination path for the tab-delimited matrix text file.
     """
     if not fishZ and not pcorr:
@@ -245,12 +206,7 @@ def format_netcorr_mat(netcorr_file, fishZ, pcorr, curr_out_path):
         entry_to_check = "PCB"
         end_to_check = "Z"
 
-    conn_mat = []
-    with open(netcorr_file) as f:
-        for line in f:
-            if line:
-                parts = line.split()
-                conn_mat.append([entry.strip() for entry in parts])
+    conn_mat = [line.split() for line in Path(netcorr_file).read_text().splitlines()]
 
     start_row = 0
     end_row = 0
@@ -266,9 +222,7 @@ def format_netcorr_mat(netcorr_file, fishZ, pcorr, curr_out_path):
             break
 
     out_conn_mat = conn_mat[start_row:end_row]
-    with open(curr_out_path, "w") as f:
-        for row in out_conn_mat:
-            f.write("\t".join(str(x) for x in row) + "\n")
+    Path(curr_out_path).write_text("".join("\t".join(row) + "\n" for row in out_conn_mat))
 
 
 def parcellated_conn(inset_path, out_dir, conn_out_file_pre, template_path, fishZ, pcorr, condition=None, logger=None):
@@ -278,13 +232,13 @@ def parcellated_conn(inset_path, out_dir, conn_out_file_pre, template_path, fish
 
     Parameters
     ----------
-    inset_path : str
+    inset_path : str or os.PathLike
         Path to the input time series / beta series NIfTI.
-    out_dir : str
+    out_dir : str or os.PathLike
         Output directory.
     conn_out_file_pre : str
         Output file prefix.
-    template_path : str
+    template_path : str or os.PathLike
         Path to the multi-ROI parcellation template.
     fishZ : bool
         Whether to Fisher Z-transform correlations.
@@ -297,28 +251,15 @@ def parcellated_conn(inset_path, out_dir, conn_out_file_pre, template_path, fish
     """
     _log = logger or logging.getLogger(__name__)
 
-    # Build output prefix and final path
-    if condition is not None:
-        prefix = f"{conn_out_file_pre}_{condition}"
-    else:
-        prefix = conn_out_file_pre
+    prefix = _conn_prefix(conn_out_file_pre, condition)
+    out_path = build_conn_output_path(out_dir, conn_out_file_pre, condition, fishZ, pcorr, "parcellated")
 
-    out_path = os.path.join(out_dir, prefix)
-    if fishZ and pcorr:
-        out_path += "_pcorr_fishZ_mat.txt"
-    elif fishZ:
-        out_path += "_fishZ_mat.txt"
-    elif pcorr:
-        out_path += "_pcorr_mat.txt"
-    else:
-        out_path += "_corr_mat.txt"
-
-    if os.path.exists(out_path):
+    if out_path.exists():
         _log.info("Functional connectivity for %s already exists.", prefix)
         return
 
     # Build and run 3dNetCorr
-    netcorr_prefix = os.path.join(out_dir, prefix)
+    netcorr_prefix = Path(out_dir) / prefix
     netCorr_command = [
         "3dNetCorr", "-prefix", netcorr_prefix,
         "-inset", inset_path,
@@ -337,17 +278,13 @@ def parcellated_conn(inset_path, out_dir, conn_out_file_pre, template_path, fish
 
     # Clean up auxiliary outputs
     for ext in ["_000.niml.dset", "_000.roidat"]:
-        aux = f"{netcorr_prefix}{ext}"
-        if os.path.exists(aux):
-            os.remove(aux)
+        netcorr_prefix.with_name(netcorr_prefix.name + ext).unlink(missing_ok=True)
 
-    netcc_file = f"{netcorr_prefix}_000.netcc"
-    if os.path.exists(netcc_file):
-        format_netcorr_mat(netcc_file, fishZ, pcorr, out_path)
-        if os.path.exists(out_path):
-            os.remove(netcc_file)
-            _log.info("Parcellated functional connectivity matrix created for %s with ROIs from template %s.", prefix, template_path)
-        else:
-            raise ToolExecutionError(f"Could not format functional connectivity for template {template_path}. Likely an internal bug.")
-    else:
+    netcc_file = netcorr_prefix.with_name(netcorr_prefix.name + "_000.netcc")
+    if not netcc_file.exists():
         raise ToolExecutionError(f"Could not create functional connectivity for template {template_path}.")
+    format_netcorr_mat(netcc_file, fishZ, pcorr, out_path)
+    if not out_path.exists():
+        raise ToolExecutionError(f"Could not format functional connectivity for template {template_path}. Likely an internal bug.")
+    netcc_file.unlink()
+    _log.info("Parcellated functional connectivity matrix created for %s with ROIs from template %s.", prefix, template_path)

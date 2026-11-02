@@ -1,7 +1,7 @@
 """ROI template validation/resampling and ROI statistic extraction (3dinfo, 3dresample, 3dROIstats)."""
 
 import logging
-import os
+from pathlib import Path
 
 import pandas as pd
 
@@ -169,20 +169,19 @@ def validate_template(scan_path, template_path, out_dir, force_diff_atlas, conn_
         _log.warning("Orientation and/or grid spacing for --scan_path %s and --template_path %s do not match.", scan_path, template_path)
         _log.info("Resampling --template_path %s to match --scan_path %s.", template_path, scan_path)
 
-        template_base = os.path.basename(template_path)
-        template_file_pre = template_base.replace(".nii.gz", "").replace(".nii", "")
-        resampled_path = os.path.join(out_dir, f"{template_file_pre}_resampled.nii.gz")
+        template_file_pre = Path(template_path).name.replace(".nii.gz", "").replace(".nii", "")
+        resampled_path = Path(out_dir) / f"{template_file_pre}_resampled.nii.gz"
 
         # Stale resampled template check: if it exists, verify grid still matches
         needs_resample = True
-        if os.path.exists(resampled_path):
+        if resampled_path.exists():
             resamp_props = get_3dinfo_properties(resampled_path, logger=logger)
             if resamp_props["orient"] == scn["orient"] and resamp_props["spacing"] == scn["spacing"]:
                 _log.info("Resampled template %s already exists and matches scan grid.", resampled_path)
                 needs_resample = False
             else:
                 _log.warning("Existing resampled template %s has stale grid. Re-resampling.", resampled_path)
-                os.remove(resampled_path)
+                resampled_path.unlink()
 
         if needs_resample:
             run_afni_command(
@@ -192,12 +191,12 @@ def validate_template(scan_path, template_path, out_dir, force_diff_atlas, conn_
                 logger=logger,
             )
 
-            if os.path.exists(resampled_path):
+            if resampled_path.exists():
                 _log.info("Successfully resampled template; saved to %s", resampled_path)
             else:
                 raise ToolExecutionError(f"Could not resample --template_path {template_path}. Please manually resample and try again.")
 
-        return resampled_path
+        return str(resampled_path)
     else:
         return template_path
 

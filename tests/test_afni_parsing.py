@@ -1,5 +1,7 @@
 """Tests for AFNI output parsing and connectivity helpers that do not need AFNI installed."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -75,7 +77,8 @@ def test_compute_matrix_contrast_shape_mismatch(tmp_path, logger):
     ],
 )
 def test_build_conn_output_path(calc_conn, fishZ, pcorr, suffix):
-    assert build_conn_output_path("/o", "pre", "A", fishZ, pcorr, calc_conn) == f"/o/pre_A{suffix}"
+    assert build_conn_output_path("/o", "pre", "A", fishZ, pcorr, calc_conn) == Path(f"/o/pre_A{suffix}")
+    assert build_conn_output_path("/o", "pre", None, fishZ, pcorr, calc_conn) == Path(f"/o/pre{suffix}")
 
 
 def test_sanitize_filename_label():

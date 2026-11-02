@@ -1,7 +1,9 @@
 """Thin subprocess wrapper around AFNI command-line tools."""
 
 import os
+import shlex
 import subprocess
+from pathlib import Path
 
 from .exceptions import ToolExecutionError
 
@@ -12,9 +14,7 @@ def clean_deconvolve_err(out_dir=None):
     Checks both the current working directory and out_dir (if provided).
     """
     for directory in filter(None, [".", out_dir]):
-        err_path = os.path.join(directory, "3dDeconvolve.err")
-        if os.path.exists(err_path):
-            os.remove(err_path)
+        (Path(directory) / "3dDeconvolve.err").unlink(missing_ok=True)
 
 
 def run_afni_command(command, capture_output=False, description="", logger=None):
@@ -23,7 +23,7 @@ def run_afni_command(command, capture_output=False, description="", logger=None)
 
     Parameters
     ----------
-    command : list of str
+    command : list of str or os.PathLike
         The command and arguments.
     capture_output : bool
         If True, capture and return stdout.
@@ -43,8 +43,10 @@ def run_afni_command(command, capture_output=False, description="", logger=None)
         If the command exits with non-zero status. Message includes the
         command, description, and stderr.
     """
+    command = [os.fspath(arg) for arg in command]
+    cmd_str = shlex.join(command)
     if logger:
-        logger.debug("Running: %s", " ".join(command))
+        logger.debug("Running: %s", cmd_str)
 
     try:
         env = os.environ.copy()
@@ -61,11 +63,11 @@ def run_afni_command(command, capture_output=False, description="", logger=None)
         return result
     except subprocess.CalledProcessError as e:
         desc = f" ({description})" if description else ""
-        msg = f"AFNI command failed{desc}: {' '.join(command)}"
+        msg = f"AFNI command failed{desc}: {cmd_str}"
         if e.stderr:
             msg += f"\n  stderr: {e.stderr.strip()}"
         if logger:
-            logger.error("AFNI command failed%s: %s", desc, " ".join(command))
+            logger.error("AFNI command failed%s: %s", desc, cmd_str)
             if e.stderr:
                 logger.error("stderr: %s", e.stderr.strip())
         raise ToolExecutionError(msg) from e

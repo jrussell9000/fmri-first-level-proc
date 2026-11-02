@@ -3,7 +3,6 @@
 import dataclasses
 import json
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -158,10 +157,9 @@ def write_qc_summary(out_dir, out_file_pre, qc_data, logger):
         - per_run_censoring (rest_conn only)
     logger : logging.Logger
     """
-    qc_path = os.path.join(out_dir, f"{out_file_pre}_qc_summary.json")
+    qc_path = Path(out_dir) / f"{out_file_pre}_qc_summary.json"
     try:
-        with open(qc_path, 'w') as f:
-            json.dump(qc_data, f, indent=2)
+        qc_path.write_text(json.dumps(qc_data, indent=2))
         logger.info("QC summary written to %s", qc_path)
     except OSError as e:
         logger.warning("Could not write QC summary to %s: %s", qc_path, e)

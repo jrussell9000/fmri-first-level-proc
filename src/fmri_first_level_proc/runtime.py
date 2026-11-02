@@ -1,11 +1,11 @@
 """Preflight binary reachability and version-lock validation for fmri-first-level-proc."""
 
 import logging
-import os
 import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import yaml
 
@@ -90,19 +90,16 @@ def preflight_tool_environments(
     else:
         afni_which = shutil.which("afni")
         if afni_which is not None:
-            resolved_home = os.path.dirname(afni_which)
+            resolved_home = str(Path(afni_which).parent)
         else:
-            candidate = os.path.expanduser("~/abin")
-            if os.path.isdir(candidate):
-                resolved_home = candidate
+            candidate = Path.home() / "abin"
+            if candidate.is_dir():
+                resolved_home = str(candidate)
 
     missing: list[str] = []
     for binary in _AFNI_BINARIES:
-        if resolved_home is not None:
-            full_path = os.path.join(resolved_home, binary)
-            reachable = os.path.isfile(full_path) and os.access(full_path, os.X_OK)
-        else:
-            reachable = shutil.which(binary) is not None
+        # With path=None, which() searches $PATH; otherwise only resolved_home
+        reachable = shutil.which(binary, path=resolved_home) is not None
 
         if not reachable:
             logger.debug("AFNI binary not found: %s", binary)
@@ -153,8 +150,7 @@ def probe_tool_versions(
     if logger is None:
         logger = logging.getLogger(__name__)
 
-    with open(lockfile_path, "r") as fh:
-        lockfile: dict = yaml.safe_load(fh)
+    lockfile: dict = yaml.safe_load(Path(lockfile_path).read_text())
 
     tools_verified: int = 0
 
@@ -166,7 +162,7 @@ def probe_tool_versions(
     else:
         cmd = ["afni", "-ver"]
         if afni_home is not None:
-            cmd[0] = os.path.join(afni_home, "afni")
+            cmd[0] = str(Path(afni_home) / "afni")
 
         try:
             result = subprocess.run(

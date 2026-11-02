@@ -1,9 +1,10 @@
 """HRF models, stimulus timing I/O, trial survival, contrast parsing, DOF, and 3dDeconvolve base command."""
 
 import logging
-import os
 import re
 import subprocess
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -14,14 +15,8 @@ from .reporting import graded_warning
 
 # HRF model categories
 HRF_DURATION_MODELS = {"GAM", "BLOCK"}       # Use mean_dur in model string
-
-
 HRF_DM_MODELS = {"dmBLOCK"}                  # Per-trial duration via married timing
-
-
 HRF_IMPULSE_MODELS = {"SPMG1"}               # No duration parameter
-
-
 VALID_HRF_MODELS = HRF_DURATION_MODELS | HRF_DM_MODELS | HRF_IMPULSE_MODELS | {"custom"}
 
 
@@ -41,8 +36,6 @@ def validate_custom_hrf(custom_hrf, logger):
 
     Returns True if valid, False otherwise (errors logged).
     """
-    import tempfile
-
     # Stage 1: prefix whitelist
     prefix_match = any(custom_hrf == name or custom_hrf.startswith(name + "(")
                        for name in AFNI_MODEL_PREFIXES)
@@ -52,29 +45,21 @@ def validate_custom_hrf(custom_hrf, logger):
                      "Known models: %s", custom_hrf, known)
         return False
 
-    # Stage 2: AFNI -nodata dry run
-    tmp_timing = None
-    tmp_x1d = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.1D', delete=False) as f:
-            f.write("10\n")
-            tmp_timing = f.name
-        tmp_x1d = tmp_timing.replace('.1D', '_test.x1D')
+    # Stage 2: AFNI -nodata dry run (run inside the temp dir so 3dDeconvolve.err lands there too)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_timing = Path(tmp) / "timing.1D"
+        tmp_timing.write_text("10\n")
         cmd = ["3dDeconvolve", "-nodata", "100", "1",
                "-polort", "-1", "-num_stimts", "1",
                "-stim_times", "1", tmp_timing, custom_hrf,
-               "-x1D", tmp_x1d, "-x1D_stop", "-nobucket"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.error("custom_hrf '%s' failed AFNI validation. "
-                         "3dDeconvolve error: %s", custom_hrf,
-                         result.stderr.strip())
-            return False
-        return True
-    finally:
-        for p in (tmp_timing, tmp_x1d):
-            if p and os.path.exists(p):
-                os.unlink(p)
+               "-x1D", Path(tmp) / "test.x1D", "-x1D_stop", "-nobucket"]
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp)
+    if result.returncode != 0:
+        logger.error("custom_hrf '%s' failed AFNI validation. "
+                     "3dDeconvolve error: %s", custom_hrf,
+                     result.stderr.strip())
+        return False
+    return True
 
 
 def needs_married_timing(hrf_model, custom_hrf=None):
@@ -171,8 +156,7 @@ def read_and_validate_stim_data(timing_path, cond_labels, logger=None):
     _log = logger or logging.getLogger(__name__)
 
     # Determine delimiter from extension
-    ext = os.path.splitext(timing_path)[1].lower()
-    delimiter = '\t' if ext == '.tsv' else ','
+    delimiter = '\t' if Path(timing_path).suffix.lower() == '.tsv' else ','
 
     # Read header to detect format (content-authoritative)
     try:
@@ -262,19 +246,18 @@ def write_onset_file(condition_df, filepath, hrf_model, custom_hrf=None, logger=
     _log = logger or logging.getLogger(__name__)
     married = needs_married_timing(hrf_model, custom_hrf)
 
-    if os.path.exists(filepath):
+    filepath = Path(filepath)
+    if filepath.exists():
         validate_onset_file_format(filepath, married, logger=logger)
         _log.info("%s already exists.", filepath)
         return True
 
     if married:
-        with open(filepath, 'w') as f:
-            for _, row in condition_df.iterrows():
-                f.write(f"{row['onset']}*{row['duration']}\n")
+        # iterrows upcasts each row to a common dtype; keep it so output formatting is unchanged
+        lines = [f"{row['onset']}*{row['duration']}\n" for _, row in condition_df.iterrows()]
     else:
-        with open(filepath, 'w') as f:
-            for onset in condition_df['onset']:
-                f.write(f"{onset}\n")
+        lines = [f"{onset}\n" for onset in condition_df['onset']]
+    filepath.write_text("".join(lines))
     _log.info("Created %s", filepath)
     return True
 

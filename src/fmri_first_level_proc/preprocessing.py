@@ -1,6 +1,6 @@
 """Motion/censor preparation, nuisance-regressor filtering, PSC scaling, and min-outlier EPI."""
 
-import os
+from pathlib import Path
 
 import numpy as np
 
@@ -12,9 +12,28 @@ from .exceptions import GuardError, InputError, ToolExecutionError
 # Censoring QC thresholds (warn only — never abort based on percentage)
 # ----------------------------------------------------------------------------
 CENSOR_WARN_THRESHOLD = 30.0    # % censored → warning
-
-
 CENSOR_HIGH_THRESHOLD = 50.0    # % censored → strong warning
+
+
+def _labeled_name(out_file_pre, label, suffix):
+    """Build '{pre}_{label}_{suffix}', or '{pre}_{suffix}' when label is empty."""
+    return f"{out_file_pre}_{label}_{suffix}" if label else f"{out_file_pre}_{suffix}"
+
+
+def _restore_time_rows(out_path, what, step, label, logger):
+    """Transpose an AFNI 1D output back to rows=TRs in place.
+
+    AFNI tools fed a transposed 1D input (``file'``) write their output with
+    rows=columns, cols=TRs; 1dtranspose restores rows=TRs for downstream use.
+    """
+    if not out_path.exists():
+        raise ToolExecutionError(f"Expected {what} file not found: {out_path}")
+    transposed_path = out_path.with_name(out_path.name + ".transposed.1D")
+    run_afni_command(["1dtranspose", out_path, transposed_path],
+                     description=f"1dtranspose {step} {label}", logger=logger)
+    if not transposed_path.exists():
+        raise ToolExecutionError(f"1dtranspose failed for {what} file: {out_path}")
+    transposed_path.replace(out_path)
 
 
 def prepare_motion_file(motion_path, use_columns, out_dir, out_prefix, label, logger):
@@ -41,7 +60,7 @@ def prepare_motion_file(motion_path, use_columns, out_dir, out_prefix, label, lo
 
     Returns
     -------
-    str
+    pathlib.Path
         Path to the prepared motion file.
 
     Notes
@@ -65,7 +84,7 @@ def prepare_motion_file(motion_path, use_columns, out_dir, out_prefix, label, lo
         raise InputError(f"Motion file '{motion_path}' has {ncols} columns, expected >= {use_columns}.")
     # Truncate to requested columns
     truncated = data[:, :use_columns]
-    prepared_path = os.path.join(out_dir, f"{out_prefix}_{label}_motion_prepared.1D")
+    prepared_path = Path(out_dir) / f"{out_prefix}_{label}_motion_prepared.1D"
     np.savetxt(prepared_path, truncated, fmt="%.8f", delimiter="\t")
     if ncols > use_columns:
         logger.info("Motion file '%s': using %d of %d columns.", motion_path, use_columns, ncols)
@@ -97,15 +116,15 @@ def create_censor_file(motion_path, fd_threshold, censor_prev_tr, out_dir, out_p
 
     Returns
     -------
-    str
+    pathlib.Path
         Path to the generated censor file.
     """
     # 1d_tool.py auto-appends _censor.1D to the prefix
-    censor_prefix = os.path.join(out_dir, f"{out_prefix}_{label}")
-    censor_path = f"{censor_prefix}_censor.1D"
+    censor_prefix = Path(out_dir) / f"{out_prefix}_{label}"
+    censor_path = censor_prefix.with_name(f"{censor_prefix.name}_censor.1D")
 
     # Skip if censor file already exists (1d_tool.py won't overwrite)
-    if os.path.exists(censor_path):
+    if censor_path.exists():
         logger.info("Censor file %s already exists (skipping generation).", censor_path)
     else:
         # Extract first 6 columns (base motion only) for FD calculation
@@ -120,7 +139,7 @@ def create_censor_file(motion_path, fd_threshold, censor_prev_tr, out_dir, out_p
 
         run_afni_command(cmd, description=f"1d_tool.py censor {label}", logger=logger)
 
-        if not os.path.exists(censor_path):
+        if not censor_path.exists():
             raise ToolExecutionError(f"Expected censor file not found: {censor_path}")
 
     # Log count of censored TRs and warn at thresholds
@@ -170,13 +189,13 @@ def notch_filter_motion(motion_path, tr, stopband, out_dir, out_prefix, label, l
 
     Returns
     -------
-    str
+    pathlib.Path
         Path to the notch-filtered motion file.
     """
     # Extract first 6 columns (base motion only)
     motion_6col = prepare_motion_file(motion_path, 6, out_dir, out_prefix, f"{label}_notch_src", logger)
 
-    out_path = os.path.join(out_dir, f"{out_prefix}_{label}_notch_motion.1D")
+    out_path = Path(out_dir) / f"{out_prefix}_{label}_notch_motion.1D"
 
     # AFNI interprets .1D files as rows=voxels, cols=timepoints.
     # A TRs×6 motion file is seen as TRs voxels × 6 timepoints, causing a
@@ -194,17 +213,7 @@ def notch_filter_motion(motion_path, tr, stopband, out_dir, out_prefix, label, l
            "-prefix", out_path]
 
     run_afni_command(cmd, description=f"3dTproject notch filter {label}", logger=logger)
-
-    if not os.path.exists(out_path):
-        raise ToolExecutionError(f"Expected notch-filtered motion file not found: {out_path}")
-
-    # Restore rows=TRs, cols=params orientation (3dTproject output is transposed)
-    transposed_path = out_path + ".transposed.1D"
-    transpose_cmd = ["1dtranspose", out_path, transposed_path]
-    run_afni_command(transpose_cmd, description=f"1dtranspose notch filter {label}", logger=logger)
-    if not os.path.exists(transposed_path):
-        raise ToolExecutionError(f"1dtranspose failed for notch-filtered motion: {out_path}")
-    os.replace(transposed_path, out_path)
+    _restore_time_rows(out_path, "notch-filtered motion", "notch filter", label, logger)
 
     logger.info("Notch-filtered motion parameters (rows=TRs, cols=params) saved to %s", out_path)
     return out_path
@@ -246,11 +255,11 @@ def censor_interpolate_1d_afni(input_path, tr, censor_path, out_dir, out_prefix,
 
     Returns
     -------
-    str
+    pathlib.Path
         Absolute path to the interpolated 1D file in rows=TRs, cols=columns
         orientation.
     """
-    out_path = os.path.join(out_dir, f"{out_prefix}_{label}_interp.1D")
+    out_path = Path(out_dir) / f"{out_prefix}_{label}_interp.1D"
 
     cmd = ["3dTproject",
            "-polort", "-1",
@@ -261,17 +270,7 @@ def censor_interpolate_1d_afni(input_path, tr, censor_path, out_dir, out_prefix,
            "-prefix", out_path]
 
     run_afni_command(cmd, description=f"3dTproject NTRP interpolate {label}", logger=logger)
-
-    if not os.path.exists(out_path):
-        raise ToolExecutionError(f"Expected NTRP-interpolated 1D file not found: {out_path}")
-
-    # Restore rows=TRs, cols=cols orientation (3dTproject output is transposed)
-    transposed_path = out_path + ".transposed.1D"
-    transpose_cmd = ["1dtranspose", out_path, transposed_path]
-    run_afni_command(transpose_cmd, description=f"1dtranspose interpolate {label}", logger=logger)
-    if not os.path.exists(transposed_path):
-        raise ToolExecutionError(f"1dtranspose failed for interpolated 1D file: {out_path}")
-    os.replace(transposed_path, out_path)
+    _restore_time_rows(out_path, "NTRP-interpolated 1D", "interpolate", label, logger)
 
     logger.info("NTRP-interpolated 1D file (rows=TRs, cols=cols) saved to %s", out_path)
     return out_path
@@ -317,11 +316,11 @@ def bandpass_filter_1d_afni(input_path, tr, bandpass, out_dir, out_prefix, label
 
     Returns
     -------
-    str
+    pathlib.Path
         Absolute path to the bandpass-filtered 1D file in rows=TRs, cols=columns
         orientation.
     """
-    out_path = os.path.join(out_dir, f"{out_prefix}_{label}_bp.1D")
+    out_path = Path(out_dir) / f"{out_prefix}_{label}_bp.1D"
 
     cmd = ["3dBandpass",
            "-nodetrend",
@@ -331,17 +330,7 @@ def bandpass_filter_1d_afni(input_path, tr, bandpass, out_dir, out_prefix, label
            f"{input_path}'"]
 
     run_afni_command(cmd, description=f"3dBandpass {label}", logger=logger)
-
-    if not os.path.exists(out_path):
-        raise ToolExecutionError(f"Expected bandpass-filtered 1D file not found: {out_path}")
-
-    # Restore rows=TRs, cols=cols orientation (3dBandpass output is transposed)
-    transposed_path = out_path + ".transposed.1D"
-    transpose_cmd = ["1dtranspose", out_path, transposed_path]
-    run_afni_command(transpose_cmd, description=f"1dtranspose {label}", logger=logger)
-    if not os.path.exists(transposed_path):
-        raise ToolExecutionError(f"1dtranspose failed for bandpass-filtered 1D file: {out_path}")
-    os.replace(transposed_path, out_path)
+    _restore_time_rows(out_path, "bandpass-filtered 1D", "bandpass", label, logger)
 
     logger.info("Bandpass-filtered 1D file (rows=TRs, cols=cols) saved to %s", out_path)
     return out_path
@@ -368,7 +357,7 @@ def compute_tissue_derivative(tissue_path, out_dir, out_prefix, tissue_label, lo
 
     Returns
     -------
-    str
+    pathlib.Path
         Path to the derivative file.
     """
     try:
@@ -378,7 +367,7 @@ def compute_tissue_derivative(tissue_path, out_dir, out_prefix, tissue_label, lo
     if data.ndim != 1:
         raise InputError(f"Tissue file '{tissue_path}' must be single-column, got shape {data.shape}.")
     deriv = np.diff(data, prepend=data[0])
-    deriv_path = os.path.join(out_dir, f"{out_prefix}_{tissue_label}_deriv.txt")
+    deriv_path = Path(out_dir) / f"{out_prefix}_{tissue_label}_deriv.txt"
     np.savetxt(deriv_path, deriv, fmt="%.8f")
     logger.info("Created tissue derivative: %s", deriv_path)
     return deriv_path
@@ -408,18 +397,14 @@ def gen_min_outlier_epi(scan_path, out_dir, out_file_pre, label, logger):
 
     Returns
     -------
-    str
+    pathlib.Path
         Path to the extracted single-volume NIfTI.
     """
-    # Build output filename
-    if label:
-        out_name = f"{out_file_pre}_{label}_min_outlier_epi.nii.gz"
-    else:
-        out_name = f"{out_file_pre}_min_outlier_epi.nii.gz"
-    out_path = os.path.join(out_dir, out_name)
+    out_name = _labeled_name(out_file_pre, label, "min_outlier_epi.nii.gz")
+    out_path = Path(out_dir) / out_name
 
     # Skip if already exists
-    if os.path.exists(out_path):
+    if out_path.exists():
         logger.info("Min-outlier EPI already exists: %s", out_path)
         return out_path
 
@@ -452,7 +437,7 @@ def gen_min_outlier_epi(scan_path, out_dir, out_file_pre, label, logger):
     except Exception as e:
         raise ToolExecutionError(f"3dbucket failed for {scan_path}[{min_idx}]: {e}") from e
 
-    if os.path.exists(out_path):
+    if out_path.exists():
         logger.info("Successfully extracted min-outlier EPI: %s", out_path)
     else:
         raise ToolExecutionError(f"Failed to create min-outlier EPI: {out_path}")
@@ -482,19 +467,13 @@ def scale_to_psc(scan_path, out_dir, out_file_pre, label, logger):
 
     Returns
     -------
-    str
+    pathlib.Path
         Path to the PSC-scaled 4D NIfTI.
     """
-    if label:
-        mean_name = f"{out_file_pre}_{label}_mean.nii.gz"
-        psc_name = f"{out_file_pre}_{label}_psc.nii.gz"
-    else:
-        mean_name = f"{out_file_pre}_mean.nii.gz"
-        psc_name = f"{out_file_pre}_psc.nii.gz"
-    mean_path = os.path.join(out_dir, mean_name)
-    psc_path = os.path.join(out_dir, psc_name)
+    mean_path = Path(out_dir) / _labeled_name(out_file_pre, label, "mean.nii.gz")
+    psc_path = Path(out_dir) / _labeled_name(out_file_pre, label, "psc.nii.gz")
 
-    if os.path.exists(psc_path):
+    if psc_path.exists():
         logger.info("PSC-scaled file already exists: %s", psc_path)
         return psc_path
 
