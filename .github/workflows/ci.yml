@@ -41,8 +41,17 @@ jobs:
         run: pytest -p no:cacheprovider
 
   afni:
-    name: real-AFNI tests (AFNI 26.3.07)
-    runs-on: ubuntu-latest
+    name: real-AFNI tests (AFNI 26.3.07, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          # cloudpipe's first-level pods run the arm64 AFNI build on Graviton
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
 
@@ -56,8 +65,8 @@ jobs:
           context: tests/docker
           tags: fflp-afni:ci
           load: true
-          cache-from: type=gha,scope=fflp-afni
-          cache-to: type=gha,scope=fflp-afni,mode=max
+          cache-from: type=gha,scope=fflp-afni-${{ matrix.arch }}
+          cache-to: type=gha,scope=fflp-afni-${{ matrix.arch }},mode=max
 
       - name: Real-AFNI tests
         run: >
