@@ -384,7 +384,8 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
         matched = []
         for i, token in enumerate(bucket_split):
             if search_stat in token and "#" in token:
-                label_part = token.split("#")[0]
+                # 3dinfo -subbrick_info prints 'name#0_Coef' in single quotes.
+                label_part = token.split("#")[0].lstrip("'")
                 try:
                     idx = int(bucket_split[i - 1][1:])
                     matched.append((label_part, idx))
