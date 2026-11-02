@@ -7,8 +7,6 @@
 # missing entries or config hash invalidation, with downstream cascade.
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.0.0
-# Last updated: 08/12/26
 # ============================================================================
 
 import dataclasses

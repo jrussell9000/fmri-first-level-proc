@@ -7,8 +7,6 @@
 # 3. (optional) Extract parcel-level/ROI activation with a provided template with AFNI's 3dROIstats
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.0.0
-# Last updated: 05/01/26
 # ============================================================================
 '''
 REQUIREMENTS:
@@ -76,52 +74,45 @@ import copy
 import json
 import logging
 import os
-import subprocess
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
-from .first_level_config import ResolvedConfig
-from .first_level_utils import (
-    FirstLevelResult,
-    graded_warning,
-    get_warnings,
-    clear_warnings,
-    setup_logging,
-    dir_path_exists,
-    file_path_exists,
-    valid_string_list,
-    valid_ave_type,
-    run_afni_command,
-    validate_template,
-    remove_files_from_dir,
-    extract_roi_stats,
-    build_hrf_string,
-    needs_married_timing,
-    read_and_validate_stim_data,
-    write_onset_file,
+from ..afni import clean_deconvolve_err, run_afni_command
+from ..config import ResolvedConfig
+from ..design import (
+    HRF_DURATION_MODELS,
     build_decon_base_command,
-    clean_deconvolve_err,
+    build_hrf_string,
+    check_trial_survival,
+    compute_dof,
     log_hrf_model,
     log_nuisance_model,
-    prepare_motion_file,
+    needs_married_timing,
+    read_and_validate_stim_data,
+    valid_contrast_functions,
+    write_onset_file,
+)
+from ..exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
+from ..fileutils import remove_files_from_dir
+from ..preprocessing import (
+    CENSOR_HIGH_THRESHOLD,
     compute_tissue_derivative,
     create_censor_file,
-    check_trial_survival,
-    write_qc_summary,
-    compute_dof,
-    valid_contrast_functions,
     gen_min_outlier_epi,
+    prepare_motion_file,
     scale_to_psc,
-    CENSOR_WARN_THRESHOLD,
-    CENSOR_HIGH_THRESHOLD,
-    HRF_DM_MODELS,
-    HRF_IMPULSE_MODELS,
-    HRF_DURATION_MODELS,
-    VALID_HRF_MODELS,
 )
+from ..reporting import (
+    FirstLevelResult,
+    clear_warnings,
+    get_warnings,
+    graded_warning,
+    setup_logging,
+    write_qc_summary,
+)
+from ..templates import extract_roi_stats, validate_template
 
 # Surviving trial count below which TRIALS_FEW warning is emitted (condition still included)
 _TRIALS_FEW_THRESHOLD = 10
@@ -283,7 +274,7 @@ def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
     while i < len(tokens):
         try:
             idx = int(tokens[i])
-            stype = int(tokens[i + 1])
+            int(tokens[i + 1])  # stat type code: parsed to validate the record, otherwise unused
             npar = int(tokens[i + 2])
             params = [float(tokens[i + 3 + j]) for j in range(npar)]
             if idx == subbrik_index:
@@ -517,12 +508,12 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     19. Return FirstLevelResult with status, warnings, qc_summary, and output_files.
 
     Works from the config-driven dispatch runner
-    (run_first_level.py / DISPATCH["task_act"]).
+    (cli.py / DISPATCH["task_act"]).
 
     Parameters
     ----------
     config : ResolvedConfig
-        All pipeline parameters (see first_level_config.py ResolvedConfig for
+        All pipeline parameters (see config.py ResolvedConfig for
         the full attribute list).
     logger : logging.Logger or None, optional
         Logger instance. A default logger is created if None is provided.

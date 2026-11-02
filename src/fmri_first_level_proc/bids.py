@@ -13,7 +13,8 @@ import logging
 import os
 
 from .exceptions import InputError  # noqa: F401 -- available for callers
-from .first_level_utils import graded_warning, sanitize_filename_label
+from .fileutils import sanitize_filename_label
+from .reporting import graded_warning
 
 logger = logging.getLogger(__name__)
 

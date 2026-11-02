@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fmri-first-level-proc"
-version = "3.1.0"
+dynamic = ["version"]
 description = "General-purpose first-level fMRI analysis framework built on AFNI."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -19,16 +19,30 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "ruff"]
 
 [project.scripts]
-fmri-first-level-proc = "fmri_first_level_proc.run_first_level:main"
-run-first-level = "fmri_first_level_proc.run_first_level:_main_deprecated"
+fmri-first-level-proc = "fmri_first_level_proc.cli:main"
+run-first-level = "fmri_first_level_proc.cli:_main_deprecated"
+
+[tool.setuptools.dynamic]
+version = { attr = "fmri_first_level_proc.__version__" }
 
 [tool.setuptools.packages.find]
-include = ["fmri_first_level_proc*"]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fmri_first_level_proc = ["data/*.yaml"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["F"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
     "level0_unit: Pure-function unit tests",
     "level1_internal_integration: Cross-function integration within a module",

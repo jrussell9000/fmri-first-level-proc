@@ -12,13 +12,11 @@
 #   fmri-first-level-proc --config my_study.yaml --log-file run.log
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.1.0
-# Last updated: 09/11/26
 # ============================================================================
 """
 CLI entry point and dispatch runner for fmri_first_level_proc.
 
-Reads a YAML configuration file, validates it via first_level_config.load_and_validate,
+Reads a YAML configuration file, validates it via config.load_and_validate,
 and dispatches each analysis block to the appropriate pipeline run() function.
 
 Exit codes
@@ -66,10 +64,9 @@ import subprocess
 import sys
 import time
 import argparse
-from pathlib import Path
+from importlib.resources import as_file, files
 
-from .first_level_utils import setup_logging, graded_warning
-from .first_level_config import load_and_validate
+from .config import load_and_validate
 from .exceptions import (
     ConfigError,
     InputError,
@@ -79,21 +76,12 @@ from .exceptions import (
     ToolVersionError,
     ToolExecutionError,
 )
+from .pipelines import DISPATCH
+from .reporting import setup_logging, graded_warning
 from .runtime import preflight_tool_environments, probe_tool_versions
 
-from .task_act_first_level import run as run_task_act
-from .task_conn_first_level import run as run_task_conn
-from .rest_conn_first_level import run as run_rest_conn
-
-# Dispatch table: analysis_type string -> pipeline run() function
-DISPATCH = {
-    "task_act": run_task_act,
-    "task_conn": run_task_conn,
-    "rest_conn": run_rest_conn,
-}
-
-# Lockfile path resolved relative to repository root
-_LOCKFILE_PATH: Path = Path(__file__).parent.parent / "tools.lock.yaml"
+# Tool version lockfile shipped as package data
+_LOCKFILE = files("fmri_first_level_proc") / "data" / "tools.lock.yaml"
 
 
 def main(cli_name: str = 'fmri-first-level-proc') -> None:
@@ -137,12 +125,13 @@ def main(cli_name: str = 'fmri-first-level-proc') -> None:
 
     try:
         preflight_tool_environments(logger=logger)
-        if _LOCKFILE_PATH.exists():
-            probe_tool_versions(str(_LOCKFILE_PATH), logger=logger)
+        if _LOCKFILE.is_file():
+            with as_file(_LOCKFILE) as lockfile_path:
+                probe_tool_versions(str(lockfile_path), logger=logger)
         else:
             graded_warning(
                 logger, 'low', 'LOCKFILE_ABSENT',
-                f"tools.lock.yaml not found at {_LOCKFILE_PATH}; skipping version pinning.",
+                f"tools.lock.yaml not found at {_LOCKFILE}; skipping version pinning.",
                 user_facing=True,
             )
 

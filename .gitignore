@@ -1,31 +1,25 @@
-# Ignore everything by default
-*
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
 
-# Core pipeline files
-!.gitignore
-!environment.yaml
-!example_config.yaml
-!example_subj.timing.csv
-!pyproject.toml
-!README.md
-!INPUT_SPECIFICATION.md
-!fmri_first_level_proc/
-!fmri_first_level_proc/__init__.py
-!fmri_first_level_proc/bids.py
-!fmri_first_level_proc/checkpoint.py
-!fmri_first_level_proc/exceptions.py
-!fmri_first_level_proc/first_level_config.py
-!fmri_first_level_proc/first_level_utils.py
-!fmri_first_level_proc/rest_conn_first_level.py
-!fmri_first_level_proc/run_first_level.py
-!fmri_first_level_proc/runtime.py
-!fmri_first_level_proc/task_act_first_level.py
-!fmri_first_level_proc/task_conn_first_level.py
+# Environments
+.venv/
+venv/
 
-# Tool version lockfile
-!tools.lock.yaml
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
-# AID Framework disclosure files
-!AID_LOG.md
-!.aid/
-!.aid/**
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local run outputs and logs
+*.log

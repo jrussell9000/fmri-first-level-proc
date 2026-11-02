@@ -8,8 +8,6 @@ from __future__ import annotations
 # objects for each analysis block.
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.0.0
-# Last updated: 08/12/26
 # ============================================================================
 """
 YAML configuration loader, validator, and resolver for fmri_first_level_proc.
@@ -40,7 +38,7 @@ analyses:
       out_dir     : str
       out_file_pre: str
       paths       : dict of required/optional file paths (type-dependent)
-      ... (type-specific keys; see INPUT_SPECIFICATION.md for full schema)
+      ... (type-specific keys; see docs/input_specification.md for full schema)
 
 Validation enforces: required keys, file existence, enum ranges, bandpass
 bounds, HRF model compatibility, contrast length parity, and unique
@@ -57,7 +55,7 @@ import yaml
 
 from .bids import discover_inputs
 from .exceptions import ConfigError, InputError
-from .first_level_utils import VALID_HRF_MODELS, validate_custom_hrf, needs_married_timing
+from .design import VALID_HRF_MODELS, validate_custom_hrf, needs_married_timing
 
 VALID_TYPES = {"task_act", "task_conn", "rest_conn"}
 VALID_STAT_BUCKET_TYPES = {"Coef", "Tstat", "Fstat", "R^2", "Zstat"}

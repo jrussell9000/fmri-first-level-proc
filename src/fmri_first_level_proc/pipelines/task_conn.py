@@ -9,8 +9,6 @@
 # 5. (optional) Runs functional connectivity analysis for available beta series with AFNI's 3dNetCorr
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.0.0
-# Last updated: 05/01/26
 # ============================================================================
 '''
 REQUIREMENTS:
@@ -84,52 +82,50 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .exceptions import ConfigError, InputError, ModelError, ToolExecutionError
-from .first_level_config import ResolvedConfig
-from .first_level_utils import (
-    setup_logging,
-    dir_path_exists,
-    file_path_exists,
-    valid_string_list,
-    valid_ave_type,
-    valid_conn_type,
-    run_afni_command,
-    validate_template,
-    remove_files_from_dir,
-    extract_roi_stats,
-    seed_to_voxel_conn,
-    parcellated_conn,
-    build_hrf_string,
-    needs_married_timing,
-    read_and_validate_stim_data,
-    write_onset_file,
-    build_decon_base_command,
-    clean_deconvolve_err,
-    log_hrf_model,
-    log_nuisance_model,
-    prepare_motion_file,
-    compute_tissue_derivative,
-    create_censor_file,
-    check_trial_survival,
-    write_qc_summary,
-    compute_dof,
-    valid_contrast_functions,
-    sanitize_filename_label,
+from ..afni import clean_deconvolve_err, run_afni_command
+from ..config import ResolvedConfig
+from ..connectivity import (
     build_conn_output_path,
     compute_matrix_contrast,
-    validate_extract_options,
-    validate_connectivity_options,
-    gen_min_outlier_epi,
-    scale_to_psc,
-    graded_warning,
-    get_warnings,
-    clear_warnings,
-    FirstLevelResult,
-    CENSOR_HIGH_THRESHOLD,
-    HRF_DM_MODELS,
-    HRF_IMPULSE_MODELS,
+    parcellated_conn,
+    seed_to_voxel_conn,
+)
+from ..design import (
     HRF_DURATION_MODELS,
-    VALID_HRF_MODELS,
+    build_decon_base_command,
+    build_hrf_string,
+    check_trial_survival,
+    compute_dof,
+    log_hrf_model,
+    log_nuisance_model,
+    needs_married_timing,
+    read_and_validate_stim_data,
+    valid_contrast_functions,
+    write_onset_file,
+)
+from ..exceptions import ConfigError, InputError, ModelError, ToolExecutionError
+from ..fileutils import remove_files_from_dir, sanitize_filename_label
+from ..preprocessing import (
+    CENSOR_HIGH_THRESHOLD,
+    compute_tissue_derivative,
+    create_censor_file,
+    gen_min_outlier_epi,
+    prepare_motion_file,
+    scale_to_psc,
+)
+from ..reporting import (
+    FirstLevelResult,
+    clear_warnings,
+    get_warnings,
+    graded_warning,
+    setup_logging,
+    write_qc_summary,
+)
+from ..templates import (
+    extract_roi_stats,
+    validate_connectivity_options,
+    validate_extract_options,
+    validate_template,
 )
 
 def read_stim_data(config: ResolvedConfig, logger):
@@ -589,12 +585,12 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     20. Write QC summary JSON.
 
     Works from the config-driven dispatch runner
-    (run_first_level.py / DISPATCH["task_conn"]).
+    (cli.py / DISPATCH["task_conn"]).
 
     Parameters
     ----------
     config : ResolvedConfig
-        All pipeline parameters (see first_level_config.py for the full attribute list).
+        All pipeline parameters (see config.py for the full attribute list).
     logger : logging.Logger or None
         If None, a default logger named 'task_conn_first_level' is created.
 

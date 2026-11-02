@@ -409,7 +409,7 @@ Applies to: `CSF_path`/`CSF_paths`, `WM_path`/`WM_paths`, `GS_paths`
 
 ### Tools Lockfile
 
-- **File:** `tools.lock.yaml` (at repository root)
+- **File:** `src/fmri_first_level_proc/data/tools.lock.yaml` (shipped as package data)
 - **Format:** YAML
 - **Purpose:** Pins expected versions of external tools and the Python runtime for reproducibility.
 - **Schema:**
@@ -570,7 +570,7 @@ Required binaries: `3dDeconvolve`, `3dTproject`, `3dTstat`, `3dBandpass`, `3dROI
 
 ### 2. Version Lock Validation
 
-When `tools.lock.yaml` is present at the repository root:
+Using the `tools.lock.yaml` shipped inside the installed package:
 - **AFNI:** Runs `afni -ver`, parses the version string, and enforces strict exact-match comparison against the lockfile pin. `"PLACEHOLDER"` in the lockfile skips the check.
 - **Python:** Compares `sys.version_info` major.minor against the lockfile's `python` field (minor-series match; patch version is ignored per PEP 440 compatibility semantics).
 

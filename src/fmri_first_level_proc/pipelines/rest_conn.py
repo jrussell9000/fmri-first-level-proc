@@ -8,8 +8,6 @@
 # 4. (optional) Runs functional connectivity analysis with AFNI's 3dNetCorr
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.0.0
-# Last updated: 05/01/26
 # ============================================================================
 '''
 REQUIREMENTS:
@@ -80,38 +78,36 @@ import shutil
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
-from .exceptions import ConfigError, InputError, ModelError, ToolExecutionError
-from .first_level_config import ResolvedConfig
-from .first_level_utils import (
-    setup_logging,
-    dir_path_exists,
-    file_path_exists,
-    valid_ave_type,
-    valid_conn_type,
-    validate_template,
-    remove_files_from_dir,
-    run_afni_command,
-    extract_roi_stats,
-    seed_to_voxel_conn,
-    parcellated_conn,
-    prepare_motion_file,
+from ..afni import run_afni_command
+from ..config import ResolvedConfig
+from ..connectivity import parcellated_conn, seed_to_voxel_conn
+from ..design import compute_dof
+from ..exceptions import ConfigError, ModelError, ToolExecutionError
+from ..fileutils import remove_files_from_dir
+from ..preprocessing import (
+    bandpass_filter_1d_afni,
+    censor_interpolate_1d_afni,
     compute_tissue_derivative,
     create_censor_file,
-    notch_filter_motion,
-    write_qc_summary,
-    compute_dof,
-    validate_extract_options,
-    validate_connectivity_options,
     gen_min_outlier_epi,
+    notch_filter_motion,
+    prepare_motion_file,
     scale_to_psc,
-    censor_interpolate_1d_afni,
-    bandpass_filter_1d_afni,
-    graded_warning,
-    get_warnings,
-    clear_warnings,
+)
+from ..reporting import (
     FirstLevelResult,
+    clear_warnings,
+    get_warnings,
+    graded_warning,
+    setup_logging,
+    write_qc_summary,
+)
+from ..templates import (
+    extract_roi_stats,
+    validate_connectivity_options,
+    validate_extract_options,
+    validate_template,
 )
 
 def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared_motion, config, logger):
@@ -578,12 +574,12 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     12. Return FirstLevelResult with status, warnings, qc_summary, and output_files.
 
     Works from the config-driven dispatch runner
-    (run_first_level.py / DISPATCH["rest_conn"]).
+    (cli.py / DISPATCH["rest_conn"]).
 
     Parameters
     ----------
     config : ResolvedConfig
-        All pipeline configuration (see first_level_config.py ResolvedConfig for
+        All pipeline configuration (see config.py ResolvedConfig for
         the full attribute list).
     logger : logging.Logger or None
         If None, a default logger is created via setup_logging.

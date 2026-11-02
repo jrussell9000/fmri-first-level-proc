@@ -3,9 +3,9 @@
 # ============================================================================
 #
 # Usage:
-#   run-first-level --config example_config.yaml --dry-run
-#   run-first-level --config example_config.yaml
-#   run-first-level --config example_config.yaml --analyses 0 2
+#   fmri-first-level-proc --config examples/config.yaml --dry-run
+#   fmri-first-level-proc --config examples/config.yaml
+#   fmri-first-level-proc --config examples/config.yaml --analyses 0 2
 #      --analyses 0 2 => only first and third analysis blocks will be run
 #
 # This file demonstrates all three analysis types with every available option.
