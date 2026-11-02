@@ -52,4 +52,5 @@ markers = [
     "level5_adversarial: Edge cases, malformed input, boundary conditions",
     "level6_cross_stage: Multi-stage integration",
     "level7_pipeline: Full pipeline end-to-end",
+    "afni: Requires a real AFNI installation (skipped without one); see tests/test_real_afni.py",
 ]

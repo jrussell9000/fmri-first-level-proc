@@ -73,6 +73,7 @@ OUTPUTS:
 import copy
 import json
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -95,7 +96,7 @@ from ..design import (
     write_onset_file,
 )
 from ..exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
-from ..fileutils import remove_files_from_dir
+from ..fileutils import remove_files_from_dir, sanitize_filename_label
 from ..preprocessing import (
     CENSOR_HIGH_THRESHOLD,
     compute_tissue_derivative,
@@ -263,6 +264,53 @@ def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: log
     # Remove err file that always seems to be output
     clean_deconvolve_err(config.out_dir)
 
+# 3dDeconvolve bucket labels: per-basis coefficients/t-stats are '<name>#<k>_<stat>';
+# per-term F-stats/R^2 are '<name>_<stat>' (including 'Full_Fstat', 'Full_R^2').
+_BASIS_LABEL = re.compile(r"^(?P<name>.+)#(?P<k>\d+)_(?P<stat>Coef|Tstat)$")
+_TERM_LABEL = re.compile(r"^(?P<name>.+)_(?P<stat>Fstat|R\^2)$")
+
+
+def parse_bucket_labels(labels, contrast_labels=()):
+    """Group 3dDeconvolve bucket sub-bricks by statistic.
+
+    Parameters
+    ----------
+    labels : list of str
+        Sub-brick labels in bucket order (``3dinfo -label`` split on '|').
+    contrast_labels : iterable of str
+        GLT labels; 3dDeconvolve appends '_GLT' to them, which is stripped so
+        the index uses the label the user configured.
+
+    Returns
+    -------
+    dict
+        {'Coef'|'Tstat'|'Fstat'|'R^2': [(label, sub_brick_index), ...]} in bucket
+        order. A condition with several basis functions gets one entry per basis,
+        labelled '<name>#<k>'; a single-basis condition is labelled '<name>'.
+    """
+    contrasts = set(contrast_labels)
+
+    def clean(name):
+        if name.endswith("_GLT") and name[:-4] in contrasts:
+            return name[:-4]
+        return name
+
+    basis = {"Coef": [], "Tstat": []}
+    by_stat = {"Coef": [], "Tstat": [], "Fstat": [], "R^2": []}
+    for idx, raw in enumerate(label.strip() for label in labels):
+        if m := _BASIS_LABEL.match(raw):
+            basis[m["stat"]].append((clean(m["name"]), int(m["k"]), idx))
+        elif m := _TERM_LABEL.match(raw):
+            by_stat[m["stat"]].append((clean(m["name"]), idx))
+
+    for stat, entries in basis.items():
+        n_basis = {}
+        for name, _, _ in entries:
+            n_basis[name] = n_basis.get(name, 0) + 1
+        by_stat[stat] = [(name if n_basis[name] == 1 else f"{name}#{k}", idx) for name, k, idx in entries]
+    return by_stat
+
+
 def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
     """Get the statistical auxiliary parameters (e.g. DOF) for a sub-brick.
 
@@ -338,7 +386,8 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
     """Extract stat-type-based bucket outputs from the 3dDeconvolve bucket dataset.
 
     For each stat type in config.stat_buckets, this function:
-    1. Discovers all sub-bricks matching that stat type via 3dinfo -subbrick_info.
+    1. Discovers all sub-bricks matching that stat type from 3dinfo -label (see
+       parse_bucket_labels).
     2. Extracts them into a single multi-sub-brick NIfTI via 3dbucket.
     3. Writes a JSON index mapping condition/contrast labels to sub-brick indices.
     4. When template_path is available and not 'WB', writes a parcellated CSV
@@ -363,36 +412,21 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
     bucket_path = _bucket_stats_path(config)
     output_files = []
 
-    bucket_info = run_afni_command(
-        ['3dinfo', '-subbrick_info', bucket_path],
+    labels_out = run_afni_command(
+        ['3dinfo', '-label', bucket_path],
         capture_output=True,
-        description="3dinfo subbrick_info for stat bucket extraction",
+        description="3dinfo label for stat bucket extraction",
         logger=logger,
     )
-    bucket_split = bucket_info.split()
-
-    available_stats = set()
-    for token in bucket_split:
-        for st in ("Coef", "Tstat", "Fstat", "R^2"):
-            if st in token:
-                available_stats.add(st)
-    if any("Tstat" in token for token in bucket_split):
+    by_stat = parse_bucket_labels(labels_out.strip().split('|'), config.contrast_labels or [])
+    available_stats = {st for st, subs in by_stat.items() if subs}
+    if by_stat["Tstat"]:
         available_stats.add("Zstat")
     logger.info("Available stat types in bucket: %s", sorted(available_stats))
 
     for stat_type in config.stat_buckets:
-        search_stat = "Tstat" if stat_type == "Zstat" else stat_type
         need_t2z = (stat_type == "Zstat")
-
-        matched = []
-        for i, token in enumerate(bucket_split):
-            if search_stat in token and "#" in token:
-                label_part = token.split("#")[0]
-                try:
-                    idx = int(bucket_split[i - 1][1:])
-                    matched.append((label_part, idx))
-                except (ValueError, IndexError):
-                    continue
+        matched = by_stat["Tstat" if need_t2z else stat_type]
 
         if not matched:
             logger.warning(
@@ -416,7 +450,7 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
                             f"Could not retrieve DOF for sub-brick {idx} ({label}) in "
                             f"{bucket_path}; cannot convert T to Z.")
                     dof = int(aux_params[0])
-                    z_tmp = out_dir / f"{config.out_file_pre}_{label}_zconv_tmp.nii.gz"
+                    z_tmp = out_dir / f"{config.out_file_pre}_{sanitize_filename_label(label)}_zconv_tmp.nii.gz"
                     run_afni_command(
                         ["3dcalc", "-a", f"{bucket_path}[{idx}]",
                          "-expr", f"fitt_t2z(a,{dof})",

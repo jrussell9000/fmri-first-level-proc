@@ -1,5 +1,6 @@
 """Motion/censor preparation, nuisance-regressor filtering, PSC scaling, and min-outlier EPI."""
 
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,21 @@ CENSOR_HIGH_THRESHOLD = 50.0    # % censored → strong warning
 def _labeled_name(out_file_pre, label, suffix):
     """Build '{pre}_{label}_{suffix}', or '{pre}_{suffix}' when label is empty."""
     return f"{out_file_pre}_{label}_{suffix}" if label else f"{out_file_pre}_{suffix}"
+
+
+def _as_1d(path, out_dir, out_prefix, label):
+    """Return a path AFNI will read as 1D data.
+
+    AFNI identifies 1D datasets by the .1D suffix; with the transpose quote
+    (``file'``) a .txt path is not recognised and the command fails with
+    "Can't open dataset". Non-.1D inputs are copied to a .1D path in out_dir.
+    """
+    path = Path(path)
+    if path.suffix == ".1D":
+        return path
+    copy = Path(out_dir) / f"{out_prefix}_{label}_src.1D"
+    shutil.copyfile(path, copy)
+    return copy
 
 
 def _restore_time_rows(out_path, what, step, label, logger):
@@ -260,6 +276,7 @@ def censor_interpolate_1d_afni(input_path, tr, censor_path, out_dir, out_prefix,
         orientation.
     """
     out_path = Path(out_dir) / f"{out_prefix}_{label}_interp.1D"
+    input_path = _as_1d(input_path, out_dir, out_prefix, label)
 
     cmd = ["3dTproject",
            "-polort", "-1",
@@ -321,6 +338,7 @@ def bandpass_filter_1d_afni(input_path, tr, bandpass, out_dir, out_prefix, label
         orientation.
     """
     out_path = Path(out_dir) / f"{out_prefix}_{label}_bp.1D"
+    input_path = _as_1d(input_path, out_dir, out_prefix, label)
 
     cmd = ["3dBandpass",
            "-nodetrend",

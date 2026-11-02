@@ -102,11 +102,6 @@ def test_task_act(workdir, inputs, fake_afni, logger):
     assert len([c for c in fake_afni.calls_to("3dinfo") if "-space" in c]) == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="extract_stat_buckets keeps the leading quote from 3dinfo -subbrick_info labels "
-    "(\"#1 'A#0_Coef' ...\" -> \"'A\"); see issue #4",
-)
 def test_task_act_stat_bucket_labels(workdir, inputs, fake_afni, logger):
     block = {
         "name": "act", "type": "task_act",

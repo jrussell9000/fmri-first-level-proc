@@ -85,6 +85,22 @@ def test_sanitize_filename_label():
     assert sanitize_filename_label("Fear - Neutral/x") == "Fear_-_Neutral_x"
 
 
+def test_parse_bucket_labels():
+    from fmri_first_level_proc.pipelines.task_act import parse_bucket_labels
+
+    # Real 3dDeconvolve -fout -rout -tout layout (AFNI 26.3.07), plus a 2-basis condition
+    labels = ["Full_R^2", "Full_Fstat", "A#0_Coef", "A#0_Tstat", "A_R^2", "A_Fstat",
+              "T#0_Coef", "T#0_Tstat", "T#1_Coef", "T#1_Tstat", "T_R^2", "T_Fstat",
+              "AvB_GLT#0_Coef", "AvB_GLT#0_Tstat", "AvB_GLT_R^2", "AvB_GLT_Fstat"]
+    by_stat = parse_bucket_labels(labels, contrast_labels=["AvB"])
+    assert by_stat["Coef"] == [("A", 2), ("T#0", 6), ("T#1", 8), ("AvB", 12)]
+    assert by_stat["Tstat"] == [("A", 3), ("T#0", 7), ("T#1", 9), ("AvB", 13)]
+    assert by_stat["Fstat"] == [("Full", 1), ("A", 5), ("T", 11), ("AvB", 15)]
+    assert by_stat["R^2"] == [("Full", 0), ("A", 4), ("T", 10), ("AvB", 14)]
+    # Without the contrast label, the _GLT suffix is a real part of the name and stays
+    assert parse_bucket_labels(["X_GLT#0_Coef"])["Coef"] == [("X_GLT", 0)]
+
+
 def test_extract_roi_stats_parses_1dformat(monkeypatch, logger):
     fake = "#File\tSub-brick\n#\tNZMean_1\tNZMean_3\n# f.nii[0]\n1.5\t2.5\n# f.nii[1]\n3.5\t4.5\n"
     monkeypatch.setattr(templates, "run_afni_command", lambda *a, **k: fake)

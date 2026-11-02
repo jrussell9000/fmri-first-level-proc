@@ -25,8 +25,16 @@ PATCH_TARGETS = (
     "fmri_first_level_proc.pipelines.rest_conn",
 )
 
-# Default 3dDeconvolve bucket layout reported by 3dinfo -label / -subbrick_info.
-DEFAULT_BUCKET_LABELS = ["Full_Fstat", "A#0_Coef", "A#0_Tstat", "B#0_Coef", "B#0_Tstat"]
+# Default 3dDeconvolve bucket layout reported by 3dinfo -label / -subbrick_info,
+# as real 3dDeconvolve -fout -rout -tout writes it for two stimuli (AFNI 26.3.07).
+DEFAULT_BUCKET_LABELS = [
+    "Full_R^2", "Full_Fstat",
+    "A#0_Coef", "A#0_Tstat", "A_R^2", "A_Fstat",
+    "B#0_Coef", "B#0_Tstat", "B_R^2", "B_Fstat",
+]
+
+# statcode line 3dinfo -subbrick_info prints after a statistic sub-brick
+_STATCODE = {"Tstat": "fitt;  statpar = 80", "Fstat": "fift;  statpar = 1 80", "R^2": "fibt;  statpar = 0.5 40"}
 
 
 class FakeAfni:
@@ -118,6 +126,9 @@ class FakeAfni:
         return path.split("[")[0].rstrip("'")
 
     def _write_transposed_1d(self, src, prefix):
+        # Like AFNI, only a .1D path is read as 1D data (otherwise "Can't open dataset")
+        if not self._strip_selector(src).endswith(".1D"):
+            raise ToolExecutionError(f"fake 3d*: Can't open dataset '{src}'")
         # AFNI reads .1D as rows=voxels, cols=time; output is written in that orientation.
         data = np.loadtxt(self._strip_selector(src), ndmin=2)
         np.savetxt(prefix, data.T, fmt="%.6f")
@@ -143,10 +154,14 @@ class FakeAfni:
         if flag == "-label":
             return "|".join(self.bucket_labels) + "\n"
         if flag == "-subbrick_info":
-            return "".join(
-                f"  -- At sub-brick #{i} '{label}' datum type is float:   -1 to 1\n"
-                for i, label in enumerate(self.bucket_labels)
-            )
+            # Real format: labels are single-quoted; stat sub-bricks get a statcode line
+            lines = ["++ 3dinfo: AFNI version=AFNI_26.3.07 (Oct 31 2026) [64-bit]"]
+            for i, label in enumerate(self.bucket_labels):
+                lines.append(f"  -- At sub-brick #{i} '{label}' datum type is float:   -1 to 1")
+                stat = next((s for s in _STATCODE if label.endswith(s)), None)
+                if stat:
+                    lines.append(f"     statcode = {_STATCODE[stat]}")
+            return "\n".join(lines) + "\n"
         raise NotImplementedError(f"3dinfo flag {flag}")
 
     def _toutcount(self, command):
@@ -154,15 +169,16 @@ class FakeAfni:
         return " ".join(f"{v:.4f}" for v in fractions) + "\n"
 
     def _roistats(self, command):
+        # Real -1Dformat: a Mean_i column precedes each NZMean_i / NZMed_i column
         n = 1 if "seed" in Path(self._opt(command, "-mask")).name else self.n_rois
         stat = "NZMed" if "-nzmedian" in command else "NZMean"
-        header = "#\t" + "\t".join(f"{stat}_{i + 1}" for i in range(n))
-        row = "\t".join(f"{0.1 * (i + 1):.4f}" for i in range(n))
-        return f"#File\tSub-brick\n{header}\n# {command[-1]}\n{row}\n"
+        header = "\t\t#\t" + "\t".join(f"Mean_{i + 1}  \t{stat}_{i + 1}" for i in range(n))
+        row = "\t\t\t" + "\t".join(f"{0.2 * (i + 1):.6f}\t{0.1 * (i + 1):.6f}" for i in range(n))
+        return f"#File\tSub-brick\n{header}\n#{command[-1]}\t0[?]\n{row}\n"
 
     def _attribute(self, command):
-        # BRICK_STATAUX records: index, stat code (3 = Tstat), n params, DOF
-        return " ".join(f"{i} 3 1 80" for i, lbl in enumerate(self.bucket_labels) if "Tstat" in lbl) + "\n"
+        # BRICK_STATAUX records: index, stat code (3 = Tstat), n params, params (DOF)
+        return " ".join(f"{i} 3 1 80" for i, lbl in enumerate(self.bucket_labels) if lbl.endswith("Tstat")) + "\n"
 
     # -- dataset producers ---------------------------------------------------
 
@@ -199,8 +215,11 @@ class FakeAfni:
         eye = "\n".join("  " + "  ".join("1.000000" if i == j else "0.250000" for j in range(n)) for i in range(n))
         sections = ["CC"] + (["FZ"] if "-fish_z" in command else []) + (["PC", "PCB"] if "-part_corr" in command else [])
         body = "".join(f"# {name}\n{eye}\n" for name in sections)
+        # Real header: ROI counts, WITH_ROI_LABELS, then label and index rows before the matrices
+        labels = "  ".join(f"{i + 1:03d}" for i in range(n)) + "\n" + "  ".join(str(i + 1) for i in range(n))
         Path(prefix + "_000.netcc").write_text(
-            f"# {n}  # Number of network ROIs\n# {len(sections)}  # Number of netcc matrices\n{body}"
+            f"# {n}  # Number of network ROIs\n# {len(sections)}  # Number of netcc matrices\n"
+            f"# WITH_ROI_LABELS\n{labels}\n{body}"
         )
         if "-ts_wb_corr" in command:
             indiv = Path(prefix + "_000_INDIV")
