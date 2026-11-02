@@ -78,7 +78,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..afni import clean_deconvolve_err, run_afni_command
+from ..afni import clean_deconvolve_err, run_afni_command, uses_num_cores
 from ..config import ResolvedConfig
 from ..design import (
     HRF_DURATION_MODELS,
@@ -483,6 +483,7 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
 
     return output_files
 
+@uses_num_cores
 def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLevelResult:
     """Validate config and execute the task activation pipeline.
 

@@ -16,7 +16,7 @@ A YAML-driven Python framework for first-level fMRI analysis (Task Activation, T
 - **Resumable Outputs:** Stages whose output files already exist are skipped on rerun. (A config-hash checkpoint ledger exists in `checkpoint.py` but is not yet wired into the pipelines.)
 - **Exception Hierarchy:** Typed exceptions (`ConfigError`, `InputError`, `ToolUnavailableError`, `ToolVersionError`, `ToolExecutionError`, `ModelError`, `GuardError`) map to distinct exit codes for programmatic error handling.
 - **Pre-Regression Extraction:** Optional `extract_raw_ptseries` toggle to capture parcellated time series before nuisance regression.
-- **Parallel Processing:** Native AFNI multi-core support.
+- **Parallel Processing:** `num_cores` sets one CPU budget per block: `3dDeconvolve -jobs`, `OMP_NUM_THREADS` for every AFNI call, and concurrent processing of independent runs/conditions within that budget.
 
 ## Prerequisites
 

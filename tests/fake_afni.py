@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
+from fmri_first_level_proc import afni
 from fmri_first_level_proc.exceptions import ToolExecutionError
 
 # Modules that bind run_afni_command at import time and must all be patched.
@@ -52,6 +53,7 @@ class FakeAfni:
         self.bucket_labels = list(bucket_labels or DEFAULT_BUCKET_LABELS)
         self.fail_on = set(fail_on)
         self.calls: list[list[str]] = []
+        self.budgets: list[int | None] = []  # OMP thread budget in effect for each call
 
     # -- public helpers ------------------------------------------------------
 
@@ -72,6 +74,7 @@ class FakeAfni:
     def __call__(self, command, capture_output=False, description="", logger=None):
         command = [str(c) for c in command]
         self.calls.append(command)
+        self.budgets.append(afni._thread_budget.get())
         program = command[0]
         if program in self.fail_on:
             raise ToolExecutionError(f"fake failure: {' '.join(command)}")
@@ -122,8 +125,13 @@ class FakeAfni:
     # -- query tools ---------------------------------------------------------
 
     def _info(self, command):
+        flags = command[1:-1]
+        if len(flags) > 1:
+            # 3dinfo prints multiple requested values on one tab-separated line
+            values = [self._info([command[0], flag, command[-1]]).strip() for flag in flags]
+            return "\t".join(values) + "\n"
         target = self._strip_selector(command[-1])
-        flag = command[1]
+        flag = flags[0]
         if flag == "-space":
             return "MNI\n"
         if flag == "-orient":

@@ -81,7 +81,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..afni import clean_deconvolve_err, run_afni_command
+from ..afni import clean_deconvolve_err, parallel_map, run_afni_command, uses_num_cores
 from ..config import ResolvedConfig
 from ..connectivity import (
     build_conn_output_path,
@@ -403,26 +403,27 @@ def gen_pbseries(bseries_info, config: ResolvedConfig, logger):
         Must include: out_dir, extract_out_file_pre, template_path, average_type.
     logger : logging.Logger
     """
-    # Iterate available condition-specific beta series
-    for i, cond in enumerate(bseries_info['CONDITION']):
+    def extract_condition(item):
+        cond, bseries_path = item
         pbseries_path = Path(config.out_dir) / f"{config.extract_out_file_pre}_pbseries_{cond}.csv"
 
         # Check if output already exists
-        if not pbseries_path.exists():
-
-            new_df = extract_roi_stats(bseries_info['PATH'][i], config.template_path, config.average_type, logger=logger)
-
-            # Save pbseries
-            new_df.to_csv(pbseries_path)
-            if pbseries_path.exists():
-                logger.info("Successfully extracted pbseries from %s using ROI template.", bseries_info['PATH'][i])
-            else:
-                logger.error("Could not extract pbseries from %s using ROI template.", bseries_info['PATH'][i])
-                raise InputError(
-                    f"Could not extract pbseries from {bseries_info['PATH'][i]} using ROI template."
-                )
-        else:
+        if pbseries_path.exists():
             logger.info("%s already exists (skipping).", pbseries_path)
+            return
+
+        new_df = extract_roi_stats(bseries_path, config.template_path, config.average_type, logger=logger)
+
+        # Save pbseries
+        new_df.to_csv(pbseries_path)
+        if pbseries_path.exists():
+            logger.info("Successfully extracted pbseries from %s using ROI template.", bseries_path)
+        else:
+            logger.error("Could not extract pbseries from %s using ROI template.", bseries_path)
+            raise InputError(f"Could not extract pbseries from {bseries_path} using ROI template.")
+
+    # Conditions are independent; extract concurrently within the num_cores budget
+    parallel_map(extract_condition, zip(bseries_info['CONDITION'], bseries_info['PATH']))
 
 def gen_conn(bseries_info, config: ResolvedConfig, logger):
     """Compute condition-specific functional connectivity from task beta series.
@@ -440,32 +441,24 @@ def gen_conn(bseries_info, config: ResolvedConfig, logger):
         fishZ, pcorr.
     logger : logging.Logger
     """
-    # Iterate task conditions with beta series
-    for i, cond in enumerate(bseries_info['CONDITION']):
+    # Run connectivity analyses based on the specified flavor
+    conn_fn = parcellated_conn if config.calc_conn == "parcellated" else seed_to_voxel_conn
 
-        # Run connectivity analyses based on the specified flavor
-        if config.calc_conn == "parcellated":
-            parcellated_conn(
-                inset_path=bseries_info['PATH'][i],
-                out_dir=config.out_dir,
-                conn_out_file_pre=config.conn_out_file_pre,
-                template_path=config.template_path,
-                fishZ=config.fishZ,
-                pcorr=config.pcorr,
-                condition=cond,
-                logger=logger,
-            )
-        else:
-            seed_to_voxel_conn(
-                inset_path=bseries_info['PATH'][i],
-                out_dir=config.out_dir,
-                conn_out_file_pre=config.conn_out_file_pre,
-                template_path=config.template_path,
-                fishZ=config.fishZ,
-                pcorr=config.pcorr,
-                condition=cond,
-                logger=logger,
-            )
+    def conn_for_condition(item):
+        cond, bseries_path = item
+        conn_fn(
+            inset_path=bseries_path,
+            out_dir=config.out_dir,
+            conn_out_file_pre=config.conn_out_file_pre,
+            template_path=config.template_path,
+            fishZ=config.fishZ,
+            pcorr=config.pcorr,
+            condition=cond,
+            logger=logger,
+        )
+
+    # Conditions are independent; run 3dNetCorr concurrently within the num_cores budget
+    parallel_map(conn_for_condition, zip(bseries_info['CONDITION'], bseries_info['PATH']))
 
 def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, config: ResolvedConfig, logger):
     """Generate connectivity contrasts from condition-level connectivity outputs.
@@ -560,6 +553,7 @@ def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, config: 
                 logger.error("Failed to create seed-to-voxel connectivity contrast '%s'.", label)
 
 
+@uses_num_cores
 def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLevelResult:
     """Validate config and execute the task connectivity pipeline.
 

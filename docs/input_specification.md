@@ -53,7 +53,7 @@ analyses:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `num_cores` | int | `1` | CPU cores for AFNI parallel processing. |
+| `num_cores` | int | `1` | CPU budget per analysis block. Passed to `3dDeconvolve -jobs`, exported to every AFNI call as `OMP_NUM_THREADS`, and split across independent per-run (`rest_conn`) and per-condition (`task_conn` extraction/connectivity) steps that run concurrently. Set it to the CPUs actually allotted (e.g. the container's CPU limit). |
 | `tr` | float | (required) | Repetition time in seconds. Applies to all scans across all analysis blocks. |
 | `template_path` | str or null | `null` | Path to a shared ROI template NIfTI file (`.nii.gz`). Required if any block uses extraction or connectivity. See [ROI Template File](#roi-template-file). |
 | `force_diff_atlas` | bool | `false` | Allow atlas space/orientation mismatch between scan and template. Use with caution. |

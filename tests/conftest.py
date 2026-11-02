@@ -2,6 +2,7 @@ import logging
 
 import pytest
 
+from fmri_first_level_proc import afni
 from fmri_first_level_proc.reporting import clear_warnings
 
 
@@ -11,7 +12,9 @@ def logger():
 
 
 @pytest.fixture(autouse=True)
-def _clear_warning_accumulator():
+def _reset_module_state():
     clear_warnings()
+    afni._3DINFO_CACHE.clear()
     yield
     clear_warnings()
+    afni._3DINFO_CACHE.clear()

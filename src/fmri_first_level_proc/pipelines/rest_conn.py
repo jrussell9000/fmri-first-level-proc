@@ -78,7 +78,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..afni import run_afni_command
+from ..afni import parallel_map, run_afni_command, uses_num_cores
 from ..config import ResolvedConfig
 from ..connectivity import parcellated_conn, seed_to_voxel_conn
 from ..design import compute_dof
@@ -432,27 +432,20 @@ def gen_residual_ts(config, logger):
                 per_run_dof.append(None)
                 skip_run.append(True)
 
-        completed_runs = []
+        # Dispatch to selected backend based on config.use_sequenced_bandpass
+        backend = (_generate_run_residual_sequenced if config.use_sequenced_bandpass
+                   else _generate_run_residual_simultaneous)
 
-        # Iterate individual resting-state runs
-        for i, run_scan in enumerate(config.scan_paths):
-
+        def residual_for_run(i):
             if skip_run[i]:
-                continue
+                return None
+            return backend(i, config.scan_paths[i], censor_paths[i], prepared_motion[i], config, logger)
 
-            # Dispatch to selected backend based on config.use_sequenced_bandpass
-            if config.use_sequenced_bandpass:
-                run_out = _generate_run_residual_sequenced(
-                    i, run_scan, censor_paths[i], prepared_motion[i], config, logger)
-            else:
-                run_out = _generate_run_residual_simultaneous(
-                    i, run_scan, censor_paths[i], prepared_motion[i], config, logger)
-
-            if run_out is None:
-                # Backend logged the specific failure; skip this run.
-                continue
-
-            completed_runs.append(run_out)
+        # Runs are independent; process them concurrently within the num_cores budget.
+        # A None result means the backend logged a failure and the run is skipped.
+        # parallel_map keeps run order, which 3dTcat relies on.
+        completed_runs = [r for r in parallel_map(residual_for_run, range(len(config.scan_paths)))
+                          if r is not None]
 
         if not completed_runs:
             raise ToolExecutionError(
@@ -561,6 +554,7 @@ def gen_conn(config, logger):
             logger=logger,
         )
 
+@uses_num_cores
 def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLevelResult:
     """Validate config and execute the resting-state connectivity pipeline.
 
@@ -664,17 +658,16 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
 
     # ---------------------------------
 
-    # Extract minimum-outlier representative EPI frame per run (mandatory, before regression)
-    for i, scan in enumerate(config.scan_paths):
+    # Per run (concurrently): extract the minimum-outlier representative EPI frame
+    # (mandatory, before regression), then optionally PSC-scale the scan.
+    def prepare_run_scan(i):
+        scan = config.scan_paths[i]
         gen_min_outlier_epi(scan, config.out_dir, config.out_file_pre, f"run{i+1}", logger)
+        if config.scale_to_psc:
+            return str(scale_to_psc(scan, config.out_dir, config.out_file_pre, f"run{i+1}", logger))
+        return scan
 
-    # PSC scaling per run (after min-outlier EPI, before regression)
-    if config.scale_to_psc:
-        config.scan_paths = list(config.scan_paths)
-        for i, scan in enumerate(config.scan_paths):
-            psc_path = scale_to_psc(
-                scan, config.out_dir, config.out_file_pre, f"run{i+1}", logger)
-            config.scan_paths[i] = str(psc_path)
+    config.scan_paths = parallel_map(prepare_run_scan, range(len(config.scan_paths)))
 
     # Extract pre-regression parcellated time series per run if requested
     if getattr(config, 'extract_raw_ptseries', False):

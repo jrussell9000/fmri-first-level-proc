@@ -96,6 +96,10 @@ def test_task_act(workdir, inputs, fake_afni, logger):
     qc = json.loads((out / "sub01_qc_summary.json").read_text())
     assert qc["per_condition_surviving_trials"] == {"A": 6, "B": 6}
     assert not (workdir / "3dDeconvolve.err").exists()
+    # Every AFNI call runs under the num_cores budget
+    assert set(fake_afni.budgets) == {2}
+    # Template + scan each queried once (combined 3dinfo, cached across both validations)
+    assert len([c for c in fake_afni.calls_to("3dinfo") if "-space" in c]) == 2
 
 
 @pytest.mark.xfail(
@@ -191,6 +195,10 @@ def test_rest_conn_seed_to_voxel(workdir, inputs, fake_afni, logger, sequenced):
     assert not (out / "sub01_fc_000_INDIV").exists()
     tcat = fake_afni.calls_to("3dTcat")[0]
     assert tcat[-2:] == [str(out / "sub01_run1_residual_dtseries.nii.gz"), str(out / "sub01_run2_residual_dtseries.nii.gz")]
+    # num_cores=2 across 2 runs: per-run work gets 1 thread each; concat runs with the full budget
+    per_run = [b for c, b in zip(fake_afni.calls, fake_afni.budgets) if c[0] in ("3dTproject", "3dToutcount")]
+    assert per_run and set(per_run) == {1}
+    assert fake_afni.budgets[fake_afni.calls.index(tcat)] == 2
     if sequenced:
         # Per run: 1 BOLD bandpass + 1 per nuisance file (motion, CSF, WM, CSF_deriv, WM_deriv)
         assert len(fake_afni.calls_to("3dBandpass")) == 2 * 6
