@@ -1,0 +1,216 @@
+"""In-process stand-in for the AFNI command-line tools used by the pipelines.
+
+FakeAfni replaces ``run_afni_command`` in every module that imports it. Each
+supported program writes the files the real tool would produce (NIfTI outputs
+are placeholder bytes; 1D outputs are real numeric text in AFNI's transposed
+orientation) and returns plausible stdout for query tools. Every call is
+recorded so tests can assert on the command sequence.
+"""
+
+from pathlib import Path
+
+import numpy as np
+
+from fmri_first_level_proc.exceptions import ToolExecutionError
+
+# Modules that bind run_afni_command at import time and must all be patched.
+PATCH_TARGETS = (
+    "fmri_first_level_proc.afni",
+    "fmri_first_level_proc.preprocessing",
+    "fmri_first_level_proc.templates",
+    "fmri_first_level_proc.connectivity",
+    "fmri_first_level_proc.pipelines.task_act",
+    "fmri_first_level_proc.pipelines.task_conn",
+    "fmri_first_level_proc.pipelines.rest_conn",
+)
+
+# Default 3dDeconvolve bucket layout reported by 3dinfo -label / -subbrick_info.
+DEFAULT_BUCKET_LABELS = ["Full_Fstat", "A#0_Coef", "A#0_Tstat", "B#0_Coef", "B#0_Tstat"]
+
+
+class FakeAfni:
+    """Callable replacement for ``run_afni_command``.
+
+    Parameters
+    ----------
+    n_trs : int
+        Length of generated censor files and 3dToutcount output.
+    censored_trs : iterable of int
+        TR indices that 1d_tool.py marks as censored (0).
+    n_rois : int
+        ROI count reported by 3dROIstats and 3dinfo -dmax for parcellations.
+    bucket_labels : list of str
+        Sub-brick labels of the 3dDeconvolve bucket dataset.
+    fail_on : set of str
+        Program names that raise ToolExecutionError instead of running.
+    """
+
+    def __init__(self, n_trs=100, censored_trs=(), n_rois=3, bucket_labels=None, fail_on=()):
+        self.n_trs = n_trs
+        self.censored_trs = set(censored_trs)
+        self.n_rois = n_rois
+        self.bucket_labels = list(bucket_labels or DEFAULT_BUCKET_LABELS)
+        self.fail_on = set(fail_on)
+        self.calls: list[list[str]] = []
+
+    # -- public helpers ------------------------------------------------------
+
+    def install(self, monkeypatch):
+        for module in PATCH_TARGETS:
+            monkeypatch.setattr(f"{module}.run_afni_command", self)
+        return self
+
+    def programs(self):
+        """Program names in call order."""
+        return [c[0] for c in self.calls]
+
+    def calls_to(self, program):
+        return [c for c in self.calls if c[0] == program]
+
+    # -- dispatch ------------------------------------------------------------
+
+    def __call__(self, command, capture_output=False, description="", logger=None):
+        command = [str(c) for c in command]
+        self.calls.append(command)
+        program = command[0]
+        if program in self.fail_on:
+            raise ToolExecutionError(f"fake failure: {' '.join(command)}")
+        handlers = {
+            "3dinfo": self._info,
+            "3dToutcount": self._toutcount,
+            "3dROIstats": self._roistats,
+            "3dAttribute": self._attribute,
+            "3dbucket": self._prefix_producer,
+            "3dcalc": self._prefix_producer,
+            "3dTstat": self._prefix_producer,
+            "3dresample": self._prefix_producer,
+            "3dTcat": self._prefix_producer,
+            "3dLSS": self._prefix_producer,
+            "3dTproject": self._tproject,
+            "3dBandpass": self._bandpass,
+            "3dDeconvolve": self._deconvolve,
+            "3dNetCorr": self._netcorr,
+            "1d_tool.py": self._censor_tool,
+            "1dtranspose": self._transpose,
+        }
+        if program not in handlers:
+            raise NotImplementedError(f"FakeAfni has no handler for {program}")
+        out = handlers[program](command)
+        return (out or "") if capture_output else None
+
+    # -- argument helpers ----------------------------------------------------
+
+    @staticmethod
+    def _opt(command, flag, default=None):
+        return command[command.index(flag) + 1] if flag in command else default
+
+    @staticmethod
+    def _touch(path):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"fake nifti")
+
+    @staticmethod
+    def _strip_selector(path):
+        """Drop AFNI sub-brick selectors and the transpose quote from a dataset argument."""
+        return path.split("[")[0].rstrip("'")
+
+    def _write_transposed_1d(self, src, prefix):
+        # AFNI reads .1D as rows=voxels, cols=time; output is written in that orientation.
+        data = np.loadtxt(self._strip_selector(src), ndmin=2)
+        np.savetxt(prefix, data.T, fmt="%.6f")
+
+    # -- query tools ---------------------------------------------------------
+
+    def _info(self, command):
+        target = self._strip_selector(command[-1])
+        flag = command[1]
+        if flag == "-space":
+            return "MNI\n"
+        if flag == "-orient":
+            return "RAI\n"
+        if flag == "-ad3":
+            return "2.000000\t2.000000\t2.000000\n"
+        if flag == "-dmax":
+            return "1\n" if "seed" in Path(target).name else f"{self.n_rois}\n"
+        if flag == "-label":
+            return "|".join(self.bucket_labels) + "\n"
+        if flag == "-subbrick_info":
+            return "".join(
+                f"  -- At sub-brick #{i} '{label}' datum type is float:   -1 to 1\n"
+                for i, label in enumerate(self.bucket_labels)
+            )
+        raise NotImplementedError(f"3dinfo flag {flag}")
+
+    def _toutcount(self, command):
+        fractions = np.linspace(0.2, 0.01, self.n_trs)
+        return " ".join(f"{v:.4f}" for v in fractions) + "\n"
+
+    def _roistats(self, command):
+        n = 1 if "seed" in Path(self._opt(command, "-mask")).name else self.n_rois
+        stat = "NZMed" if "-nzmedian" in command else "NZMean"
+        header = "#\t" + "\t".join(f"{stat}_{i + 1}" for i in range(n))
+        row = "\t".join(f"{0.1 * (i + 1):.4f}" for i in range(n))
+        return f"#File\tSub-brick\n{header}\n# {command[-1]}\n{row}\n"
+
+    def _attribute(self, command):
+        # BRICK_STATAUX records: index, stat code (3 = Tstat), n params, DOF
+        return " ".join(f"{i} 3 1 80" for i, lbl in enumerate(self.bucket_labels) if "Tstat" in lbl) + "\n"
+
+    # -- dataset producers ---------------------------------------------------
+
+    def _prefix_producer(self, command):
+        self._touch(self._opt(command, "-prefix"))
+
+    def _tproject(self, command):
+        src, prefix = self._opt(command, "-input"), self._opt(command, "-prefix")
+        if src.endswith("'"):
+            self._write_transposed_1d(src, prefix)
+        else:
+            self._touch(prefix)
+
+    def _bandpass(self, command):
+        src, prefix = command[-1], self._opt(command, "-prefix")
+        if src.endswith("'"):
+            self._write_transposed_1d(src, prefix)
+        else:
+            self._touch(prefix)
+
+    def _deconvolve(self, command):
+        for flag in ("-bucket", "-errts"):
+            if flag in command:
+                self._touch(self._opt(command, flag))
+        if "-x1D" in command:
+            Path(self._opt(command, "-x1D")).write_text("# fake design matrix\n")
+        Path("3dDeconvolve.err").write_text("")
+
+    def _netcorr(self, command):
+        prefix = self._opt(command, "-prefix")
+        for ext in ("_000.niml.dset", "_000.roidat"):
+            Path(prefix + ext).write_text("")
+        n = self.n_rois
+        eye = "\n".join("  " + "  ".join("1.000000" if i == j else "0.250000" for j in range(n)) for i in range(n))
+        sections = ["CC"] + (["FZ"] if "-fish_z" in command else []) + (["PC", "PCB"] if "-part_corr" in command else [])
+        body = "".join(f"# {name}\n{eye}\n" for name in sections)
+        Path(prefix + "_000.netcc").write_text(
+            f"# {n}  # Number of network ROIs\n# {len(sections)}  # Number of netcc matrices\n{body}"
+        )
+        if "-ts_wb_corr" in command:
+            indiv = Path(prefix + "_000_INDIV")
+            indiv.mkdir(exist_ok=True)
+            self._touch(indiv / "WB_CORR_ROI_001.nii.gz")
+            if "-ts_wb_Z" in command:
+                self._touch(indiv / "WB_Z_ROI_001.nii.gz")
+
+    # -- 1D tools ------------------------------------------------------------
+
+    def _censor_tool(self, command):
+        n = len(np.loadtxt(self._opt(command, "-infile"), ndmin=2))
+        censor = np.ones(n)
+        for idx in self.censored_trs:
+            if idx < n:
+                censor[idx] = 0
+        prefix = command[command.index("-censor_motion") + 2]
+        np.savetxt(f"{prefix}_censor.1D", censor, fmt="%d")
+
+    def _transpose(self, command):
+        np.savetxt(command[2], np.loadtxt(command[1], ndmin=2).T, fmt="%.6f")
