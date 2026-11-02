@@ -4,7 +4,7 @@ All notable changes to this fork of fmri-first-level-proc. Versions follow
 [Semantic Versioning](https://semver.org/). Issue numbers refer to
 `jrussell9000/fmri-first-level-proc`.
 
-## [Unreleased]
+## [4.0.1] — 2026-11-02
 
 ### Changed
 
