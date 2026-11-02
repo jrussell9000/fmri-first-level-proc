@@ -1,6 +1,7 @@
-"""Preflight binary reachability and version-lock validation for fmri-first-level-proc."""
+"""Preflight binary reachability, version-lock validation, and CPU discovery for fmri-first-level-proc."""
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -10,6 +11,55 @@ from pathlib import Path
 import yaml
 
 from .exceptions import ToolUnavailableError, ToolVersionError
+
+
+def _cgroup_cpu_limit(cgroup_root: Path) -> int | None:
+    """Whole CPUs allowed by the cgroup CPU quota (v2 cpu.max, else v1 CFS), or None if unlimited."""
+    try:
+        quota, period = (cgroup_root / "cpu.max").read_text().split()[:2]
+        if quota == "max":
+            return None
+        return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    try:
+        quota = int((cgroup_root / "cpu" / "cpu.cfs_quota_us").read_text())
+        period = int((cgroup_root / "cpu" / "cpu.cfs_period_us").read_text())
+        return max(1, quota // period) if quota > 0 and period > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _schedulable_cpus() -> int:
+    """CPUs this process may run on (affinity-aware where the platform supports it)."""
+    if hasattr(os, "process_cpu_count"):  # Python 3.13+
+        return os.process_cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0)) or 1
+    return os.cpu_count() or 1
+
+
+def available_cpus(environ=None, cgroup_root: Path = Path("/sys/fs/cgroup")) -> tuple[int, str]:
+    """Resolve ``num_cores: auto`` to a CPU count and a description of its source.
+
+    Order:
+    1. ``OMP_NUM_THREADS``, when set to a positive integer. Orchestrators such as
+       Kubernetes set it from the pod's CPU request (downward API), which is the
+       reservation the scheduler guarantees. Capped at the cgroup limit if lower.
+    2. The cgroup CPU quota (the container's CPU limit), rounded down, minimum 1.
+    3. CPUs schedulable for this process.
+    """
+    environ = os.environ if environ is None else environ
+    limit = _cgroup_cpu_limit(cgroup_root)
+
+    omp = environ.get("OMP_NUM_THREADS", "").strip()
+    if omp.isdigit() and int(omp) > 0:
+        if limit is not None and limit < int(omp):
+            return limit, f"OMP_NUM_THREADS={omp}, capped at cgroup CPU limit {limit}"
+        return int(omp), "OMP_NUM_THREADS"
+    if limit is not None:
+        return limit, "cgroup CPU limit"
+    return _schedulable_cpus(), "schedulable CPUs"
 
 # Complete AFNI binary list (15 binaries, verified by codebase grep)
 _AFNI_BINARIES: list[str] = [

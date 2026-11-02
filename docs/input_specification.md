@@ -53,7 +53,7 @@ analyses:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `num_cores` | int | `1` | CPU budget per analysis block. Passed to `3dDeconvolve -jobs`, exported to every AFNI call as `OMP_NUM_THREADS`, and split across independent per-run (`rest_conn`) and per-condition (`task_conn` extraction/connectivity) steps that run concurrently. Set it to the CPUs actually allotted (e.g. the container's CPU limit). |
+| `num_cores` | int or `"auto"` | `1` | CPU budget per analysis block. Passed to `3dDeconvolve -jobs`, exported to every AFNI call as `OMP_NUM_THREADS`, and split across independent per-run (`rest_conn`) and per-condition (`task_conn` extraction/connectivity) steps that run concurrently. `"auto"` resolves at load time, in order: `OMP_NUM_THREADS` if it is a positive integer (e.g. a Kubernetes downward-API projection of the pod's CPU request), capped at the cgroup CPU limit; else the cgroup CPU limit (`cpu.max`, rounded down, minimum 1); else the CPUs schedulable for the process. The resolved value and its source are logged. |
 | `tr` | float | (required) | Repetition time in seconds. Applies to all scans across all analysis blocks. |
 | `template_path` | str or null | `null` | Path to a shared ROI template NIfTI file (`.nii.gz`). Required if any block uses extraction or connectivity. See [ROI Template File](#roi-template-file). |
 | `force_diff_atlas` | bool | `false` | Allow atlas space/orientation mismatch between scan and template. Use with caution. |

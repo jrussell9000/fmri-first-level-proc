@@ -27,7 +27,7 @@ Config Schema Overview
 ----------------------
 global:
     tr           : float (required) -- repetition time in seconds
-    num_cores    : int -- CPU cores for parallel processing
+    num_cores    : int | 'auto' -- CPU budget; 'auto' reads OMP_NUM_THREADS, then the cgroup limit
     template_path: str -- shared ROI template for all analyses
     force_diff_atlas: bool -- allow atlas space mismatches
     derivatives_dirs: list[str] -- BIDS derivatives directories (optional)
@@ -56,6 +56,7 @@ import yaml
 from .bids import discover_inputs
 from .exceptions import ConfigError, InputError
 from .design import VALID_HRF_MODELS, validate_custom_hrf, needs_married_timing
+from .runtime import available_cpus
 
 VALID_TYPES = {"task_act", "task_conn", "rest_conn"}
 VALID_STAT_BUCKET_TYPES = {"Coef", "Tstat", "Fstat", "R^2", "Zstat"}
@@ -261,6 +262,12 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
         _cfg_err(logger, "global.tr must be a positive number.")
     if tr_float <= 0:
         _cfg_err(logger, "global.tr must be a positive number, got %s.", tr_val)
+
+    # -- Validate global.num_cores (positive int or 'auto'; default 1) --
+    nc_val = global_cfg.get("num_cores")
+    if nc_val is not None and nc_val != "auto":
+        if isinstance(nc_val, bool) or not isinstance(nc_val, int) or nc_val < 1:
+            _cfg_err(logger, "global.num_cores must be a positive integer or 'auto', got %r.", nc_val)
 
     # -- Validate each analysis block --
     for idx, block in enumerate(raw_config["analyses"]):
@@ -604,7 +611,12 @@ def resolve_config(
 
     # -- Global-sourced fields --
     num_cores_raw = global_cfg.get("num_cores")
-    num_cores = int(num_cores_raw) if num_cores_raw is not None else 1
+    if num_cores_raw == "auto":
+        num_cores, source = available_cpus()
+        if logger is not None:
+            logger.info("num_cores: auto -> %d (%s).", num_cores, source)
+    else:
+        num_cores = int(num_cores_raw) if num_cores_raw is not None else 1
     template_path = global_cfg.get("template_path", None)
     force_diff_atlas = bool(global_cfg.get("force_diff_atlas", False))
     tr = float(global_cfg["tr"])

@@ -60,6 +60,20 @@ def test_load_and_validate_task_act(tmp_path, task_inputs, logger):
     assert cfg.scan_path == task_inputs["scan.nii.gz"]
 
 
+def test_num_cores_auto(tmp_path, task_inputs, monkeypatch, logger):
+    monkeypatch.setattr("fmri_first_level_proc.config.available_cpus", lambda: (3, "test"))
+    path = _write_config(tmp_path, [_task_act_block(tmp_path, task_inputs)], num_cores="auto")
+    (cfg,) = load_and_validate(path, logger)
+    assert cfg.num_cores == 3
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, "four", True])
+def test_num_cores_rejects_invalid(tmp_path, task_inputs, logger, bad):
+    path = _write_config(tmp_path, [_task_act_block(tmp_path, task_inputs)], num_cores=bad)
+    with pytest.raises(ConfigError, match="num_cores"):
+        load_and_validate(path, logger)
+
+
 def test_load_and_validate_errors(tmp_path, task_inputs, logger):
     with pytest.raises(ConfigError):
         load_and_validate(str(tmp_path / "nope.yaml"), logger)

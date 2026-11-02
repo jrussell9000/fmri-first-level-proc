@@ -20,7 +20,7 @@
 # overridden per-block.
 
 global:
-  num_cores: 1                   # CPU cores for AFNI parallel processing
+  num_cores: 1                   # CPU budget per block; "auto" = OMP_NUM_THREADS, else the container's CPU limit
   tr: 0.8                        # Repetition time in seconds (applies to all scans)
   template_path: null            # Path to shared ROI template (.nii.gz), or null
   force_diff_atlas: false        # true = allow atlas mismatch (USE WITH CAUTION)

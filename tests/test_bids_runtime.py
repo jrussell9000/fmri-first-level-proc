@@ -66,6 +66,38 @@ def test_write_dataset_description_is_idempotent(tmp_path):
     assert json.loads((deriv / "dataset_description.json").read_text()) == {"Name": "external"}
 
 
+def _cgroup(tmp_path, cpu_max=None, v1=None):
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    if cpu_max is not None:
+        (root / "cpu.max").write_text(cpu_max + "\n")
+    if v1 is not None:
+        (root / "cpu").mkdir()
+        (root / "cpu" / "cpu.cfs_quota_us").write_text(f"{v1[0]}\n")
+        (root / "cpu" / "cpu.cfs_period_us").write_text(f"{v1[1]}\n")
+    return root
+
+
+@pytest.mark.parametrize(
+    "env, cpu_max, v1, expected",
+    [
+        ({"OMP_NUM_THREADS": "2"}, "400000 100000", None, (2, "OMP_NUM_THREADS")),
+        ({"OMP_NUM_THREADS": "8"}, "200000 100000", None, (2, "OMP_NUM_THREADS=8, capped at cgroup CPU limit 2")),
+        ({}, "250000 100000", None, (2, "cgroup CPU limit")),        # 2.5 CPUs -> 2
+        ({}, "50000 100000", None, (1, "cgroup CPU limit")),         # 0.5 CPU -> at least 1
+        ({}, None, (300000, 100000), (3, "cgroup CPU limit")),       # cgroup v1
+        ({"OMP_NUM_THREADS": "4,2"}, "200000 100000", None, (2, "cgroup CPU limit")),  # unparseable -> ignored
+    ],
+)
+def test_available_cpus(tmp_path, env, cpu_max, v1, expected):
+    assert runtime.available_cpus(environ=env, cgroup_root=_cgroup(tmp_path, cpu_max, v1)) == expected
+
+
+def test_available_cpus_falls_back_to_schedulable(tmp_path):
+    n, source = runtime.available_cpus(environ={}, cgroup_root=_cgroup(tmp_path, "max 100000"))
+    assert source == "schedulable CPUs" and n >= 1
+
+
 def _fake_afni_home(tmp_path, skip=(), non_exec=()):
     home = tmp_path / "abin"
     home.mkdir()
