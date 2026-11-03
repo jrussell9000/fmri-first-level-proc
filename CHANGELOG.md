@@ -4,6 +4,37 @@ All notable changes to this fork of fmri-first-level-proc. Versions follow
 [Semantic Versioning](https://semver.org/). Issue numbers refer to
 `jrussell9000/fmri-first-level-proc`.
 
+## [4.2.0] — 2026-11-03
+
+ABCD staging only: these change n-back results on GE sessions and on any session a rule
+now excludes or repairs. The framework's core is unchanged.
+
+### Changed
+
+- **n-back trims by each run's `dummy` row**, not its NSS count. Hagler et al. 2019's GE
+  discard of 5 and 16 frames is out of date; ABCD now discards 4 and 15. The older count
+  lost each GE run's first cue, and in about half of two-run GE sessions a bare 0-back
+  condition then fell below 2 trials. Rest still trims its NSS count.
+- **`--run-validity` is required.** Only n-back runs the table marks usable are staged.
+- **A session whose rules exclude everything now finishes**, recording why, rather than
+  failing, so a queue doesn't resubmit it.
+
+### Added
+
+- **`fmri-first-level-abcd-validity`** builds the per-run table from ABCD's E-Prime valid-run
+  count and run-level results.
+- **Exclusions**, each recorded per run: `unexpected-frame-count` (a wrong scanner label or a
+  short run), `predates-ge-timing-correction`, `unexpected-dummy`, `no-dummy-row`,
+  `no-task-events`, and the table's reasons.
+
+### Fixed
+
+- **A run with no task events** stayed in the concatenated BOLD, modelled as baseline.
+- **A short run's events** could spill into the next run's time.
+- **Zero-`dummy` runs**, whose onsets carry no pad, were modelled 6.4 s early and lost 3 events.
+- **A next run's first cue misfiled at the end of a run** excluded that whole run. The cue now
+  moves back to its run.
+
 ## [4.1.0] — 2026-11-02
 
 ### Added

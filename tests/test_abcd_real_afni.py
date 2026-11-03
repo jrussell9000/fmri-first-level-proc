@@ -22,14 +22,14 @@ pytestmark = [
 
 TR = 0.8
 SUBJ, SES = "sub-TEST0001", "ses-00A"
-N_FRAMES, N_NSS = 20, 4
+N_FRAMES, N_NSS = 370, 8
 PROB_AFFINE = np.diag([1.0, 1.0, 1.0, 1.0])
 REF_AFFINE = np.array([[-2.0, 0, 0, 6.5], [0, -2.0, 0, 6.5], [0, 0, 2.0, 0.5], [0, 0, 0, 1.0]])
 EVENTS = (
     "onset\tduration\tresponse_time\ttrial_type\n"
-    '0.000\t3.200\t"n/a"\t"dummy"\n'
-    '3.210\t2.890\t"n/a"\t"cue"\n'
-    '6.210\t1.900\t"n/a"\t"0_back_posface"\n'
+    '0.000\t6.400\t"n/a"\t"dummy"\n'
+    '6.410\t2.890\t"n/a"\t"cue"\n'
+    '9.410\t1.900\t"n/a"\t"0_back_posface"\n'
 )
 
 
@@ -69,7 +69,8 @@ def test_staging_commands_trim_mask_concatenate_and_average(tmp_path, monkeypatc
     _seed(raw, np.random.default_rng(0))
     work = tmp_path / "work"
     work.mkdir()
-    sess = staging.Session(SUBJ, SES, raw, "fixed", work)
+    validity = {rid: (True, "") for rid in ("task-nback_run-01", "task-nback_run-02")}
+    sess = staging.Session(SUBJ, SES, raw, "fixed", work, validity)
     by_task = sess.runs_by_task(sess.read_marker())
 
     nback, _ = sess.stage_task("nback", by_task["nback"], TR)
