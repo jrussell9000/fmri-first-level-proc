@@ -1,0 +1,14 @@
+lockfile_version: "2.0.0"
+tools:
+  afni:
+    minimum: "26.0.09"
+    validated: "26.0.09"
+  python:
+    minimum: "3.12"
+    validated: "3.14"
+  numpy:
+    minimum: "2.4.2"
+    validated: "2.4.2"
+  pandas:
+    minimum: "3.0.1"
+    validated: "3.0.1"

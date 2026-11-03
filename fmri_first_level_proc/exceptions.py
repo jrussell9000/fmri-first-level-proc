@@ -22,7 +22,7 @@ class ToolUnavailableError(FmriFirstLevelError):
 
 
 class ToolVersionError(FmriFirstLevelError):
-    """External tool binary found but version does not match the lockfile pin."""
+    """Installed external tool or library version is below the minimum recorded in the packaged lockfile."""
 
 
 class ToolExecutionError(FmriFirstLevelError):
@@ -35,3 +35,22 @@ class ModelError(FmriFirstLevelError):
 
 class GuardError(FmriFirstLevelError):
     """Pipeline invariant violation: unexpected state indicating a bug."""
+
+
+def exit_code(exc):
+    """Return the CLI exit code for an exception.
+
+    ConfigError, InputError -> 2; ModelError -> 5; ToolUnavailableError,
+    ToolVersionError, ToolExecutionError, subprocess.CalledProcessError -> 4;
+    GuardError and any other exception -> 1.
+    """
+    import subprocess
+
+    if isinstance(exc, (ConfigError, InputError)):
+        return 2
+    if isinstance(exc, ModelError):
+        return 5
+    if isinstance(exc, (ToolUnavailableError, ToolVersionError, ToolExecutionError,
+                        subprocess.CalledProcessError)):
+        return 4
+    return 1

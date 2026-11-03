@@ -3,6 +3,7 @@
 
 # Core pipeline files
 !.gitignore
+!CHANGELOG.md
 !environment.yaml
 !example_config.yaml
 !example_subj.timing.csv
@@ -13,17 +14,29 @@
 !fmri_first_level_proc/__init__.py
 !fmri_first_level_proc/bids.py
 !fmri_first_level_proc/checkpoint.py
+!fmri_first_level_proc/connectivity.py
+!fmri_first_level_proc/engine.py
+!fmri_first_level_proc/estimability.py
+!fmri_first_level_proc/events.py
 !fmri_first_level_proc/exceptions.py
 !fmri_first_level_proc/first_level_config.py
 !fmri_first_level_proc/first_level_utils.py
+!fmri_first_level_proc/inputs.py
+!fmri_first_level_proc/names.py
+!fmri_first_level_proc/nuisance.py
+!fmri_first_level_proc/prep.py
+!fmri_first_level_proc/qc.py
 !fmri_first_level_proc/rest_conn_first_level.py
+!fmri_first_level_proc/roi.py
 !fmri_first_level_proc/run_first_level.py
+!fmri_first_level_proc/runsets.py
 !fmri_first_level_proc/runtime.py
+!fmri_first_level_proc/smoothing.py
 !fmri_first_level_proc/task_act_first_level.py
 !fmri_first_level_proc/task_conn_first_level.py
 
-# Tool version lockfile
-!tools.lock.yaml
+# Packaged lockfile
+!fmri_first_level_proc/tools.lock.yaml
 
 # AID Framework disclosure files
 !AID_LOG.md

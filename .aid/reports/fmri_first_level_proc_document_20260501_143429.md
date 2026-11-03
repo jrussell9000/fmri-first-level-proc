@@ -8,7 +8,7 @@
     <file path="README.md" changes="Updated the Resting-State Connectivity feature bullet to mention the optional sequenced denoising path (separate BOLD and nuisance bandpass filtering per Ciric et al. 2017) and its DOF-cost benefit.">
       <type>readme</type>
     </file>
-    <file path="fmri_first_level_proc/rest_conn_first_level.py" changes="Added module-level docstring entries introducing _generate_run_residual_simultaneous and _generate_run_residual_sequenced as the two backends; brief references to Ciric et al. 2017 (PMID 30446748) and Hallquist et al. 2013 for the design rationale.">
+    <file path="fmri_first_level_proc/rest_conn_first_level.py" changes="Added module-level docstring entries introducing _generate_run_residual_simultaneous and _generate_run_residual_sequenced as the two backends; brief references to Ciric et al. 2017 (PMID 28302591) and Hallquist et al. 2013 for the design rationale.">
       <type>docstring</type>
     </file>
     <file path="AID_LOG.md" changes="Appended v2.5.0 entry to Version History describing the sequenced denoising path, new utility functions, test-suite expansion (55 new tests; 515 total passing), and documentation updates.">

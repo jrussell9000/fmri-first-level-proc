@@ -7,264 +7,103 @@
 # 3. (optional) Extract parcel-level/ROI activation with a provided template with AFNI's 3dROIstats
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.0.0
-# Last updated: 05/01/26
 # ============================================================================
-'''
-REQUIREMENTS:
-- AFNI
-- numpy
-- pandas
+"""
+Task activation first-level pipeline.
 
-INPUTS:
-(required)
--scan_path: global file path to the run-concatenated dense time series (preprocessed UP TO first-level analyses)
-    format = string(path_to_nii) (volumetric)
---task_timing_path: global file path to the run-concatenated stimulus timing file (should have been stripped for dummy scans)
-    format = string(path_to_csv); column 1 name = 'CONDITION', column 2 name = 'ONSET' (global times matching --scan_path scan length), column 3 name = 'DURATION'
---motion_path: global file path to the run-concatenated motion regressors (should have been stripped for dummy scans)
-    format = string(path_to_txt) (tab-delimited) with no headers; rows = TR/frame, columns = motion regressors (6 base or 12 with derivatives, controlled by include_motion_derivs)
---fd_threshold: framewise displacement threshold (mm); TRs with FD above this value are censored (censor file is generated internally from --motion_path; it is NOT a user-provided input)
---cond_labels: string-list (comma-separated) of task conditions to use in first level analyses - labels should match the 'CONDITION' column from the timing file;
-    Conditions in cond_labels will be the only ones used in the regression (more could be in task_timing_path file) and the only ones that can be used within contrast_functions (optional)
-    format = string-list of conditions e.g. 'stimFear,stimSad,stimNeu'
---out_dir: global directory path for derivative intermediates and statistical datasets; will create if doesn't exist
---out_file_pre: prefix to be prepended to the statistical dataset outputs (should usually contain an ID, task name, time point, etc. but NOT the global file path; eg. 'subj001_nback_baseline')
---num_cores: number of CPU cores available for parallel processing (int)
+INPUTS
+------
+Mode A (per-run files): paths.scan_paths, paths.task_timing_paths,
+    paths.motion_paths, paths.CSF_paths (optional), paths.WM_paths (optional),
+    aligned lists with run_labels.
+Mode B (single concatenated file): paths.scan_path, paths.task_timing_path,
+    paths.motion_path, paths.CSF_path (optional), paths.WM_path (optional),
+    with run_lengths and run_labels describing run boundaries.
 
-(optional)
---hrf_model: HRF basis function model to use (default: 'GAM'). Options: 'GAM', 'BLOCK', 'dmBLOCK', 'SPMG1', 'custom'
---custom_hrf: custom AFNI HRF model string (only used when hrf_model='custom', e.g. 'TENT(0,14,8)')
---CSF_path: global file path to the run-concatenated cerebrospinal fluid BOLD signal time series
-    format = string(path_to_txt); no headers; rows=TR/frame, single column = mean CSF signal
---WM_path: global file path to the run-concatenated white-matter BOLD signal time series
-    format = string(path_to_txt); no headers; rows=TR/frame, single column = mean WM signal
---use_tissue_derivs: (no value) include this option to add first temporal derivatives of tissue signals (CSF/WM) as additional nuisance regressors; only computed for tissue paths that are provided
---remove_previous: (no value) include this option if "out_dir" should have all files removed before processing starts (including connectivity); if not included, will not overwrite pre-existing files
---contrast_functions: list of string formulas for linear contrasts using condition names in cond_labels
-    format = list(string-equations) (e.g. if conditions "stimFear", "stimSad", and "stimNeu" exist in cond_labels, "1*stimFear-1*stimNeu,1*stimSad-1*stimNeu" would produce Fear-Neutral and Sad-Neutral constrasts)
---contrast_labels: list of string labels to give to each constrast in contrasts_functions
-    format = list(string-labels) (for the example above, "Fear-Neutral,Sad-Neutral")
---extract: (no value) include this option if you want condition/contrast- and stat-specific maps
-    If present and no template is provided to template_path, voxelwise whole-brain maps will be output; if present and template_path is valid, parcellated maps will be output
---extract_labels: if --extract is present, list of string labels to extract (each to their own file); MUST have corresponding matches in either --cond_labels or --constrast_labels
-    format = list(string-labels) (e.g. "stimFear,stimSad,Fear-Neutral,Sad-Neutral" would save 4 maps specific to each condition/contrast and stat contained in --extract_stat)
---extract_stat: if --extract is present, statistic to extract from the 'bucket' statistical dataset from 3dDeconvolve; options: 'z', 't', 'r'
---extract_out_file_pre: if --extract, the prefix to attach to output files (should NOT include the file path, task condition/contrast, or stat; similar to --out_file_pre e.g. 'subj001_nback_baseline_Shen368')
---template_path: optional template file for --extract; if --extract is present and no template exists, voxelwise maps will be extracted, else parcel-level/ROI averages will be extracted based on the template and extract_stat
-    Can be a binary mask (only a single parcel/ROI will be output) or a set of N ROIs/masks indicated by unique integers>0 (full parcel/ROI table will be output)
-    format = string(path_to_nii) (volumetric and registered to the same atlas as input scan, unless --force_diff_atlas used; if there is a mismatch in grid spacing, will resample the template to the input scan grid)
---average_type: either "mean" or "median" - the type of averaging used when calculating average parcel activation with template
---extract_resids: (no value) if --extract is present and a valid template is provided, flag to indicate that parcel-level/ROI residuals should also be extracted.
---force_diff_atlas: (no value) include this option if you know the template and scan are in different standard spaces, but want to force connectivity analyses anyway (USE WITH CAUTION)
+Other inputs: cond_labels, hrf_model, custom_hrf, fd_threshold, censor_prev_tr,
+include_motion_derivs, use_tissue_derivs, scale_to_psc, average_type,
+roi_zero_handling, template_path (global), smoothing (enabled, fwhm),
+contrasts (functions, labels), extraction (stat_buckets, extract_out_file_pre,
+extract_resids, extract_raw_ptseries).
 
-OUTPUTS:
-(always)
-{out_dir}/{out_file_pre}_concat_{condition}_onsets.txt: AFNI-safe version of timing onsets for task conditions (1D single column with no headers or row names)
-{out_dir}/{out_file_pre}_concat_bucket_stats.nii.gz: first-level output statistical dataset for the entire task (subbrik = stim-stat combination)
-{out_dir}/{out_file_pre}_concat_bucket_resids.nii.gz: residuals from the first-level output statistical dataset for the entire task
+FINAL OUTPUTS
+-------------
+{pre}_concat_bucket_stats.nii.gz (frozen primary output)
+{pre}_concat_bucket_resids.nii.gz
+{pre}_concat_bucket_stats_index.json
+{ext}_{stat}_bucket.nii.gz, {ext}_{stat}_index.json (sub-brick key is its exact
+    3dinfo -label label, mapped to its 0-based position in the extracted
+    bucket; a Zstat bucket reuses the matching Tstat label with "Zstat" in
+    place of "Tstat"), {ext}_{stat}_parcellated.csv (same keys as row labels)
+{ext}_resids.csv
+{ext}_raw_ptseries.csv, {ext}_raw_psc_ptseries.csv
+Min-outlier EPI (single or per-run labeled name)
+_s{N}mm smoothed siblings of the bucket stats, residuals and each stat bucket
+{pre}_qc_summary.json
+{pre}_timing_errors.json (written only when onset timing validation fails)
 
-(optional)
---extract:
-    If no template is provided: {out_dir}/{extract_out_file_pre}_{condition/constrast}_{stat}.nii.gz: condition- and stat-specific voxelwise map
-    If a template is provided: {out_dir}/{extract_out_file_pre}_{condition/constrast}_{stat}.csv; rows correspond to each parcel/ROI in the template and columns are ["ROI", "ACT_{averageType}_{stat}"]
-    If a template is provided and --extract_resids is present: {out_dir}/{extract_out_file_pre}_resids.csv; rows correspond to each parcel/ROI in the template and columns are ["ROI", "ACT_{averageType}_RESID"]
-'''
+INTERMEDIATE OUTPUTS
+---------------------
+{pre}_ledger.jsonl, mean/PSC volumes, concat_scan, run_intersect_mask,
+resampled template, smoothing mask, smoothed model inputs, onset files,
+preflight and estimability design matrices, REML_cmd files, censor and
+side files, prepared motion, tissue prepared/derivative files.
 
-# Imports
+STEP ORDER
+----------
+Always-run: task-act-events, task-act-nuisance, task-act-estimability,
+task-act-onsets, task-act-preflight.
+Ledgered: task-act-template (if template used), task-act-prep,
+task-act-min-outlier-epi, task-act-raw-ptseries (if configured),
+task-act-glm, task-act-extract (if configured), task-act-smooth and
+task-act-glm-smooth (if smoothing enabled), task-act-roi-qc (if template used).
+Final: task-act-qc.
+"""
+
 import copy
 import json
-import logging
-import os
-import subprocess
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
-from .first_level_config import ResolvedConfig
+from . import names, events, nuisance, estimability, prep, roi, smoothing
+from .engine import RunContext, StageSpec, Outcome, Output, run_with_status
+from .runsets import build_runsets
+from .runtime import runtime_check
+from .exceptions import GuardError, InputError, ToolExecutionError
 from .first_level_utils import (
-    FirstLevelResult,
-    graded_warning,
-    get_warnings,
     clear_warnings,
     setup_logging,
-    dir_path_exists,
-    file_path_exists,
-    valid_string_list,
-    valid_ave_type,
     run_afni_command,
-    validate_template,
-    remove_files_from_dir,
-    extract_roi_stats,
-    build_hrf_string,
     needs_married_timing,
-    read_and_validate_stim_data,
-    write_onset_file,
+    hrf_for_durations,
     build_decon_base_command,
-    clean_deconvolve_err,
-    log_hrf_model,
-    log_nuisance_model,
-    prepare_motion_file,
-    compute_tissue_derivative,
-    create_censor_file,
-    check_trial_survival,
-    write_qc_summary,
-    compute_dof,
+    collect_reml_cmds,
     valid_contrast_functions,
     gen_min_outlier_epi,
-    scale_to_psc,
-    CENSOR_WARN_THRESHOLD,
-    CENSOR_HIGH_THRESHOLD,
-    HRF_DM_MODELS,
-    HRF_IMPULSE_MODELS,
-    HRF_DURATION_MODELS,
-    VALID_HRF_MODELS,
+    log_hrf_model,
+    log_nuisance_model,
 )
 
-# Surviving trial count below which TRIALS_FEW warning is emitted (condition still included)
-_TRIALS_FEW_THRESHOLD = 10
 
+# ---------------------------------------------------------------------------
+# Sub-brick statistics helper
+# ---------------------------------------------------------------------------
 
-def read_stim_data(config: ResolvedConfig, logger: logging.Logger) -> pd.DataFrame:
-    """Read and validate stimulus timing data for the task activation pipeline.
-
-    Reads and validates the timing CSV without writing any onset files. Separating
-    the read phase from the write phase allows trial-survival filtering to be applied
-    before onset files are written, maintaining architectural consistency with the
-    task connectivity pipeline.
-
-    Parameters
-    ----------
-    config : ResolvedConfig
-        Must include: task_timing_path, cond_labels.
-    logger : logging.Logger
+def _get_stataux(bucket_path, logger=None):
+    """Get the statistical auxiliary parameters (e.g. DOF) for every
+    sub-brick via a single 3dAttribute BRICK_STATAUX call.
 
     Returns
     -------
-    pd.DataFrame
-        Sorted timing data with trial_type, onset, duration columns (BIDS naming).
-    """
-    return read_and_validate_stim_data(config.task_timing_path, config.cond_labels, logger=logger)
-
-
-def write_stim_onset_files(stim_data: pd.DataFrame, config: ResolvedConfig, logger: logging.Logger) -> None:
-    """Write per-condition AFNI onset files for the task activation pipeline.
-
-    Must be called after trial-survival filtering so that config.cond_labels reflects
-    only surviving conditions. Writes one AFNI-format onset file per condition in
-    config.cond_labels (used as -stim_times inputs to 3dDeconvolve). Conditions present
-    in stim_data but not in config.cond_labels are silently ignored.
-
-    Parameters
-    ----------
-    stim_data : pd.DataFrame
-        Sorted timing data with trial_type, onset, duration columns (BIDS naming).
-    config : ResolvedConfig
-        Must include: cond_labels, out_dir, out_file_pre, hrf_model, custom_hrf.
-    logger : logging.Logger
-    """
-    for cond in stim_data['trial_type'].unique():
-        cond_df = stim_data[stim_data['trial_type'] == cond]
-        if cond in config.cond_labels:
-            onset_file = f"{config.out_dir}/{config.out_file_pre}_concat_{cond}_onsets.txt"
-            write_onset_file(cond_df, onset_file, config.hrf_model, config.custom_hrf, logger=logger)
-
-def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: logging.Logger) -> None:
-    """Execute the 3dDeconvolve activation first-level regression.
-
-    Builds the full 3dDeconvolve command including nuisance regressors
-    (motion, optional CSF/WM/derivatives), per-condition HRF-convolved
-    stimulus timing, optional linear contrasts (GLTs), and statistics output
-    flags (-fout, -rout, -tout). Writes the bucket stats and residuals NIfTIs.
-    Skips if the output bucket stats file already exists.
-
-    Parameters
-    ----------
-    stim_data : pd.DataFrame
-        Timing data from read_stim_data.
-    config : ResolvedConfig
-        Must include: scan_path, censor_path, motion_path, CSF_path, WM_path,
-        out_dir, out_file_pre, cond_labels, hrf_model, custom_hrf,
-        contrast_functions, contrast_labels, num_cores, tr.
-    logger : logging.Logger
+    dict of int -> list of float
+        {sub-brick index: auxiliary parameter values (e.g. [DOF] for a
+        T-stat sub-brick)}. The first occurrence wins for a duplicated index.
 
     Raises
     ------
-    ToolExecutionError
-        If 3dDeconvolve fails or does not produce the expected bucket stats file.
-    """
-    # Check if outputs exist
-    if not os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"):
-
-        # Compute tissue signal derivatives if requested
-        CSF_deriv_path = None
-        WM_deriv_path = None
-        if config.use_tissue_derivs:
-            if config.CSF_path is not None:
-                CSF_deriv_path = compute_tissue_derivative(config.CSF_path, config.out_dir, config.out_file_pre, "CSF", logger)
-            if config.WM_path is not None:
-                WM_deriv_path = compute_tissue_derivative(config.WM_path, config.out_dir, config.out_file_pre, "WM", logger)
-
-        # Set-up base command, including temporal detrending, frame censors, and motion regressors
-        decon_command = build_decon_base_command(config.scan_path, config.censor_path, config.motion_path,
-                                                 CSF_path=config.CSF_path, WM_path=config.WM_path,
-                                                 CSF_deriv_path=CSF_deriv_path, WM_deriv_path=WM_deriv_path,
-                                                 tr=config.tr)
-        decon_command.extend(["-num_stimts", f"{len(config.cond_labels)}"])
-
-        # Iteratively add stim timing for conditions
-        for i, cond in enumerate(config.cond_labels):
-            # Compute mean duration for models that need it
-            mean_dur = None
-            if config.hrf_model in HRF_DURATION_MODELS:
-                mean_dur = np.mean(stim_data[stim_data['trial_type'] == cond]['duration'])
-            hrf_string = build_hrf_string(config.hrf_model, mean_dur=mean_dur, custom_hrf=config.custom_hrf)
-
-            # dmBLOCK-family models require -stim_times_AM1 for married timing
-            stim_flag = "-stim_times_AM1" if needs_married_timing(config.hrf_model, config.custom_hrf) else "-stim_times"
-            decon_command.extend([stim_flag, f"{i+1}", f"{config.out_dir}/{config.out_file_pre}_concat_{cond}_onsets.txt",
-                                 hrf_string, "-stim_label", f"{i+1}", f"{cond}"])
-
-        # Iteratively add contrasts
-        if config.contrast_functions:
-            decon_command.extend(["-num_glt", str(len(config.contrast_functions))])
-            for ci, cont in enumerate(config.contrast_functions):
-                sym_eq = "SYM: " + " ".join(
-                    f"{coef}*{cond}" for coef, cond in zip(cont["COEFS"], cont["CONDS"])
-                )
-                decon_command.extend(["-gltsym", sym_eq,
-                                      "-glt_label", f"{ci+1}", f"{config.contrast_labels[ci]}"])
-
-        # Add statistics output
-        decon_command.extend(["-errts", f"{config.out_dir}/{config.out_file_pre}_concat_bucket_resids.nii.gz",
-                              "-fout", "-rout", "-tout",
-                              "-bucket", f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz",
-                              "-jobs", f"{config.num_cores}"])
-
-        # Run command
-        run_afni_command(decon_command, description="3dDeconvolve activation", logger=logger)
-
-        if os.path.exists(f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"):
-            logger.info("Successfully created first level activation stats for %s", config.out_file_pre)
-        else:
-            raise ToolExecutionError(
-                f"3dDeconvolve did not produce bucket stats for {config.out_file_pre}."
-            )
-    else:
-        logger.info("First level activation stats for %s already exists.", config.out_file_pre)
-
-    # Remove err file that always seems to be output
-    clean_deconvolve_err(config.out_dir)
-
-def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
-    """Get the statistical auxiliary parameters (e.g. DOF) for a sub-brick.
-
-    Returns
-    -------
-    list of float
-        The auxiliary parameter values (e.g. [DOF] for a T-stat sub-brick).
+    GuardError
+        If the 3dAttribute command fails.
     """
     try:
         out = run_afni_command(
@@ -273,506 +112,856 @@ def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
             description="3dAttribute BRICK_STATAUX",
             logger=logger,
         )
-    except ToolExecutionError:
-        return []
+    except ToolExecutionError as e:
+        raise GuardError(
+            f"Could not retrieve BRICK_STATAUX from {bucket_path}: {e}"
+        ) from e
 
-    # BRICK_STATAUX format: pairs of (subbrik_index stat_type n_params param1 param2 ...)
-    # stat_type 3 = T-stat (params: DOF)
     tokens = out.split()
+    stataux = {}
     i = 0
     while i < len(tokens):
         try:
             idx = int(tokens[i])
-            stype = int(tokens[i + 1])
+            _ = int(tokens[i + 1])
             npar = int(tokens[i + 2])
             params = [float(tokens[i + 3 + j]) for j in range(npar)]
-            if idx == subbrik_index:
-                return params
+            if idx not in stataux:
+                stataux[idx] = params
             i += 3 + npar
         except (ValueError, IndexError):
             break
-    return []
+    return stataux
 
 
-def generate_bucket_stats_index(config: ResolvedConfig, logger: logging.Logger) -> str:
-    """Generate a JSON index mapping every sub-brick label in the bucket stats output to its 0-based index.
+# ---------------------------------------------------------------------------
+# GLT contrast argument builder
+# ---------------------------------------------------------------------------
 
-    Parameters
-    ----------
-    config : ResolvedConfig
-        Must include: out_dir, out_file_pre.
-    logger : logging.Logger
+def gltsym_args(kept_contrasts, contrast_labels):
+    """Build -gltsym/-glt_label arguments from the kept contrast list."""
+    if not kept_contrasts or not contrast_labels:
+        return []
+    args = []
+    for k, (contrast, label) in enumerate(zip(kept_contrasts, contrast_labels), 1):
+        gltstr = "".join(
+            f"{c}*{cd} " for c, cd in zip(contrast["COEFS"], contrast["CONDS"])
+        ).strip()
+        args.extend(["-gltsym", f"SYM: {gltstr}", "-glt_label", str(k), label])
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Bucket stats index generation
+# ---------------------------------------------------------------------------
+
+def generate_bucket_stats_index(io, bucket_rel, index_rel, logger):
+    """Generate a JSON index mapping bucket sub-brick labels to indices.
 
     Returns
     -------
-    str
-        Path to the written index JSON file.
+    Output
     """
-    bucket_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"
-    index_path = os.path.join(
-        config.out_dir, f"{config.out_file_pre}_concat_bucket_stats_index.json")
-
-    if os.path.exists(index_path):
-        logger.info("Bucket stats index already exists: %s", index_path)
-        return index_path
-
+    bucket_path = io.path(bucket_rel)
     info = run_afni_command(
-        ['3dinfo', '-label', bucket_path],
+        ["3dinfo", "-label", bucket_path],
         capture_output=True,
         description="3dinfo label for bucket stats index",
         logger=logger,
+        cwd=io.staging,
     )
-    labels = [l.strip() for l in info.strip().split('|') if l.strip()]
+    labels = [l.strip() for l in info.strip().split("|") if l.strip()]
     index_map = {label: i for i, label in enumerate(labels)}
+    text = json.dumps(index_map, indent=2) + "\n"
+    with open(io.path(index_rel), "w", newline="") as f:
+        f.write(text)
+    return Output(index_rel, "final", "py_text", producer="bucket stats index",
+                 expected_text=text)
 
-    with open(index_path, "w") as f:
-        json.dump(index_map, f, indent=2)
-    logger.info("Wrote bucket stats index: %s", index_path)
 
-    return index_path
+# ---------------------------------------------------------------------------
+# Per-stat-type index writer
+# ---------------------------------------------------------------------------
+
+def write_stat_indexes(io, ext, matched, token=""):
+    """Write per-stat-type JSON indexes and return their Outputs."""
+    outputs = []
+    for stat_type, items in matched.items():
+        index_rel = names.stat_index(ext, stat_type, token)
+        index_map = {label: i for i, (label, _) in enumerate(items)}
+        index_text = json.dumps(index_map, indent=2) + "\n"
+        with open(io.path(index_rel), "w", newline="") as f:
+            f.write(index_text)
+        outputs.append(Output(index_rel, "final", "py_text",
+                              producer=f"{stat_type} index",
+                              expected_text=index_text))
+    return outputs
 
 
-def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list[str]:
-    """Extract stat-type-based bucket outputs from the 3dDeconvolve bucket dataset.
+# ---------------------------------------------------------------------------
+# Stat bucket extraction
+# ---------------------------------------------------------------------------
 
-    For each stat type in config.stat_buckets, this function:
-    1. Discovers all sub-bricks matching that stat type via 3dinfo -subbrick_info.
-    2. Extracts them into a single multi-sub-brick NIfTI via 3dbucket.
-    3. Writes a JSON index mapping condition/contrast labels to sub-brick indices.
-    4. When template_path is available and not 'WB', writes a parcellated CSV
-       (rows = conditions/contrasts, columns = ROIs).
+def extract_stat_bucket_niftis(io, bucket_path, stat_types, ext, token, logger):
+    """Extract stat-type-specific NIfTI buckets from the full bucket stats dataset.
 
-    For Zstat: finds Tstat sub-bricks, converts each to Z via 3dcalc fitt_t2z(),
-    then assembles the Z volumes into the bucket.
+    Each extracted sub-brick is keyed by its exact ``3dinfo -label`` label
+    (e.g. ``"ave_negface_GLT#0_Coef"``, ``"Full_Fstat"``); a Zstat bucket
+    reuses the matching Tstat label with the trailing "Tstat" replaced by
+    "Zstat". A label belongs to stat type S when it ends with "_" + S.
 
     Parameters
     ----------
-    config : ResolvedConfig
-        Must include: out_dir, out_file_pre, stat_buckets, extract_out_file_pre,
-        template_path, average_type, extract_resids.
+    io : StepIO
+    bucket_path : str
+        Absolute path to the source bucket stats NIfTI (in out_dir).
+    stat_types : list of str
+    ext : str
+        extract_out_file_pre.
+    token : str
+        Smoothing token ("" for unsmoothed).
     logger : logging.Logger
 
     Returns
     -------
-    list[str]
-        Paths of all output files created.
+    (list of Output, dict)
+        Outputs and a dict {stat: [(key, orig_idx)]} matched sub-bricks.
     """
-    bucket_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"
-    output_files = []
+    outputs = []
+    matched_all = {}
 
-    bucket_info = run_afni_command(
-        ['3dinfo', '-subbrick_info', bucket_path],
+    info = run_afni_command(
+        ["3dinfo", "-label", bucket_path],
         capture_output=True,
-        description="3dinfo subbrick_info for stat bucket extraction",
-        logger=logger,
+        description="3dinfo label for stat bucket extraction",
+        logger=logger, cwd=io.staging,
     )
-    bucket_split = bucket_info.split()
+    labels = [l.strip() for l in info.strip().split("|") if l.strip()]
 
-    available_stats = set()
-    for token in bucket_split:
-        for st in ("Coef", "Tstat", "Fstat", "R^2"):
-            if st in token:
-                available_stats.add(st)
-    if any("Tstat" in token for token in bucket_split):
-        available_stats.add("Zstat")
-    logger.info("Available stat types in bucket: %s", sorted(available_stats))
-
-    for stat_type in config.stat_buckets:
+    for stat_type in stat_types:
         search_stat = "Tstat" if stat_type == "Zstat" else stat_type
         need_t2z = (stat_type == "Zstat")
+        suffix = f"_{search_stat}"
 
         matched = []
-        for i, token in enumerate(bucket_split):
-            if search_stat in token and "#" in token:
-                label_part = token.split("#")[0]
-                try:
-                    idx = int(bucket_split[i - 1][1:])
-                    matched.append((label_part, idx))
-                except (ValueError, IndexError):
-                    continue
+        for idx, label in enumerate(labels):
+            if label.endswith(suffix):
+                key = label[: -len(search_stat)] + "Zstat" if need_t2z else label
+                matched.append((key, idx))
 
         if not matched:
             logger.warning(
                 "No sub-bricks found for stat type '%s' in %s. Skipping.",
-                stat_type, bucket_path)
+                stat_type, bucket_path,
+            )
             continue
 
-        logger.info("Found %d sub-bricks for stat type '%s': %s",
-                    len(matched), stat_type, [m[0] for m in matched])
+        bucket_out_rel = names.stat_bucket(ext, stat_type, token)
 
-        bucket_out = os.path.join(
-            config.out_dir,
-            f"{config.extract_out_file_pre}_{stat_type}_bucket.nii.gz")
-        index_out = os.path.join(
-            config.out_dir,
-            f"{config.extract_out_file_pre}_{stat_type}_index.json")
+        if need_t2z:
+            stataux = _get_stataux(bucket_path, logger=logger)
+            z_vols = []
+            for i, (key, idx) in enumerate(matched):
+                aux_params = stataux.get(idx, [])
+                if not aux_params:
+                    raise GuardError(
+                        f"Could not retrieve DOF for sub-brick {idx} ({key}) "
+                        f"in {bucket_path}; cannot convert T to Z."
+                    )
+                dof = int(aux_params[0])
+                z_tmp_rel = f"_zconv_tmp_{i}.nii.gz"
+                run_afni_command(
+                    ["3dcalc", "-a", f"{bucket_path}[{idx}]",
+                     "-expr", f"fitt_t2z(a,{dof})",
+                     "-prefix", io.path(z_tmp_rel)],
+                    description=f"T-to-Z conversion for {key}",
+                    logger=logger, cwd=io.staging,
+                )
+                z_vols.append(io.path(z_tmp_rel))
 
-        if not os.path.exists(bucket_out):
-            if need_t2z:
-                z_vols = []
-                for label, idx in matched:
-                    aux_params = _get_subbrik_stat_aux(bucket_path, idx, logger=logger)
-                    if not aux_params:
-                        raise GuardError(
-                            f"Could not retrieve DOF for sub-brick {idx} ({label}) in "
-                            f"{bucket_path}; cannot convert T to Z.")
-                    dof = int(aux_params[0])
-                    z_tmp = os.path.join(
-                        config.out_dir,
-                        f"{config.out_file_pre}_{label}_zconv_tmp.nii.gz")
-                    run_afni_command(
-                        ["3dcalc", "-a", f"{bucket_path}[{idx}]",
-                         "-expr", f"fitt_t2z(a,{dof})",
-                         "-prefix", z_tmp],
-                        description=f"T-to-Z conversion for {label}",
-                        logger=logger)
-                    z_vols.append(z_tmp)
-
-                bucket_cmd = ["3dbucket", "-prefix", bucket_out] + z_vols
-                run_afni_command(bucket_cmd,
-                    description=f"3dbucket assemble {stat_type} bucket",
-                    logger=logger)
-
-                for zv in z_vols:
-                    if os.path.exists(zv):
-                        os.remove(zv)
-            else:
-                sub_brik_selectors = [f"{bucket_path}[{idx}]" for _, idx in matched]
-                bucket_cmd = ["3dbucket", "-prefix", bucket_out] + sub_brik_selectors
-                run_afni_command(bucket_cmd,
-                    description=f"3dbucket extract {stat_type} bucket",
-                    logger=logger)
-
-            if not os.path.exists(bucket_out):
-                raise ToolExecutionError(
-                    f"Failed to create {stat_type} bucket: {bucket_out}")
-            logger.info("Created %s bucket: %s", stat_type, bucket_out)
+            run_afni_command(
+                ["3dbucket", "-prefix", io.path(bucket_out_rel)] + z_vols,
+                description=f"3dbucket assemble {stat_type} bucket",
+                logger=logger, cwd=io.staging,
+            )
         else:
-            logger.info("%s bucket already exists: %s", stat_type, bucket_out)
+            selectors = [f"{bucket_path}[{idx}]" for _, idx in matched]
+            run_afni_command(
+                ["3dbucket", "-prefix", io.path(bucket_out_rel)] + selectors,
+                description=f"3dbucket extract {stat_type} bucket",
+                logger=logger, cwd=io.staging,
+            )
 
-        output_files.append(bucket_out)
+        outputs.append(Output(bucket_out_rel, "final", "nifti",
+                              producer=f"{stat_type} bucket extraction",
+                              expected_nvols=len(matched)))
+        matched_all[stat_type] = matched
 
-        index_map = {label: i for i, (label, _) in enumerate(matched)}
-        with open(index_out, "w") as f:
-            json.dump(index_map, f, indent=2)
-        output_files.append(index_out)
-        logger.info("Wrote %s index: %s", stat_type, index_out)
+    return outputs, matched_all
 
-        if config.template_path is not None and config.template_path != "WB":
-            csv_out = os.path.join(
-                config.out_dir,
-                f"{config.extract_out_file_pre}_{stat_type}_parcellated.csv")
-            if not os.path.exists(csv_out):
-                rows = {}
-                for new_idx, (label, _) in enumerate(matched):
-                    roi_df = extract_roi_stats(
-                        f"{bucket_out}[{new_idx}]",
-                        config.template_path, config.average_type, logger=logger)
-                    rows[label] = roi_df.iloc[0]
-                parcellated_df = pd.DataFrame(rows).T
-                parcellated_df.index.name = "condition"
-                parcellated_df.to_csv(csv_out)
-                logger.info("Wrote %s parcellated CSV: %s", stat_type, csv_out)
-            else:
-                logger.info("%s parcellated CSV already exists: %s", stat_type, csv_out)
-            output_files.append(csv_out)
 
-    if config.extract_resids:
-        resid_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_resids.nii.gz"
-        resid_csv = f"{config.out_dir}/{config.extract_out_file_pre}_resids.csv"
-        if not os.path.exists(resid_csv):
-            resid_df = extract_roi_stats(
-                resid_path, config.template_path, config.average_type, logger=logger)
-            resid_df.to_csv(resid_csv)
-            if os.path.exists(resid_csv):
-                logger.info("Extracted residuals to %s", resid_csv)
-            else:
-                raise ToolExecutionError("Could not extract residuals using ROI template.")
-        output_files.append(resid_csv)
+def stat_bucket_parcellations(io, ext, matched, bucket_out_paths, template,
+                               average_type, roi_zero_handling, logger):
+    """Write parcellated CSVs for each extracted stat bucket.
 
-    return output_files
+    Parameters
+    ----------
+    io : StepIO
+    ext : str
+    matched : dict
+        {stat: [(label, orig_idx)]}
+    bucket_out_paths : dict
+        {stat: absolute path to the extracted bucket NIfTI}
+    template : str or None
+    average_type, roi_zero_handling : str
+    logger : logging.Logger
 
-def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLevelResult:
-    """Validate config and execute the task activation pipeline.
+    Returns
+    -------
+    list of Output
+    """
+    outputs = []
+    for stat_type, items in matched.items():
+        if template is not None:
+            csv_rel = names.stat_parcellated(ext, stat_type)
+            bucket_path = bucket_out_paths[stat_type]
+            rows = {}
+            for new_idx, (label, _) in enumerate(items):
+                roi_df = roi.extract_roi_stats(
+                    f"{bucket_path}[{new_idx}]", template, average_type,
+                    roi_zero_handling, logger, cwd=io.staging,
+                )
+                rows[label] = roi_df.iloc[0]
+            parcellated_df = pd.DataFrame(rows).T
+            parcellated_df.index.name = "condition"
+            csv_text = parcellated_df.to_csv()
+            with open(io.path(csv_rel), "w", newline="") as f:
+                f.write(csv_text)
+            outputs.append(Output(csv_rel, "final", "py_text",
+                                  producer=f"{stat_type} parcellation",
+                                  expected_text=csv_text))
 
-    Orchestrates the full task_act pipeline in the following order:
-    1. Validate contrast and extraction arguments.
-    2. Optionally clear out_dir (if remove_previous is set).
-    3. Validate extraction and connectivity template options.
-    4. Optionally extract pre-regression parcellated time series (extract_raw_ptseries).
-    5. Extract minimum-outlier EPI frame (gen_min_outlier_epi; mandatory).
-    6. Generate motion censor file from motion_path and fd_threshold.
-    7. Prepare motion regressors (truncate to required columns).
-    8. Read and validate stimulus timing data (read_stim_data).
-    9. Check per-condition trial survival after censoring.
-    10. Warn for conditions with few surviving trials (TRIALS_FEW).
-    11. Filter conditions with fewer than 2 surviving trials (warn COND_DROPPED and drop).
-    12. Drop contrasts/extractions that reference dropped conditions (warn CONTRAST_DROPPED / EXTRACT_DROPPED).
-    13. Write per-condition AFNI onset files (write_stim_onset_files).
-    14. Pre-flight DOF check.
-    15. Warn if overall censoring rate exceeds CENSOR_HIGH_THRESHOLD (CENSOR_HIGH).
-    16. Run 3dDeconvolve GLM (run_first_level).
-    17. Optionally extract stat-type-based bucket outputs (extract_stat_buckets).
-    18. Write QC summary JSON.
-    19. Return FirstLevelResult with status, warnings, qc_summary, and output_files.
+    return outputs
 
-    Works from the config-driven dispatch runner
-    (run_first_level.py / DISPATCH["task_act"]).
+
+# ---------------------------------------------------------------------------
+# Expected-path enumeration
+# ---------------------------------------------------------------------------
+
+def task_act_expected(config, runsets, conditions):
+    """Enumerate every final output and deterministic intermediate for task_act.
+
+    Returns
+    -------
+    set of str
+    """
+    pre = config.out_file_pre
+    expected = set()
+    s_pre = runsets.s_pre
+    s_final = runsets.s_final
+    k_sup = runsets.k_supplied
+
+    expected.add(names.ledger(pre))
+    expected.add(names.qc_summary(pre))
+    expected.add(names.bucket_stats(pre))
+    expected.add(names.bucket_resids(pre))
+    expected.add(names.bucket_stats_index(pre))
+
+    for lbl in s_final:
+        expected.add(names.min_outlier_epi(pre, None if k_sup == 1 else lbl))
+
+    if config.scale_to_psc:
+        for lbl in s_pre:
+            expected.add(names.run_mean(pre, None if k_sup == 1 else lbl))
+            expected.add(names.run_psc(pre, None if k_sup == 1 else lbl))
+        if k_sup > 1:
+            expected.add(names.psc_concat(pre))
+
+    if runsets.input_mode == "A" and k_sup > 1:
+        expected.add(names.concat_scan(pre))
+
+    if runsets.k_model > 1:
+        expected.add(names.run_intersect_mask(pre))
+
+    if config.template_path is not None:
+        expected.add(names.template_resampled(pre, config.template_path))
+
+    if config.extract_raw_ptseries and config.extract_out_file_pre:
+        ext = config.extract_out_file_pre
+        expected.add(names.raw_ptseries(ext, None))
+        if config.scale_to_psc:
+            expected.add(names.raw_psc_ptseries(ext, None))
+
+    if config.stat_buckets and config.extract_out_file_pre:
+        ext = config.extract_out_file_pre
+        for stat in config.stat_buckets:
+            expected.add(names.stat_bucket(ext, stat))
+            expected.add(names.stat_index(ext, stat))
+            if config.template_path is not None:
+                expected.add(names.stat_parcellated(ext, stat))
+
+    if config.extract_resids and config.extract_out_file_pre:
+        expected.add(names.resids_csv(config.extract_out_file_pre))
+
+    for cond in conditions:
+        expected.add(names.onset_file(pre, cond))
+
+    expected.add(names.censor(pre, None))
+    for sf in names.censor_side_files(pre, None):
+        expected.add(sf)
+    expected.add(names.motion_prepared(pre, None))
+    for tissue in ("CSF", "WM"):
+        path_attr = f"{tissue}_path" if runsets.input_mode == "B" else f"{tissue}_paths"
+        if getattr(config, path_attr, None) is not None:
+            expected.add(names.tissue_prepared(pre, tissue))
+            if config.use_tissue_derivs:
+                expected.add(names.tissue_deriv(pre, tissue, None))
+
+    expected.add(names.preflight_dmat(pre))
+    expected.add(names.estimability_dmat(pre))
+
+    if config.smoothing_enabled:
+        token = names.smoothing_token(config.smoothing_fwhm)
+        expected.add(names.smoothing_mask(pre))
+        for lbl in s_pre:
+            expected.add(names.blurred_run(pre, None if k_sup == 1 else lbl, token))
+            if config.scale_to_psc:
+                expected.add(names.blurred_psc_run(pre, None if k_sup == 1 else lbl, token))
+        if k_sup > 1:
+            expected.add(names.blurred_concat(pre, token, config.scale_to_psc))
+        expected.add(names.bucket_stats(pre, token))
+        expected.add(names.bucket_resids(pre, token))
+        expected.add(names.bucket_stats_index(pre, token))
+        if config.stat_buckets and config.extract_out_file_pre:
+            ext = config.extract_out_file_pre
+            for stat in config.stat_buckets:
+                expected.add(names.stat_bucket(ext, stat, token))
+                expected.add(names.stat_index(ext, stat, token))
+
+    return expected
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def run(config, logger=None):
+    """Run the task activation first-level pipeline.
+
+    On failure, the error is recorded in {pre}_qc_summary.json (run_status)
+    and the exception is re-raised.
 
     Parameters
     ----------
     config : ResolvedConfig
-        All pipeline parameters (see first_level_config.py ResolvedConfig for
-        the full attribute list).
-    logger : logging.Logger or None, optional
-        Logger instance. A default logger is created if None is provided.
+    logger : logging.Logger, optional
 
     Returns
     -------
     FirstLevelResult
-        Structured result with status ('success' or 'warning'),
-        output_dir, accumulated graded warnings, qc_summary dict, and
-        list of output file paths.
-
-    Raises
-    ------
-    ConfigError
-        On invalid or incompatible configuration options.
-    InputError
-        If an expected output file is not found after a write step.
-    ModelError
-        If all conditions are dropped due to insufficient surviving trials.
-    ToolExecutionError
-        If an AFNI command fails or does not produce its expected output.
-    GuardError
-        If a pipeline invariant is violated (e.g. unexpected sub-brick state).
     """
     if logger is None:
         logger = setup_logging("task_act_first_level")
+    return run_with_status("task_act", config, logger, _run)
+
+
+def _run(config, logger, tracker):
+    """Pipeline body; see run()."""
 
     config = copy.copy(config)
     clear_warnings()
+    tracker.step = "task-act-runtime-check"
+    versions = runtime_check(logger)
+    tracker.versions = versions
 
-    logger.info("First-level regression will use the following task conditions: %s", config.cond_labels)
-    logger.info("All other task conditions will not be modeled.")
+    # Contrast checks
+    tracker.step = "task-act-contrast-validation"
+    if config.contrast_functions:
+        parsed_contrasts = valid_contrast_functions(
+            config.contrast_functions, config.contrast_labels,
+            config.cond_labels, logger=logger,
+        )
+    else:
+        parsed_contrasts = None
+
+    tracker.step = "task-act-run-sets"
+    runsets = build_runsets(config, "task_act", logger)
+    ctx = RunContext(config, "task_act", logger, versions, runsets.grid_ref, tracker=tracker)
+    ctx.start()
+
     log_hrf_model(config.hrf_model, config.custom_hrf, logger)
-    log_nuisance_model(config.CSF_path, config.WM_path, logger, use_tissue_derivs=config.use_tissue_derivs)
+    log_nuisance_model(config.CSF_path, config.WM_path, logger, config.use_tissue_derivs)
 
-    # Contrast-related checks
-    if config.contrast_labels is not None:
-        if config.contrast_functions is None:
-            raise ConfigError("contrast_functions must exist if contrast_labels exist.")
-    else:
-        if config.contrast_functions is not None:
-            raise ConfigError("contrast_labels must exist if contrast_functions exist.")
-    if config.contrast_functions is not None and config.contrast_labels is not None:
-        config.contrast_functions = valid_contrast_functions(
-            config.contrast_functions, config.contrast_labels, config.cond_labels, logger=logger
-        )
+    pre = config.out_file_pre
 
-    # If remove_previous is provided, clear-out the output dir (before template
-    # resampling or any other file creation in out_dir)
-    if config.remove_previous:
-        logger.info("Removing all files from previous analyses in %s (if they exist).", config.out_dir)
-        remove_files_from_dir(config.out_dir, logger=logger)
-
-    # Check if the user wants to extract stat buckets
-    if config.stat_buckets:
-        if config.extract_out_file_pre is None:
-            raise ConfigError(
-                "extract_out_file_pre must be set when stat_buckets is specified."
-            )
-        logger.info("Stat bucket extraction requested for types: %s", config.stat_buckets)
-
-        if config.template_path is None:
-            config.template_path = "WB"
-            logger.info("No template was provided; stat buckets will be NIfTI-only (no parcellated CSV).")
-            if config.extract_resids:
-                raise ConfigError("extract_resids is only valid when template_path is provided and valid.")
-        else:
-            config.template_path = validate_template(
-                config.scan_path, config.template_path, config.out_dir,
-                config.force_diff_atlas, conn_type="extract", logger=logger
-            )
-            if config.average_type is None:
-                raise ConfigError("average_type is required when stat_buckets is specified and template_path is valid.")
-            logger.info("Parcellated CSVs will be extracted based on %s.", config.template_path)
-    else:
-        logger.info("No stat bucket extraction requested.")
-
-    # Extract pre-regression parcellated time series if requested
-    if getattr(config, 'extract_raw_ptseries', False):
-        if config.extract_out_file_pre is None:
-            raise ConfigError("extract_raw_ptseries requires extract_out_file_pre to be set.")
-        raw_out = os.path.join(config.out_dir, f"{config.extract_out_file_pre}_raw_ptseries.csv")
-        if not os.path.exists(raw_out):
-            if config.template_path is None or config.template_path == "WB":
-                raise ConfigError("extract_raw_ptseries requires a valid template_path (not whole-brain).")
-            # Validate template if not already validated by the extract block above
-            validated_tpl = validate_template(
-                config.scan_path, config.template_path,
-                config.out_dir, config.force_diff_atlas, conn_type="extract", logger=logger
-            )
-            raw_df = extract_roi_stats(config.scan_path, validated_tpl, config.average_type, logger=logger)
-            raw_df.to_csv(raw_out)
-            if os.path.exists(raw_out):
-                logger.info("Extracted raw (pre-regression) ptseries to %s.", raw_out)
-            else:
-                raise InputError("Failed to extract raw ptseries.")
-        else:
-            logger.info("Raw ptseries already exists: %s", raw_out)
-
-    # ---------------------------------
-
-    # Extract minimum-outlier representative EPI frame (mandatory, before regression)
-    gen_min_outlier_epi(config.scan_path, config.out_dir, config.out_file_pre, "", logger)
-
-    # PSC scaling (after min-outlier EPI, before regression)
-    if config.scale_to_psc:
-        psc_path = scale_to_psc(
-            config.scan_path, config.out_dir, config.out_file_pre, "", logger)
-        config.scan_path = psc_path
-
-    # Generate censor file from motion regressors (before prepare_motion_file overwrites path)
-    config.censor_path = create_censor_file(
-        config.motion_path, config.fd_threshold, config.censor_prev_tr,
-        config.out_dir, config.out_file_pre, "concat", logger)
-
-    # Validate and prepare motion regressors
-    use_cols = 12 if config.include_motion_derivs else 6
-    config.motion_path = prepare_motion_file(
-        config.motion_path, use_cols, config.out_dir, config.out_file_pre, "concat", logger)
-
-    # Read and validate stimulus timing data (no file I/O yet)
-    stim_data = read_stim_data(config, logger)
-
-    # Per-condition trial survival QC
-    trial_survival = check_trial_survival(stim_data, config.cond_labels, config.censor_path, config.tr, logger)
-
-    # Warn for conditions with few but sufficient surviving trials
-    for cond, n_surv in trial_survival.items():
-        if 2 <= n_surv < _TRIALS_FEW_THRESHOLD:
-            graded_warning(
-                logger, 'medium', 'TRIALS_FEW',
-                f"Condition '{cond}' has only {n_surv} surviving trial(s) after censoring "
-                f"(below advisory threshold of {_TRIALS_FEW_THRESHOLD}).",
-                user_facing=True,
-            )
-
-    # Filter conditions by survival (minimum 2 trials required for AFNI estimation)
-    original_conds = list(config.cond_labels)
-    config.cond_labels = [c for c in original_conds if trial_survival.get(c, 0) >= 2]
-    dropped_conds = [c for c in original_conds if c not in config.cond_labels]
-
-    if dropped_conds:
-        graded_warning(
-            logger, 'medium', 'COND_DROPPED',
-            f"Conditions with insufficient surviving trials (< 2) dropped: {dropped_conds}",
-            user_facing=True,
-        )
-
-    if not config.cond_labels:
-        raise ModelError("No task conditions have sufficient surviving trials. Analysis aborted.")
-
-    # Update contrast functions if any conditions were dropped
-    if config.contrast_functions and dropped_conds:
-        valid_contrasts = []
-        valid_labels = []
-        for i, cont in enumerate(config.contrast_functions):
-            if any(c in dropped_conds for c in cont["CONDS"]):
-                graded_warning(
-                    logger, 'medium', 'CONTRAST_DROPPED',
-                    f"Contrast '{config.contrast_labels[i]}' depends on dropped conditions "
-                    f"{[c for c in cont['CONDS'] if c in dropped_conds]} and will be skipped.",
-                    user_facing=True,
-                )
-            else:
-                valid_contrasts.append(cont)
-                valid_labels.append(config.contrast_labels[i])
-        config.contrast_functions = valid_contrasts
-        config.contrast_labels = valid_labels
-
-    # Write onset files now that cond_labels reflects only surviving conditions
-    write_stim_onset_files(stim_data, config, logger)
-
-    # Pre-flight DOF check
-    n_regressors = use_cols + len(config.cond_labels)
-    if config.CSF_path is not None:
-        n_regressors += 1
-    if config.WM_path is not None:
-        n_regressors += 1
-    if config.use_tissue_derivs:
-        if config.CSF_path is not None:
-            n_regressors += 1
-        if config.WM_path is not None:
-            n_regressors += 1
-    dof = compute_dof(config.censor_path, n_regressors, logger, tr=config.tr)
-
-    # Build QC summary data
-    qc_data = {
-        "analysis_type": "task_act",
-        "hrf_model": config.hrf_model if config.hrf_model != "custom" else f"custom ({config.custom_hrf})",
-        "fd_threshold": config.fd_threshold,
-        "censor_prev_tr": config.censor_prev_tr,
-    }
-    try:
-        censor_data = np.loadtxt(config.censor_path)
-        qc_data["n_trs_total"] = len(censor_data)
-        qc_data["n_trs_censored"] = int(np.sum(censor_data == 0))
-        qc_data["pct_censored"] = round(100.0 * qc_data["n_trs_censored"] / qc_data["n_trs_total"], 2) if qc_data["n_trs_total"] > 0 else 0.0
-    except Exception:
-        pass
-    qc_data["per_condition_trial_counts"] = {c: int(len(stim_data[stim_data['trial_type'] == c])) for c in config.cond_labels}
-    qc_data["per_condition_surviving_trials"] = trial_survival
-    qc_data["dof"] = dof
-
-    # Warn if censoring rate exceeds the high threshold
-    if qc_data.get("pct_censored", 0.0) > CENSOR_HIGH_THRESHOLD:
-        graded_warning(
-            logger, 'high', 'CENSOR_HIGH',
-            f"Censoring rate ({qc_data['pct_censored']:.1f}%) exceeds the {CENSOR_HIGH_THRESHOLD}% threshold.",
-            user_facing=True,
-        )
-
-    # Run activation first-level analysis
-    run_first_level(stim_data, config, logger)
-
-    # Generate bucket stats sub-brick index
-    bucket_stats_index_path = generate_bucket_stats_index(config, logger)
-
-    # Run stat bucket extraction if indicated
-    extraction_files = []
-    if config.stat_buckets:
-        extraction_files = extract_stat_buckets(config, logger)
-
-    # Write QC summary
-    write_qc_summary(config.out_dir, config.out_file_pre, qc_data, logger)
-
-    # Collect output file paths
-    output_files: list[str] = []
-    psc_out = os.path.join(config.out_dir, f"{config.out_file_pre}_psc.nii.gz")
-    if os.path.exists(psc_out):
-        output_files.append(psc_out)
-    bucket_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_stats.nii.gz"
-    resids_path = f"{config.out_dir}/{config.out_file_pre}_concat_bucket_resids.nii.gz"
-    if os.path.exists(bucket_path):
-        output_files.append(bucket_path)
-    if os.path.exists(resids_path):
-        output_files.append(resids_path)
-    if os.path.exists(bucket_stats_index_path):
-        output_files.append(bucket_stats_index_path)
-    output_files.extend(extraction_files)
-    qc_path = os.path.join(config.out_dir, f"{config.out_file_pre}_qc_summary.json")
-    if os.path.exists(qc_path):
-        output_files.append(qc_path)
-
-    # Determine overall result status
-    status = "warning" if any(w.get("severity") == "high" for w in get_warnings()) else "success"
-
-    return FirstLevelResult(
-        status=status,
-        output_dir=Path(config.out_dir),
-        warnings=get_warnings(),
-        qc_summary=qc_data,
-        output_files=output_files,
+    # Template checks
+    template_used = config.template_path is not None and (
+        (config.stat_buckets and config.extract_out_file_pre)
+        or config.extract_resids
+        or config.extract_raw_ptseries
     )
+    same_grid = None
+    if template_used:
+        tracker.step = "task-act-template-check"
+        same_grid = roi.check_template(
+            config.template_path, runsets.grid_ref, config.force_diff_atlas,
+            {"extract"}, logger,
+        )
+
+    # Step: task-act-events
+    def _events_step(io):
+        event_table, check = events.build_event_table(
+            config, runsets, config.cond_labels,
+        )
+        if check.violations:
+            record = events.timing_record("task_act", runsets.input_mode, config.tr, check)
+            text = json.dumps(record, indent=2) + "\n"
+            rel = names.timing_errors(pre)
+            with open(io.path(rel), "w", newline="") as f:
+                f.write(text)
+            msg = events.timing_error_message(record, rel)
+            return Outcome(
+                outputs=[Output(rel, "final", "py_text",
+                               producer="timing error record",
+                               expected_text=text)],
+                deferred_error=InputError(msg, context=record),
+            )
+        ctx._event_table = event_table
+        return Outcome(outputs=[])
+
+    ctx.run_step("task-act-events", _events_step)
+    event_table = ctx._event_table
+
+    # Step: task-act-nuisance
+    def _nuisance_step(io):
+        outcome, state = nuisance.task_nuisance(io, config, runsets, logger)
+        ctx._nuisance_state = state
+        return outcome
+
+    ctx.run_step("task-act-nuisance", _nuisance_step)
+    nuisance_state = ctx._nuisance_state
+    s_pre = runsets.s_pre
+
+    # Step: task-act-estimability
+    def _estimability_step(io):
+        onset_specs = []
+        run_df = event_table.for_runs(s_pre).df
+        married = needs_married_timing(config.hrf_model, config.custom_hrf)
+        for cond in config.cond_labels:
+            rows = events.onset_rows(event_table, [cond], list(s_pre))
+            text = events.onset_file_text(rows, married)
+            tmp_rel = f"_tmp_onset_{cond}.txt"
+            with open(io.path(tmp_rel), "w", newline="") as f:
+                f.write(text)
+
+            hrf = hrf_for_durations(
+                config.hrf_model, config.custom_hrf,
+                run_df.loc[run_df["condition"] == cond, "duration"],
+            )
+
+            onset_specs.append((cond, io.path(tmp_rel), hrf))
+
+        matrix, header = estimability.estimability_dry_run(
+            io, config, runsets, onset_specs, logger,
+        )
+
+        # Load censor vector
+        censor_path = f"{config.out_dir}/{names.censor(pre, None)}"
+        censor_vec = np.loadtxt(censor_path, dtype=int).ravel()
+
+        all_column_order = []
+        all_fvalues = []
+        afni_version = ctx.versions.get("afni_version")
+        for cond in config.cond_labels:
+            # Trials in this condition's onset-file order (same source as the file).
+            cond_rows = events.onset_rows_labeled(event_table, [cond], list(s_pre))
+            cond_order = [
+                (c, lbl, onset)
+                for i, lbl in enumerate(s_pre)
+                for (c, onset, _) in cond_rows[i]
+            ]
+            if not cond_order:
+                # No trials in the model runs: no IM columns may exist for it.
+                try:
+                    stray = estimability.im_columns(header, cond)
+                except ToolExecutionError:
+                    stray = []
+                if stray:
+                    raise GuardError(
+                        f"Condition '{cond}' has no trials in the model runs but "
+                        f"the design matrix has {len(stray)} IM column(s) for it."
+                    )
+                continue
+
+            cols = estimability.im_columns(header, cond)
+            # One (f, reason) per trial, pooled over the trial's basis columns
+            # when the HRF has more than one column per trial.
+            fvals = estimability.trial_estimability(
+                matrix, cols, censor_vec, len(cond_order),
+            )
+            estimability.check_im_order(matrix, cols, cond_order, afni_version)
+
+            all_column_order.extend(cond_order)
+            all_fvalues.extend(fvals)
+
+        trials = estimability.build_trials(
+            event_table, config.cond_labels, s_pre, runsets.supplied,
+            all_column_order, all_fvalues, "task_act",
+        )
+        trial_counts, surviving, run_counts = estimability.survival_summary(
+            trials, config.cond_labels,
+        )
+        kept_conditions, kept_contrasts, kept_labels, _ = estimability.apply_floor(
+            "task_act", config.cond_labels, surviving,
+            parsed_contrasts, config.contrast_labels, logger,
+        )
+        config.cond_labels = kept_conditions
+        config.contrast_functions = (
+            [f"{'+'.join(f'{c}*{cd}' for c, cd in zip(con['COEFS'], con['CONDS']))}"
+             for con in kept_contrasts] if kept_contrasts else None
+        )
+        config.contrast_labels = kept_labels
+        ctx._kept_contrasts = kept_contrasts
+
+        reml = collect_reml_cmds(io.staging, pre, "task-act-estimability")
+        outputs = [Output(names.estimability_dmat(pre), "intermediate", "x1d",
+                          producer="estimability dry run")]
+        for rel, kind in reml:
+            outputs.append(Output(rel, "intermediate", kind, producer="REML_cmd"))
+
+        qc_frag = {
+            "trials": trials,
+            "per_condition_trial_counts": trial_counts,
+            "per_condition_surviving_trials": surviving,
+            "per_condition_run_counts": run_counts,
+        }
+        return Outcome(outputs=outputs, qc=qc_frag)
+
+    ctx.run_step("task-act-estimability", _estimability_step)
+
+    # Step: task-act-onsets
+    def _onsets_step(io):
+        outputs = []
+        married = needs_married_timing(config.hrf_model, config.custom_hrf)
+        for cond in config.cond_labels:
+            rows = events.onset_rows(event_table, [cond], list(s_pre))
+            text = events.onset_file_text(rows, married)
+            rel = names.onset_file(pre, cond)
+            with open(io.path(rel), "w", newline="") as f:
+                f.write(text)
+            outputs.append(Output(rel, "intermediate", "py_text",
+                                  producer="onset file", expected_text=text))
+        return Outcome(outputs=outputs)
+
+    ctx.run_step("task-act-onsets", _onsets_step)
+
+    # Step: task-act-preflight
+    def _preflight_step(io):
+        onset_files = [
+            (cond, f"{config.out_dir}/{names.onset_file(pre, cond)}")
+            for cond in config.cond_labels
+        ]
+        ortvecs = nuisance.task_ortvecs(nuisance_state, config.out_dir)
+
+        censor_path = f"{config.out_dir}/{names.censor(pre, None)}"
+        motion_path = f"{config.out_dir}/{nuisance_state['motion_rel']}"
+
+        dof = estimability.task_act_preflight_dof(
+            io, config, runsets, onset_files, censor_path, motion_path,
+            ortvecs, event_table, logger,
+        )
+
+        reml = collect_reml_cmds(io.staging, pre, "task-act-preflight")
+        outputs = [Output(names.preflight_dmat(pre), "intermediate", "x1d",
+                          producer="preflight dry run")]
+        for rel, kind in reml:
+            outputs.append(Output(rel, "intermediate", kind, producer="REML_cmd"))
+
+        return Outcome(outputs=outputs, qc={"dof": dof})
+
+    ctx.run_step("task-act-preflight", _preflight_step)
+
+    # Ledgered stage: task-act-template
+    template_resolved = config.template_path
+    if template_used:
+        template_resolved = roi.template_stage(
+            ctx, config, runsets, pre, same_grid, "task-act", logger,
+        )
+
+    # Ledgered stage: task-act-prep
+    prep_spec = StageSpec(
+        label="task-act-prep",
+        fields=("scan_path", "scan_paths", "run_lengths", "run_labels", "scale_to_psc"),
+        derived_values={"s_pre": list(s_pre)},
+    )
+
+    def _prep_stage(io):
+        return prep.task_prep(io, config, runsets, logger)
+
+    ctx.run_stage(prep_spec, _prep_stage)
+
+    # Set S_final (= S_pre for task_act; no model-estimation failures per run)
+    runsets.set_s_final(s_pre)
+    s_final = runsets.s_final
+
+    # Ledgered stage: task-act-min-outlier-epi
+    moe_spec = StageSpec(
+        label="task-act-min-outlier-epi",
+        fields=("scan_path", "scan_paths", "run_lengths", "run_labels"),
+        derived_values={"s_final": list(s_final)},
+    )
+
+    def _moe_stage(io):
+        outputs = []
+        for lbl in s_final:
+            ri = runsets.run(lbl)
+            out_rel = names.min_outlier_epi(pre, None if runsets.k_supplied == 1 else lbl)
+            gen_min_outlier_epi(
+                ri.source_path, ri.start, ri.n_vols, io.path(out_rel), logger,
+                cwd=io.staging,
+            )
+            outputs.append(Output(out_rel, "final", "nifti",
+                                  producer="min-outlier EPI", expected_nvols=1))
+        return Outcome(outputs=outputs)
+
+    ctx.run_stage(moe_spec, _moe_stage)
+
+    # Ledgered stage: task-act-raw-ptseries
+    if config.extract_raw_ptseries and template_used:
+        raw_spec = StageSpec(
+            label="task-act-raw-ptseries",
+            fields=("extract_raw_ptseries", "extract_out_file_pre", "template_path",
+                    "average_type", "roi_zero_handling", "scan_path", "scan_paths",
+                    "run_labels", "scale_to_psc"),
+            derived_values={"s_pre": list(s_pre), "template_resolved": template_resolved},
+            upstream=("task-act-prep", "task-act-template"),
+        )
+
+        def _raw_ptseries_stage(io):
+            return prep.task_raw_ptseries(io, config, runsets, template_resolved, logger)
+
+        ctx.run_stage(raw_spec, _raw_ptseries_stage)
+
+    def _run_glm(io, token, stage_label, description, producer):
+        """Run the 3dDeconvolve GLM (unsmoothed when token is None) and
+        return (outputs, bucket_stats_rel)."""
+        model_input = prep.task_model_input(config, runsets, config.out_dir, token)
+        mask_path = prep.task_mask_path(config, runsets, config.out_dir)
+        censor_path = f"{config.out_dir}/{names.censor(pre, None)}"
+        motion_path = f"{config.out_dir}/{nuisance_state['motion_rel']}"
+
+        ortvecs = nuisance.task_ortvecs(nuisance_state, config.out_dir)
+
+        cmd = build_decon_base_command(
+            model_input, censor_path, motion_path, ortvecs,
+            runsets.run_starts(s_pre), mask_path, config.tr,
+        )
+        cmd.extend(["-num_stimts", str(len(config.cond_labels))])
+
+        run_df = event_table.for_runs(s_pre).df
+        married = needs_married_timing(config.hrf_model, config.custom_hrf)
+        stim_flag = "-stim_times_AM1" if married else "-stim_times"
+        for k, cond in enumerate(config.cond_labels, 1):
+            onset_path = f"{config.out_dir}/{names.onset_file(pre, cond)}"
+            hrf = hrf_for_durations(
+                config.hrf_model, config.custom_hrf,
+                run_df.loc[run_df["condition"] == cond, "duration"],
+            )
+            cmd.extend([stim_flag, str(k), onset_path, hrf, "-stim_label", str(k), cond])
+
+        cmd.extend(gltsym_args(getattr(ctx, "_kept_contrasts", None), config.contrast_labels))
+
+        bucket_stats_rel = names.bucket_stats(pre, token)
+        bucket_resids_rel = names.bucket_resids(pre, token)
+        cmd.extend([
+            "-errts", io.path(bucket_resids_rel),
+            "-fout", "-rout", "-tout",
+            "-bucket", io.path(bucket_stats_rel),
+            "-jobs", str(config.num_cores),
+        ])
+
+        run_afni_command(cmd, description=description, logger=logger, cwd=io.staging)
+
+        reml = collect_reml_cmds(io.staging, pre, stage_label)
+        outputs = [
+            Output(bucket_stats_rel, "final", "nifti", producer=producer),
+            Output(bucket_resids_rel, "final", "nifti", producer=producer),
+        ]
+        for rel, kind in reml:
+            outputs.append(Output(rel, "intermediate", kind, producer="REML_cmd"))
+
+        index_out = generate_bucket_stats_index(
+            io, bucket_stats_rel, names.bucket_stats_index(pre, token), logger,
+        )
+        outputs.append(index_out)
+
+        return outputs, bucket_stats_rel
+
+    # Files the GLM passes to AFNI (censor, motion, onsets, tissue regressors
+    # and their derivatives); hashed so a content-only edit reruns the GLM.
+    glm_files = (
+        [f"{config.out_dir}/{names.censor(pre, None)}",
+         f"{config.out_dir}/{nuisance_state['motion_rel']}"]
+        + [f"{config.out_dir}/{names.onset_file(pre, c)}" for c in config.cond_labels]
+        + [f"{config.out_dir}/{nuisance_state['tissue_rel'][t]}"
+           for t in ("CSF", "WM") if t in nuisance_state["tissue_rel"]]
+        + [f"{config.out_dir}/{d}"
+           for t, d in sorted(nuisance_state.get("tissue_deriv_rel", {}).items())]
+    )
+
+    # Ledgered stage: task-act-glm
+    glm_spec = StageSpec(
+        label="task-act-glm",
+        fields=("scan_path", "scan_paths", "run_lengths", "run_labels", "tr",
+                "hrf_model", "custom_hrf", "cond_labels", "contrast_functions",
+                "contrast_labels", "task_timing_path", "task_timing_paths",
+                "motion_path", "motion_paths", "include_motion_derivs",
+                "fd_threshold", "censor_prev_tr", "CSF_path", "CSF_paths",
+                "WM_path", "WM_paths", "use_tissue_derivs"),
+        derived_files=tuple(glm_files),
+        derived_values={"s_pre": list(s_pre)},
+        upstream=("task-act-prep",),
+    )
+
+    def _glm_stage(io):
+        outputs, _ = _run_glm(io, None, "task-act-glm", "3dDeconvolve GLM", "3dDeconvolve GLM")
+        return Outcome(outputs=outputs)
+
+    ctx.run_stage(glm_spec, _glm_stage)
+
+    # Ledgered stage: task-act-extract
+    if config.stat_buckets or config.extract_resids:
+        extract_upstream = ["task-act-glm"]
+        if template_used:
+            extract_upstream.append("task-act-template")
+        extract_spec = StageSpec(
+            label="task-act-extract",
+            fields=("stat_buckets", "extract_resids", "extract_out_file_pre",
+                    "average_type", "roi_zero_handling", "template_path"),
+            derived_values={"template_resolved": template_resolved},
+            upstream=tuple(extract_upstream),
+        )
+
+        def _extract_stage(io):
+            outputs = []
+            bucket_path = f"{config.out_dir}/{names.bucket_stats(pre)}"
+
+            if config.stat_buckets:
+                stat_outs, matched = extract_stat_bucket_niftis(
+                    io, bucket_path, config.stat_buckets,
+                    config.extract_out_file_pre, "", logger,
+                )
+                outputs.extend(stat_outs)
+
+                idx_outs = write_stat_indexes(io, config.extract_out_file_pre, matched)
+                outputs.extend(idx_outs)
+
+                bucket_out_paths = {
+                    stat: io.path(names.stat_bucket(config.extract_out_file_pre, stat))
+                    for stat in matched
+                }
+                parcel_outs = stat_bucket_parcellations(
+                    io, config.extract_out_file_pre, matched, bucket_out_paths,
+                    template_resolved if config.template_path else None,
+                    config.average_type, config.roi_zero_handling, logger,
+                )
+                outputs.extend(parcel_outs)
+
+            if config.extract_resids:
+                resid_path = f"{config.out_dir}/{names.bucket_resids(pre)}"
+                resid_df = roi.extract_roi_stats(
+                    resid_path, template_resolved, config.average_type,
+                    config.roi_zero_handling, logger, cwd=io.staging,
+                )
+                csv_text = resid_df.to_csv()
+                rel = names.resids_csv(config.extract_out_file_pre)
+                with open(io.path(rel), "w", newline="") as f:
+                    f.write(csv_text)
+                outputs.append(Output(rel, "final", "py_text",
+                                      producer="residuals extraction",
+                                      expected_text=csv_text))
+
+            return Outcome(outputs=outputs)
+
+        ctx.run_stage(extract_spec, _extract_stage)
+
+    # Smoothing branch
+    if config.smoothing_enabled:
+        token = names.smoothing_token(config.smoothing_fwhm)
+
+        smooth_spec = StageSpec(
+            label="task-act-smooth",
+            fields=("smoothing_enabled", "smoothing_fwhm", "scan_path", "scan_paths",
+                    "run_lengths", "run_labels", "scale_to_psc"),
+            derived_values={"s_pre": list(s_pre)},
+            upstream=("task-act-prep",),
+        )
+
+        def _smooth_stage(io):
+            return smoothing.task_smooth(io, config, runsets, s_pre, pre, token, logger)
+
+        ctx.run_stage(smooth_spec, _smooth_stage)
+
+        glm_smooth_spec = StageSpec(
+            label="task-act-glm-smooth",
+            fields=glm_spec.fields + ("smoothing_enabled", "smoothing_fwhm",
+                                      "stat_buckets", "extract_out_file_pre"),
+            derived_files=tuple(glm_files),
+            derived_values={"s_pre": list(s_pre)},
+            upstream=("task-act-smooth",),
+        )
+
+        def _glm_smooth_stage(io):
+            outputs, bucket_stats_rel = _run_glm(
+                io, token, "task-act-glm-smooth", "3dDeconvolve smoothed GLM", "smoothed GLM",
+            )
+
+            if config.stat_buckets:
+                stat_outs, matched = extract_stat_bucket_niftis(
+                    io, io.path(bucket_stats_rel), config.stat_buckets,
+                    config.extract_out_file_pre, token, logger,
+                )
+                outputs.extend(stat_outs)
+
+                idx_outs = write_stat_indexes(io, config.extract_out_file_pre, matched, token)
+                outputs.extend(idx_outs)
+
+            return Outcome(outputs=outputs)
+
+        ctx.run_stage(glm_smooth_spec, _glm_smooth_stage)
+
+    # Ledgered stage: task-act-roi-qc
+    if template_used:
+        roiqc_spec = StageSpec(
+            label="task-act-roi-qc",
+            fields=("template_path", "roi_zero_handling", "scan_path", "scan_paths",
+                    "run_lengths", "run_labels", "scale_to_psc"),
+            derived_values={"s_pre": list(s_pre), "template_resolved": template_resolved},
+            upstream=("task-act-template", "task-act-prep"),
+        )
+
+        def _roiqc_stage(io):
+            return roi.task_roi_qc(io, config, runsets, s_pre, template_resolved, pre, logger)
+
+        ctx.run_stage(roiqc_spec, _roiqc_stage)
+
+    # Final assembly
+    conditions_final = config.cond_labels
+    expected = task_act_expected(config, runsets, conditions_final)
+
+    def _qc_fragment(retired):
+        return {
+            "analysis_type": "task_act",
+            "hrf_model": config.hrf_model if config.hrf_model != "custom"
+                        else f"custom ({config.custom_hrf})",
+            "fd_threshold": config.fd_threshold,
+            "censor_prev_tr": config.censor_prev_tr,
+            "censor_metric": nuisance.CENSOR_METRIC,
+            "fd_radius_mm": nuisance.FD_RADIUS_MM,
+            "excluded_runs": nuisance_state["excluded"],
+            "reused_stages": ctx.reused,
+            "retired_outputs": retired,
+            "provenance": versions,
+        }
+
+    return ctx.finish(expected=expected, qc_step_fragment=_qc_fragment)

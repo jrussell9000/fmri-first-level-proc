@@ -5,8 +5,6 @@
 # Common functions used across task_act, task_conn, and rest_conn pipelines.
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.0.0
-# Last updated: 05/01/26
 # ============================================================================
 """
 Shared utility functions for the fmri_first_level_proc package.
@@ -14,46 +12,60 @@ Shared utility functions for the fmri_first_level_proc package.
 This module provides functions used by all three analysis pipelines
 (task_act_first_level, task_conn_first_level, rest_conn_first_level):
 
-- Argument validation and type helpers (argparse types)
 - Logging setup
-- Motion file preparation and censor file generation
-- Notch filtering of motion parameters
-- Trial survival QC
-- HRF model string construction and validation
-- Stimulus timing file I/O (read/validate phase: read_and_validate_stim_data; write phase: write_onset_file)
-- AFNI command execution wrapper
-- NIfTI template validation and resampling
-- ROI statistics extraction via 3dROIstats
-- Minimum-outlier EPI frame extraction (gen_min_outlier_epi)
-- QC summary output
-- Degrees of freedom computation
+- Graded warning system with closed warning-code table
+- FirstLevelResult dataclass
+- HRF model string construction, validation, and logging
+- AFNI command execution wrappers (run_afni_command, run_afni_capture)
+- 3dinfo property queries
 - Linear contrast parsing and validation
-- Connectivity output path construction
-- Connectivity matrix contrast computation
-- Seed-to-voxel and parcellated connectivity via 3dNetCorr
+- Filename sanitization
+- Numeric table I/O helpers (load_numeric_table, format_table)
+- Within-run tissue derivative computation
+- Censor-interpolation and bandpass filtering of 1D files
+- 3dDeconvolve base command construction
+- REML_cmd collection
+- Min-outlier EPI extraction
 """
 
-import argparse
 import dataclasses
-import json
+import logging
 import os
 import re
-import sys
-import shutil
-import logging
 import subprocess
-from pathlib import Path
+import sys
+import tempfile
 
 import numpy as np
-import pandas as pd
-from io import StringIO
-from .exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
+from pathlib import Path
+from .exceptions import (
+    ConfigError, GuardError, InputError, ToolExecutionError,
+)
 
-# ----------------------------------------------------------------------------
-# Censoring QC thresholds (warn only — never abort based on percentage)
-# ----------------------------------------------------------------------------
-CENSOR_WARN_THRESHOLD = 30.0    # % censored → warning
-CENSOR_HIGH_THRESHOLD = 50.0    # % censored → strong warning
+
+# ---------------------------------------------------------------------------
+# Closed warning-code table
+# ---------------------------------------------------------------------------
+
+WARNING_CODES = {
+    "CENSOR_HIGH": "high",
+    "COND_DROPPED": "medium",
+    "CONTRAST_DROPPED": "medium",
+    "GS_MISSING": "low",
+    "RUN_SKIPPED": "high",
+    "DISCOVERY_COLLISION": "medium",
+    "UNVALIDATED_VERSION": "medium",
+    "LEDGER_ENTRY_UNREADABLE": "medium",
+    "RETIREMENT_FAILED": "high",
+    "NULL_ROI": "high",
+    "SEED_NULL": "high",
+    "PCORR_RANK_DEFICIENT": "high",
+    "RUN_FAILED": "high",
+    "RUN_INSUFFICIENT_TRS": "high",
+    "DERIV_RUN_BOUNDARY": "medium",
+    "SMOOTH_FWHM_OFF_TARGET": "medium",
+    "SMOOTH_INPUT_ABOVE_TARGET": "medium",
+}
 
 # Module-level warning accumulator (cross-pipeline contract)
 _WARNING_ACCUMULATOR: list[dict] = []
@@ -69,6 +81,11 @@ def clear_warnings() -> None:
     _WARNING_ACCUMULATOR.clear()
 
 
+def warning_count() -> int:
+    """Return the current number of accumulated warnings."""
+    return len(_WARNING_ACCUMULATOR)
+
+
 @dataclasses.dataclass
 class FirstLevelResult:
     """Structured result returned by each pipeline's run() function.
@@ -76,7 +93,9 @@ class FirstLevelResult:
     Attributes
     ----------
     status : str
-        ``'completed'`` on success.
+        ``'success'`` when no high-severity warnings were emitted, or
+        ``'warning'`` when at least one high-severity warning was emitted
+        (CLI exit code 3).
     output_dir : Path
         Directory where output files were written.
     warnings : list[dict]
@@ -84,7 +103,11 @@ class FirstLevelResult:
     qc_summary : dict
         Quality-control metrics (written to the QC summary JSON).
     output_files : list[str]
-        Paths to all files produced by the pipeline run.
+        Absolute paths to all final products of the analysis.
+    intermediate_files : list[str]
+        Absolute paths to every other file the analysis leaves on disk.
+        Disjoint from output_files. Excludes staging directories and the
+        CLI log file.
     """
 
     status: str
@@ -92,121 +115,12 @@ class FirstLevelResult:
     warnings: list[dict]
     qc_summary: dict
     output_files: list[str]
+    intermediate_files: list[str]
 
-# ----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # General Helpers
-# ----------------------------------------------------------------------------
-
-def dir_path_exists(path_string):
-    """argparse type: ensure directory exists (create if needed)."""
-    if not os.path.isdir(path_string):
-        os.makedirs(path_string, exist_ok=True)
-    return path_string
-
-def file_path_exists(path_string):
-    """argparse type: ensure a single file path exists."""
-    if not os.path.isfile(path_string):
-        raise argparse.ArgumentTypeError(
-            f"[ERROR] The file '{path_string}' does not exist or is not a valid file."
-        )
-    return path_string
-
-def prepare_motion_file(motion_path, use_columns, out_dir, out_prefix, label, logger):
-    """
-    Validate and prepare a motion regressor file for AFNI.
-
-    Reads the motion file, validates it has >= use_columns columns, and writes
-    a truncated version (first use_columns columns only) to out_dir. Returns
-    the path to the prepared file.
-
-    Parameters
-    ----------
-    motion_path : str
-        Path to the original motion file.
-    use_columns : int
-        Number of columns to keep (6 for base, 12 for +derivs, etc.).
-    out_dir : str
-        Directory for the prepared file.
-    out_prefix : str
-        Filename prefix for the prepared file.
-    label : str
-        Descriptive label for logging (e.g. "run1", "concat").
-    logger : logging.Logger
-
-    Returns
-    -------
-    str
-        Path to the prepared motion file.
-
-    Notes
-    -----
-    Rotation parameters are assumed to be in **degrees**. The pipeline passes
-    motion values through to AFNI without unit conversion. The expected column
-    order is ``[tx, ty, tz, rx, ry, rz, ...]`` (translations in mm first,
-    rotations in degrees second). AFNI's ``1d_tool.py -censor_motion`` uses
-    an Euclidean norm without radius scaling, so 1 degree ~ 1 mm of arc at
-    the standard ~57.3 mm head radius -- this is AFNI's intended convention.
-    Passing radians instead of degrees will underweight rotational FD by ~57x.
-    """
-    try:
-        data = np.loadtxt(motion_path)
-    except Exception as e:
-        raise InputError(f"Cannot read motion file '{motion_path}': {e}") from e
-    if data.ndim == 1:
-        data = data.reshape(-1, 1)
-    ncols = data.shape[1]
-    if ncols < use_columns:
-        raise InputError(f"Motion file '{motion_path}' has {ncols} columns, expected >= {use_columns}.")
-    # Truncate to requested columns
-    truncated = data[:, :use_columns]
-    prepared_path = os.path.join(out_dir, f"{out_prefix}_{label}_motion_prepared.1D")
-    np.savetxt(prepared_path, truncated, fmt="%.8f", delimiter="\t")
-    if ncols > use_columns:
-        logger.info("Motion file '%s': using %d of %d columns.", motion_path, use_columns, ncols)
-    return prepared_path
-
-def valid_string_list(string_list):
-    """argparse type: parse comma-separated string into a list of stripped, non-empty strings."""
-    try:
-        conds = string_list.split(",")
-        conds_s = [cond.strip() for cond in conds]
-        for cond in conds_s:
-            if cond is None or cond == "":
-                raise argparse.ArgumentTypeError(
-                    f"[ERROR] '{string_list}' could not be parsed; "
-                    "use string-list notation (e.g. 'cond1label,cond2label...')"
-                )
-        return conds_s
-    except argparse.ArgumentTypeError:
-        raise
-    except (ValueError, IndexError, AttributeError):
-        raise argparse.ArgumentTypeError(
-            f"[ERROR] '{string_list}' could not be parsed; "
-            "use string-list notation (e.g. 'cond1label,cond2label...')"
-        )
-
-def valid_stat_type(stat_string):
-    """argparse type: validate extract stat is one of z, t, r."""
-    valid_types = ["z", "t", "r"]
-    if stat_string not in valid_types:
-        raise argparse.ArgumentTypeError("[ERROR] --extract_stat must be 'z', 't', or 'r'")
-    return stat_string
-
-def valid_ave_type(ave_string):
-    """argparse type: validate average type is mean or median."""
-    if ave_string not in ["mean", "median"]:
-        raise argparse.ArgumentTypeError(
-            f"[ERROR] '{ave_string}' must be one of ['mean', 'median']."
-        )
-    return ave_string
-
-def valid_conn_type(conn_string):
-    """argparse type: validate connectivity type."""
-    if conn_string not in ["seed_to_voxel", "parcellated"]:
-        raise argparse.ArgumentTypeError(
-            f"[ERROR] '{conn_string}' must be one of ['seed_to_voxel', 'parcellated']."
-        )
-    return conn_string
+# ---------------------------------------------------------------------------
 
 def setup_logging(name: str, log_file: str | None = None) -> logging.Logger:
     """
@@ -251,6 +165,10 @@ def setup_logging(name: str, log_file: str | None = None) -> logging.Logger:
     return logger
 
 
+# ---------------------------------------------------------------------------
+# Graded Warnings
+# ---------------------------------------------------------------------------
+
 def graded_warning(
     logger: logging.Logger,
     severity: str,
@@ -259,18 +177,19 @@ def graded_warning(
     *,
     user_facing: bool = False,
 ) -> dict:
-    """
-    Emit a graded warning and return a structured record for accumulation.
+    """Emit a graded warning and return a structured record for accumulation.
+
+    High-severity warnings set FirstLevelResult.status to ``'warning'`` and
+    CLI exit code 3.
 
     Parameters
     ----------
     logger : logging.Logger
         Logger instance to use for emission.
     severity : str
-        One of 'low', 'medium', or 'high'. High-severity warnings trigger
-        exit code 3 when accumulated in FirstLevelResult.warnings.
+        One of 'low', 'medium', or 'high'.
     code : str
-        Machine-readable warning code (e.g. 'W001_MISSING_RUNS').
+        Machine-readable warning code from WARNING_CODES.
     message : str
         Human-readable warning description.
     user_facing : bool, optional
@@ -283,12 +202,21 @@ def graded_warning(
         {'severity': severity, 'code': code, 'message': message,
          'user_facing': user_facing}
 
-    Notes
-    -----
-    Appends to the module-level _WARNING_ACCUMULATOR and returns the dict.
-    Pipeline entry points should call clear_warnings() at entry and
-    get_warnings() at FirstLevelResult construction.
+    Raises
+    ------
+    GuardError
+        If *code* is not in WARNING_CODES or *severity* does not match the
+        table entry.
     """
+    if code not in WARNING_CODES:
+        raise GuardError(
+            f"Unknown warning code '{code}'. Valid codes: {sorted(WARNING_CODES)}"
+        )
+    if severity != WARNING_CODES[code]:
+        raise GuardError(
+            f"Warning code '{code}' has severity '{WARNING_CODES[code]}', "
+            f"not '{severity}'."
+        )
     level = logging.WARNING if user_facing else logging.INFO
     logger.log(level, "[%s] %s", code, message)
     record = {
@@ -300,169 +228,111 @@ def graded_warning(
     _WARNING_ACCUMULATOR.append(record)
     return record
 
-def validate_extract_options(extract_flag_name, average_type, extract_out_file_pre, template_path, scan_path, out_dir, force_diff_atlas, logger=None):
 
-    """Validate extraction-related args for task_conn or rest_conn pipelines.
-
-    Parameters
-    ----------
-    extract_flag_name : str
-        Name of the extract flag for error messages (e.g. '--extract_pbseries').
-    average_type : str or None
-    extract_out_file_pre : str or None
-    template_path : str or None
-    scan_path : str
-        Path to the scan (used for template validation).
-    out_dir : str
-    force_diff_atlas : bool
-    logger : logging.Logger, optional
-
-    Returns
-    -------
-    str
-        Validated (possibly resampled) template_path.
-    """
-    _log = logger or logging.getLogger(__name__)
-
-    if average_type is None:
-        raise ConfigError(f"--average_type must be provided if {extract_flag_name} is present.")
-
-    if extract_out_file_pre is None:
-        raise ConfigError(f"--extract_out_file_pre must be provided if {extract_flag_name} is present.")
-
-    if template_path is None:
-        raise ConfigError(f"{extract_flag_name} requires an ROI or ROI set (.nii) be provided to --template_path.")
-
-    return validate_template(scan_path, template_path, out_dir, force_diff_atlas,
-                              conn_type="extract", logger=logger)
-
-def validate_connectivity_options(calc_conn, conn_out_file_pre, template_path, scan_path, out_dir, force_diff_atlas, data_label="data", logger=None):
-
-    """Validate connectivity-related args for task_conn or rest_conn pipelines.
+def reemit_warning(record: dict, logger: logging.Logger, prefix: str) -> None:
+    """Re-emit a warning record (e.g. from a reused stage) into the accumulator.
 
     Parameters
     ----------
-    calc_conn : str or None
-        'seed_to_voxel' or 'parcellated'.
-    conn_out_file_pre : str or None
-    template_path : str or None
-    scan_path : str
-        Path to scan (used for template validation).
-    out_dir : str
-    force_diff_atlas : bool
-    data_label : str
-        Label for log messages (e.g. 'task beta series', 'residual time series').
-    logger : logging.Logger, optional
-
-    Returns
-    -------
-    str or None
-        Validated (possibly resampled) template_path, or None if calc_conn is None.
+    record : dict
+        A warning record dict with keys severity, code, message, user_facing.
+    logger : logging.Logger
+    prefix : str
+        Prefix prepended to the log message (e.g. ``'[reused stage X]'``).
     """
-    _log = logger or logging.getLogger(__name__)
+    if record["code"] not in WARNING_CODES:
+        raise GuardError(
+            f"Reemitted warning code '{record['code']}' is not in WARNING_CODES."
+        )
+    level = logging.WARNING if record.get("user_facing") else logging.INFO
+    logger.log(level, "%s [%s] %s", prefix, record["code"], record["message"])
+    _WARNING_ACCUMULATOR.append(dict(record))
 
-    if calc_conn is None:
-        _log.info("Connectivity will not be output after generating %s.", data_label)
-        return template_path
 
-    if conn_out_file_pre is None:
-        raise ConfigError("--conn_out_file_pre must be provided if --calc_conn is present.")
+# ---------------------------------------------------------------------------
+# HRF Model Constants
+# ---------------------------------------------------------------------------
 
-    if calc_conn == "parcellated":
-        if template_path is None:
-            raise ConfigError(f"--calc_conn '{calc_conn}' requires an ROI set (.nii) be provided to --template_path.")
-        validated = validate_template(scan_path, template_path, out_dir, force_diff_atlas,
-                                       conn_type="parcellated", logger=logger)
-        _log.info("Calculating parcellated (ROI-based) connectivity matrices after generating %s.", data_label)
-    else:
-        if template_path is None:
-            raise ConfigError(f"--calc_conn '{calc_conn}' requires a seed ROI mask file (binary .nii) be provided to --template_path.")
-        validated = validate_template(scan_path, template_path, out_dir, force_diff_atlas,
-                                       conn_type="seed_to_voxel", logger=logger)
-        _log.info("Calculating seed-to-voxel whole-brain connectivity (.nii) after generating %s.", data_label)
-
-    return validated
-
-def remove_files_from_dir(dir_string, logger=None):
-    """Remove all files, links, and subdirectories from a directory."""
-    _log = logger or logging.getLogger(__name__)
-    resolved = os.path.realpath(dir_string)
-    if resolved == "/" or resolved == os.path.expanduser("~") or len(resolved) < 5:
-        raise GuardError(f"Refusing to clear dangerous path: '{dir_string}' (resolved: '{resolved}').")
-    if not os.path.isdir(dir_string):
-        _log.warning("'%s' does not yet exist. --remove_previous will be ignored.", dir_string)
-    else:
-        for item_name in os.listdir(dir_string):
-            item_path = os.path.join(dir_string, item_name)
-            try:
-                if os.path.isfile(item_path):
-                    os.remove(item_path)
-                elif os.path.islink(item_path):
-                    os.unlink(item_path)
-                elif os.path.isdir(item_path):
-                    shutil.rmtree(item_path)
-            except OSError as e:
-                _log.error("Error deleting '%s': %s", item_path, e)
-
-# ----------------------------------------------------------------------------
-# HRF Model Helpers
-# ----------------------------------------------------------------------------
-
-# HRF model categories
 HRF_DURATION_MODELS = {"GAM", "BLOCK"}       # Use mean_dur in model string
 HRF_DM_MODELS = {"dmBLOCK"}                  # Per-trial duration via married timing
 HRF_IMPULSE_MODELS = {"SPMG1"}               # No duration parameter
 VALID_HRF_MODELS = HRF_DURATION_MODELS | HRF_DM_MODELS | HRF_IMPULSE_MODELS | {"custom"}
 
-# Known AFNI model name prefixes for custom HRF validation (first pass)
+# Mapping from HRF model name to AFNI model prefix (for prefix whitelist validation)
 AFNI_MODEL_PREFIXES = {
-    "GAM", "BLOCK", "dmBLOCK", "dmUBLOCK", "TENT", "TENTzero",
-    "CSPLIN", "CSPLINzero", "SPMG1", "SPMG2", "SPMG3",
-    "TWOGAMpw", "MION", "MIONN", "WAV", "EXPR", "POLY", "SIN",
+    "GAM": "GAM",
+    "BLOCK": "BLOCK",
+    "dmBLOCK": "dmBLOCK",
+    "SPMG1": "SPMG",
+    "TWOGAMpw": "TWOGAMpw",
+    "TENT": "TENT",
+    "TENTzero": "TENTzero",
+    "CSPLIN": "CSPLIN",
+    "CSPLINzero": "CSPLINzero",
 }
 
-def validate_custom_hrf(custom_hrf, logger):
-    """
-    Two-stage validation of a custom HRF string:
-    1. Prefix check: verify the string starts with a known AFNI model name
-    2. AFNI dry run: use 3dDeconvolve -nodata to validate full syntax
 
-    Returns True if valid, False otherwise (errors logged).
-    """
-    import tempfile
+def validate_custom_hrf(custom_hrf, logger) -> int:
+    """Validate a custom HRF string against AFNI and return the column count.
 
+    Stage 1: check that the string starts with a recognized AFNI model prefix.
+    Stage 2: run a minimal 3dDeconvolve dry run and return the number of columns
+    produced by the model.
+
+    Parameters
+    ----------
+    custom_hrf : str
+        Custom HRF string (e.g. ``'TENT(0,14,8)'``).
+    logger : logging.Logger
+
+    Returns
+    -------
+    int
+        Number of columns the model generates in the design matrix.
+
+    Raises
+    ------
+    ConfigError
+        If the prefix is not recognized or the AFNI dry run fails.
+    """
     # Stage 1: prefix whitelist
-    prefix_match = any(custom_hrf == name or custom_hrf.startswith(name + "(")
-                       for name in AFNI_MODEL_PREFIXES)
-    if not prefix_match:
-        known = ", ".join(sorted(AFNI_MODEL_PREFIXES))
-        logger.error("custom_hrf '%s' does not start with a known AFNI model name. "
-                     "Known models: %s", custom_hrf, known)
-        return False
+    matched = False
+    for prefix in AFNI_MODEL_PREFIXES.values():
+        if custom_hrf == prefix or custom_hrf.startswith(prefix + "("):
+            matched = True
+            break
+    if not matched:
+        raise ConfigError(
+            f"Custom HRF '{custom_hrf}' does not start with a recognized AFNI model prefix. "
+            f"Known prefixes: {sorted(AFNI_MODEL_PREFIXES.values())}"
+        )
 
-    # Stage 2: AFNI -nodata dry run
-    tmp_timing = None
-    tmp_x1d = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.1D', delete=False) as f:
+    # Stage 2: AFNI dry-run validation
+    with tempfile.TemporaryDirectory() as tmp:
+        timing_path = os.path.join(tmp, "timing.1D")
+        with open(timing_path, "w") as f:
             f.write("10\n")
-            tmp_timing = f.name
-        tmp_x1d = tmp_timing.replace('.1D', '_test.x1D')
-        cmd = ["3dDeconvolve", "-nodata", "100", "1",
-               "-polort", "-1", "-num_stimts", "1",
-               "-stim_times", "1", tmp_timing, custom_hrf,
-               "-x1D", tmp_x1d, "-x1D_stop", "-nobucket"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.error("custom_hrf '%s' failed AFNI validation. "
-                         "3dDeconvolve error: %s", custom_hrf,
-                         result.stderr.strip())
-            return False
-        return True
-    finally:
-        for p in (tmp_timing, tmp_x1d):
-            if p and os.path.exists(p):
-                os.unlink(p)
+        x1d_path = os.path.join(tmp, "hrf_test.x1D")
+        try:
+            run_afni_command(
+                ["3dDeconvolve", "-nodata", "100", "1",
+                 "-polort", "-1",
+                 "-num_stimts", "1",
+                 "-stim_times", "1", "timing.1D", custom_hrf,
+                 "-x1D", "hrf_test.x1D",
+                 "-x1D_stop", "-nobucket"],
+                description="custom_hrf validation",
+                logger=logger,
+                cwd=tmp,
+            )
+        except ToolExecutionError as e:
+            raise ConfigError(
+                f"custom_hrf '{custom_hrf}' failed AFNI validation: {e}"
+            ) from e
+
+        matrix = np.loadtxt(x1d_path, comments="#", ndmin=2)
+        return matrix.shape[1]
+
 
 def needs_married_timing(hrf_model, custom_hrf=None):
     """Check if the HRF model requires married timing (onset*duration).
@@ -476,35 +346,6 @@ def needs_married_timing(hrf_model, custom_hrf=None):
         return any(custom_hrf == name or custom_hrf.startswith(name + "(")
                    for name in HRF_DM_MODELS)
     return False
-
-def validate_onset_file_format(onset_file, expects_married, logger=None):
-    """Check if onset file format (married vs single-column) matches expectations.
-
-    Married timing files contain '*' characters (e.g. '10.5*3.0').
-    Single-column files contain only onset times.
-
-    Returns True if format matches expectations, False if mismatch.
-    """
-    _log = logger or logging.getLogger(__name__)
-    try:
-        with open(onset_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    has_star = '*' in line
-                    if has_star != expects_married:
-                        fmt_found = "married" if has_star else "single-column"
-                        fmt_expected = "married" if expects_married else "single-column"
-                        _log.warning(
-                            "Onset file '%s' is in %s format but %s format is expected. "
-                            "This file may be stale from a previous run with a different HRF model. "
-                            "Consider using --remove_previous or deleting this file.",
-                            onset_file, fmt_found, fmt_expected)
-                        return False
-                    return True
-    except OSError as e:
-        _log.warning("Could not read onset file '%s' for format validation: %s", onset_file, e)
-    return True  # If file is empty or unreadable, don't block — downstream will catch errors
 
 def build_hrf_string(hrf_model, mean_dur=None, custom_hrf=None):
     """Construct AFNI stim_times model string for the selected HRF."""
@@ -522,573 +363,13 @@ def build_hrf_string(hrf_model, mean_dur=None, custom_hrf=None):
         return "SPMG1"
     raise ConfigError(f"Unknown hrf_model: {hrf_model}")
 
-# ----------------------------------------------------------------------------
-# Stim Data & Onset File Helpers
-# ----------------------------------------------------------------------------
-
-def read_and_validate_stim_data(timing_path, cond_labels, logger=None):
-    """Read task timing file (BIDS _events.tsv or legacy CSV), validate columns, sort by onset.
-
-    Detection is content-authoritative: the file extension determines the delimiter
-    (.tsv -> tab; .csv/other -> comma), then the header is inspected to classify the
-    format. BIDS format is identified by onset/duration/trial_type columns (case-
-    insensitive). Legacy CSV format is identified by ONSET/DURATION/CONDITION columns
-    (case-insensitive). A deprecation warning is emitted when legacy format is detected.
-    The returned DataFrame uses BIDS column names (onset, duration, trial_type) regardless
-    of the input format.
-
-    Parameters
-    ----------
-    timing_path : str
-        Path to the timing file. BIDS _events.tsv (preferred) or legacy CSV (deprecated).
-    cond_labels : list of str
-        Expected condition labels (must all exist in the timing file).
-    logger : logging.Logger, optional
-
-    Returns
-    -------
-    pd.DataFrame
-        Sorted by onset, reset index. Columns use BIDS names: onset, duration, trial_type.
-
-    Raises
-    ------
-    InputError
-        If the file header does not match either known format, or if required condition
-        labels are absent from the timing file.
-    """
-    _log = logger or logging.getLogger(__name__)
-
-    # Determine delimiter from extension
-    ext = os.path.splitext(timing_path)[1].lower()
-    delimiter = '\t' if ext == '.tsv' else ','
-
-    # Read header to detect format (content-authoritative)
-    try:
-        header_df = pd.read_csv(timing_path, sep=delimiter, nrows=0)
-    except Exception as e:
-        raise InputError(f"Cannot read timing file '{timing_path}': {e}") from e
-    cols_lower = [c.strip().lower() for c in header_df.columns]
-
-    bids_required = {'onset', 'duration', 'trial_type'}
-    legacy_required = {'condition', 'onset', 'duration'}
-
-    if bids_required.issubset(set(cols_lower)):
-        # BIDS format
-        stim_df = pd.read_csv(timing_path, sep=delimiter)
-        stim_df.columns = stim_df.columns.str.strip()
-        # Normalize to lower-case BIDS names for any mixed-case BIDS files
-        rename_map = {c: c.lower() for c in stim_df.columns if c.lower() in bids_required}
-        stim_df = stim_df.rename(columns=rename_map)
-    elif legacy_required.issubset(set(cols_lower)):
-        # Legacy CSV format — emit deprecation warning
-        graded_warning(
-            _log, 'low', 'EVENTS_LEGACY',
-            'Legacy CSV events format detected. Migrate to BIDS _events.tsv. '
-            'CSV support will be removed in version 4.0.0.',
-            user_facing=True,
-        )
-        stim_df = pd.read_csv(timing_path, sep=delimiter)
-        stim_df.columns = stim_df.columns.str.strip()
-        # Rename legacy columns to BIDS names (case-insensitive match)
-        col_map = {c: c.lower() for c in stim_df.columns if c.lower() in legacy_required}
-        stim_df = stim_df.rename(columns=col_map)
-        # CONDITION -> trial_type
-        if 'condition' in stim_df.columns:
-            stim_df = stim_df.rename(columns={'condition': 'trial_type'})
-    else:
-        raise InputError(
-            f"Timing file '{timing_path}' header does not match any known format. "
-            "Expected BIDS columns (onset, duration, trial_type) or legacy columns "
-            "(CONDITION, ONSET, DURATION). Found: " + str(list(header_df.columns))
-        )
-
-    sorted_df = stim_df.sort_values(by='onset', ascending=True)
-
-    # Check conditions exist in the timing file
-    missing = [c for c in cond_labels if c not in sorted_df['trial_type'].unique()]
-    if missing:
-        raise InputError(
-            f"Task condition(s) not found in timing file '{timing_path}': {missing}"
-        )
-
-    # Check for conditions with too few trials
-    for cond in cond_labels:
-        n_trials = len(sorted_df[sorted_df['trial_type'] == cond])
-        if n_trials == 0:
-            _log.warning("Condition '%s' has 0 trials in the timing file. "
-                       "Cannot create onset file for a condition with no events.", cond)
-        elif n_trials < 2:
-            _log.warning("Condition '%s' has only %d trial(s). At least 2 trials are required "
-                       "for a reliable estimate.", cond, n_trials)
-        elif n_trials < 3:
-            _log.warning("Condition '%s' has only %d trial(s). Estimates may be unreliable.", cond, n_trials)
-
-    return sorted_df.reset_index(drop=True)
-
-def write_onset_file(condition_df, filepath, hrf_model, custom_hrf=None, logger=None):
-    """Write AFNI-compatible onset file. Validates format on existing files.
-
-    Parameters
-    ----------
-    condition_df : pd.DataFrame
-        Must contain 'onset' column, and 'duration' if married timing needed.
-        Expects BIDS column names (onset, duration, trial_type).
-    filepath : str
-        Output onset file path.
-    hrf_model : str
-        HRF model name.
-    custom_hrf : str or None
-        Custom HRF string (used when hrf_model='custom').
-    logger : logging.Logger, optional
-
-    Returns
-    -------
-    bool
-        True if file was created or already exists with correct format.
-    """
-    _log = logger or logging.getLogger(__name__)
-    married = needs_married_timing(hrf_model, custom_hrf)
-
-    if os.path.exists(filepath):
-        validate_onset_file_format(filepath, married, logger=logger)
-        _log.info("%s already exists.", filepath)
-        return True
-
-    if married:
-        with open(filepath, 'w') as f:
-            for _, row in condition_df.iterrows():
-                f.write(f"{row['onset']}*{row['duration']}\n")
-    else:
-        with open(filepath, 'w') as f:
-            for onset in condition_df['onset']:
-                f.write(f"{onset}\n")
-    _log.info("Created %s", filepath)
-    return True
-
-# ----------------------------------------------------------------------------
-# AFNI Helpers
-# ----------------------------------------------------------------------------
-
-def create_censor_file(motion_path, fd_threshold, censor_prev_tr, out_dir, out_prefix, label, logger):
-    """
-    Generate a censor file from motion regressors using AFNI's 1d_tool.py.
-
-    Extracts the first 6 columns (base motion parameters) from the motion file,
-    then runs 1d_tool.py to create an FD-based censor file.
-
-    Parameters
-    ----------
-    motion_path : str
-        Path to the original motion file (before prepare_motion_file).
-    fd_threshold : float
-        Framewise displacement threshold (mm) for censoring.
-    censor_prev_tr : bool
-        If True, also censor the TR preceding each high-motion TR.
-    out_dir : str
-        Output directory.
-    out_prefix : str
-        Filename prefix.
-    label : str
-        Descriptive label (e.g. "concat", "run1").
-    logger : logging.Logger
-
-    Returns
-    -------
-    str
-        Path to the generated censor file.
-    """
-    # 1d_tool.py auto-appends _censor.1D to the prefix
-    censor_prefix = os.path.join(out_dir, f"{out_prefix}_{label}")
-    censor_path = f"{censor_prefix}_censor.1D"
-
-    # Skip if censor file already exists (1d_tool.py won't overwrite)
-    if os.path.exists(censor_path):
-        logger.info("Censor file %s already exists (skipping generation).", censor_path)
-    else:
-        # Extract first 6 columns (base motion only) for FD calculation
-        motion_6col = prepare_motion_file(motion_path, 6, out_dir, out_prefix, f"{label}_censor_src", logger)
-
-        # Build 1d_tool.py command
-        cmd = ["1d_tool.py",
-               "-infile", motion_6col,
-               "-censor_motion", str(fd_threshold), censor_prefix]
-        if censor_prev_tr:
-            cmd.append("-censor_prev_TR")
-
-        run_afni_command(cmd, description=f"1d_tool.py censor {label}", logger=logger)
-
-        if not os.path.exists(censor_path):
-            raise ToolExecutionError(f"Expected censor file not found: {censor_path}")
-
-    # Log count of censored TRs and warn at thresholds
-    try:
-        censor_data = np.loadtxt(censor_path)
-        n_censored = int(np.sum(censor_data == 0))
-        n_total = len(censor_data)
-        pct_censored = 100.0 * n_censored / n_total if n_total > 0 else 0.0
-        logger.info("Censor file %s: %d of %d TRs censored (%.1f%%).",
-                     censor_path, n_censored, n_total, pct_censored)
-        if pct_censored >= CENSOR_HIGH_THRESHOLD:
-            logger.warning("HIGH CENSORING: %.1f%% of TRs censored (>= %.0f%%). "
-                           "Results may be unreliable. Review motion QC carefully.",
-                           pct_censored, CENSOR_HIGH_THRESHOLD)
-        elif pct_censored >= CENSOR_WARN_THRESHOLD:
-            logger.warning("Elevated censoring: %.1f%% of TRs censored (>= %.0f%%). "
-                           "Consider reviewing motion QC.",
-                           pct_censored, CENSOR_WARN_THRESHOLD)
-    except Exception:
-        pass  # Non-critical; censor file exists and will be used
-
-    return censor_path
-
-def check_trial_survival(stim_df, cond_labels, censor_path, tr, logger):
-    """Check how many trials per condition survive motion censoring.
-
-    For each condition, count how many trials have their onset TR uncensored.
-    Warns if any condition has few surviving trials. Returns a dict of counts.
-
-    Parameters
-    ----------
-    stim_df : pd.DataFrame
-        Timing data with trial_type and onset columns (BIDS column names).
-    cond_labels : list of str
-        Condition labels to check.
-    censor_path : str
-        Path to the censor file (binary 1D).
-    tr : float
-        Repetition time in seconds.
-    logger : logging.Logger
-
-    Returns
-    -------
-    dict
-        {condition: n_surviving_trials} for each condition.
-    """
-    try:
-        censor_data = np.loadtxt(censor_path)
-    except Exception:
-        logger.warning("Could not read censor file for trial survival check.")
-        return {}
-
-    survival = {}
-    for cond in cond_labels:
-        cond_df = stim_df[stim_df['trial_type'] == cond]
-        n_total = len(cond_df)
-        n_surviving = 0
-        for onset in cond_df['onset']:
-            tr_idx = int(round(onset / tr))
-            if 0 <= tr_idx < len(censor_data) and censor_data[tr_idx] == 1:
-                n_surviving += 1
-        survival[cond] = n_surviving
-        if n_surviving < 2:
-            logger.warning("Condition '%s': only %d of %d trials survive censoring. "
-                         "Cannot reliably estimate this condition (minimum 2 required). Skipping.",
-                         cond, n_surviving, n_total)
-        elif n_surviving == 2:
-            logger.warning("Condition '%s': only 2 of %d trials survive censoring. "
-                           "Estimate will have very low power.", cond, n_total)
-        elif n_surviving < 5:
-            logger.warning("Condition '%s': only %d of %d trials survive censoring. "
-                           "Estimates may be unreliable.", cond, n_surviving, n_total)
-        else:
-            logger.info("Condition '%s': %d of %d trials survive censoring.",
-                        cond, n_surviving, n_total)
-    return survival
-
-
-def notch_filter_motion(motion_path, tr, stopband, out_dir, out_prefix, label, logger):
-    """
-    Apply a notch (stopband) filter to motion parameters using AFNI's 3dTproject.
-
-    Used to remove respiratory artifacts from motion parameters before FD-based
-    censoring (Fair et al., 2020).
-
-    Parameters
-    ----------
-    motion_path : str
-        Path to the original motion file.
-    tr : float
-        Repetition time in seconds.
-    stopband : list of float
-        [low, high] Hz band to remove.
-    out_dir : str
-        Output directory.
-    out_prefix : str
-        Filename prefix.
-    label : str
-        Descriptive label (e.g. "run1").
-    logger : logging.Logger
-
-    Returns
-    -------
-    str
-        Path to the notch-filtered motion file.
-    """
-    # Extract first 6 columns (base motion only)
-    motion_6col = prepare_motion_file(motion_path, 6, out_dir, out_prefix, f"{label}_notch_src", logger)
-
-    out_path = os.path.join(out_dir, f"{out_prefix}_{label}_notch_motion.1D")
-
-    # AFNI interprets .1D files as rows=voxels, cols=timepoints.
-    # A TRs×6 motion file is seen as TRs voxels × 6 timepoints, causing a
-    # "too few timepoints" error in 3dTproject.  The trailing ' (AFNI transpose
-    # operator) presents the file as 6 voxels × TRs timepoints so 3dTproject
-    # operates correctly along the time axis.  After filtering, 3dTproject
-    # writes its output in the same transposed orientation (rows=params,
-    # cols=TRs); 1dtranspose is then used to restore rows=TRs, cols=params
-    # for downstream use.
-    cmd = ["3dTproject",
-           "-polort", "-1",
-           "-dt", str(tr),
-           "-input", f"{motion_6col}'",
-           "-stopband", str(stopband[0]), str(stopband[1]),
-           "-prefix", out_path]
-
-    run_afni_command(cmd, description=f"3dTproject notch filter {label}", logger=logger)
-
-    if not os.path.exists(out_path):
-        raise ToolExecutionError(f"Expected notch-filtered motion file not found: {out_path}")
-
-    # Restore rows=TRs, cols=params orientation (3dTproject output is transposed)
-    transposed_path = out_path + ".transposed.1D"
-    transpose_cmd = ["1dtranspose", out_path, transposed_path]
-    run_afni_command(transpose_cmd, description=f"1dtranspose notch filter {label}", logger=logger)
-    if not os.path.exists(transposed_path):
-        raise ToolExecutionError(f"1dtranspose failed for notch-filtered motion: {out_path}")
-    os.replace(transposed_path, out_path)
-
-    logger.info("Notch-filtered motion parameters (rows=TRs, cols=params) saved to %s", out_path)
-    return out_path
-
-def censor_interpolate_1d_afni(input_path, tr, censor_path, out_dir, out_prefix, label, logger):
-    """
-    Interpolate censored TRs in a nuisance regressor 1D file using AFNI 3dTproject -cenmode NTRP.
-
-    Invokes ``3dTproject`` with ``-cenmode NTRP`` to replace censored TRs with
-    interpolated values in the input 1D file.  Because AFNI interprets .1D files
-    as rows=voxels, cols=timepoints, the input is presented to 3dTproject with a
-    trailing apostrophe (AFNI transpose operator) so the time axis is read
-    correctly.  After the command executes, 3dTproject writes its output in the
-    transposed orientation (rows=columns, cols=TRs); ``1dtranspose`` is applied to
-    restore rows=TRs, cols=columns for all downstream consumers.  This function is
-    intended for sequenced denoising pipelines where censored TRs must be
-    interpolated in nuisance regressors (e.g., tissue signals, motion parameters)
-    before bandpass filtering so that the frequency-domain operation is not
-    contaminated by zero-fill or mean-imputation artefacts.
-
-    Parameters
-    ----------
-    input_path : str
-        Path to the input 1D file (rows=TRs orientation) whose censored TRs will
-        be interpolated.
-    tr : float
-        Repetition time in seconds; passed to 3dTproject via ``-dt``.
-    censor_path : str
-        Path to the AFNI-format censor file (1=keep, 0=censor).
-    out_dir : str
-        Output directory for the interpolated file.
-    out_prefix : str
-        Filename prefix used to construct the output filename.
-    label : str
-        Descriptive label appended to the output filename (e.g., ``"CSF"``).
-    logger : logging.Logger
-        Logger for info and error messages.
-
-    Returns
-    -------
-    str
-        Absolute path to the interpolated 1D file in rows=TRs, cols=columns
-        orientation.
-    """
-    out_path = os.path.join(out_dir, f"{out_prefix}_{label}_interp.1D")
-
-    cmd = ["3dTproject",
-           "-polort", "-1",
-           "-dt", str(tr),
-           "-input", f"{input_path}'",
-           "-censor", censor_path,
-           "-cenmode", "NTRP",
-           "-prefix", out_path]
-
-    run_afni_command(cmd, description=f"3dTproject NTRP interpolate {label}", logger=logger)
-
-    if not os.path.exists(out_path):
-        raise ToolExecutionError(f"Expected NTRP-interpolated 1D file not found: {out_path}")
-
-    # Restore rows=TRs, cols=cols orientation (3dTproject output is transposed)
-    transposed_path = out_path + ".transposed.1D"
-    transpose_cmd = ["1dtranspose", out_path, transposed_path]
-    run_afni_command(transpose_cmd, description=f"1dtranspose interpolate {label}", logger=logger)
-    if not os.path.exists(transposed_path):
-        raise ToolExecutionError(f"1dtranspose failed for interpolated 1D file: {out_path}")
-    os.replace(transposed_path, out_path)
-
-    logger.info("NTRP-interpolated 1D file (rows=TRs, cols=cols) saved to %s", out_path)
-    return out_path
-
-def bandpass_filter_1d_afni(input_path, tr, bandpass, out_dir, out_prefix, label, logger):
-    """
-    Bandpass-filter a nuisance regressor 1D file using AFNI 3dBandpass -nodetrend.
-
-    Invokes ``3dBandpass`` with ``-nodetrend`` to apply a bandpass filter to the
-    input 1D file over the passband specified by ``bandpass[0]`` (fbot) and
-    ``bandpass[1]`` (ftop).  The ``-nodetrend`` flag is required to preserve
-    consistency with the ``polort -1`` convention used throughout the pipeline
-    (i.e., no polynomial detrending is applied here, because detrending is handled
-    separately), and the passband matches the BOLD bandpass step so that nuisance
-    regressors and BOLD data share the same frequency content.  Because AFNI
-    interprets .1D files as rows=voxels, cols=timepoints, the input is presented to
-    3dBandpass with a trailing apostrophe (AFNI transpose operator) so the time axis
-    is read correctly.  After the command executes, 3dBandpass writes its output in
-    the transposed orientation (rows=columns, cols=TRs); ``1dtranspose`` is applied
-    to restore rows=TRs, cols=columns for all downstream consumers.  This function
-    is intended for use after ``censor_interpolate_1d_afni``, filtering interpolated
-    nuisance regressors (e.g., tissue signals, motion parameters) at the same
-    passband as the BOLD signal before they enter the final regression model.
-
-    Parameters
-    ----------
-    input_path : str
-        Path to the input 1D file (rows=TRs orientation) to be bandpass-filtered.
-    tr : float
-        Repetition time in seconds; passed to 3dBandpass via ``-dt``.
-    bandpass : list or tuple of float
-        Two-element sequence ``[fbot, ftop]`` specifying the lower and upper
-        frequency bounds of the passband in Hz.
-    out_dir : str
-        Output directory for the filtered file.
-    out_prefix : str
-        Filename prefix used to construct the output filename.
-    label : str
-        Descriptive label appended to the output filename (e.g., ``"CSF"``).
-    logger : logging.Logger
-        Logger for info and error messages.
-
-    Returns
-    -------
-    str
-        Absolute path to the bandpass-filtered 1D file in rows=TRs, cols=columns
-        orientation.
-    """
-    out_path = os.path.join(out_dir, f"{out_prefix}_{label}_bp.1D")
-
-    cmd = ["3dBandpass",
-           "-nodetrend",
-           "-dt", str(tr),
-           "-prefix", out_path,
-           str(bandpass[0]), str(bandpass[1]),
-           f"{input_path}'"]
-
-    run_afni_command(cmd, description=f"3dBandpass {label}", logger=logger)
-
-    if not os.path.exists(out_path):
-        raise ToolExecutionError(f"Expected bandpass-filtered 1D file not found: {out_path}")
-
-    # Restore rows=TRs, cols=cols orientation (3dBandpass output is transposed)
-    transposed_path = out_path + ".transposed.1D"
-    transpose_cmd = ["1dtranspose", out_path, transposed_path]
-    run_afni_command(transpose_cmd, description=f"1dtranspose {label}", logger=logger)
-    if not os.path.exists(transposed_path):
-        raise ToolExecutionError(f"1dtranspose failed for bandpass-filtered 1D file: {out_path}")
-    os.replace(transposed_path, out_path)
-
-    logger.info("Bandpass-filtered 1D file (rows=TRs, cols=cols) saved to %s", out_path)
-    return out_path
-
-def compute_tissue_derivative(tissue_path, out_dir, out_prefix, tissue_label, logger):
-    """
-    Compute the first temporal derivative of a tissue signal file.
-
-    Reads the tissue signal, computes backward difference (zero-padded to
-    preserve length), and saves to out_dir.
-
-    Parameters
-    ----------
-    tissue_path : str
-        Path to the tissue signal file (single-column text).
-    out_dir : str
-        Output directory.
-    out_prefix : str
-        Filename prefix.
-    tissue_label : str
-        Label for the tissue type (e.g. "CSF", "WM", "run1_CSF").
-    logger : logging.Logger
-
-    Returns
-    -------
-    str
-        Path to the derivative file.
-    """
-    try:
-        data = np.loadtxt(tissue_path)
-    except Exception as e:
-        raise InputError(f"Cannot read tissue file '{tissue_path}': {e}") from e
-    if data.ndim != 1:
-        raise InputError(f"Tissue file '{tissue_path}' must be single-column, got shape {data.shape}.")
-    deriv = np.diff(data, prepend=data[0])
-    deriv_path = os.path.join(out_dir, f"{out_prefix}_{tissue_label}_deriv.txt")
-    np.savetxt(deriv_path, deriv, fmt="%.8f")
-    logger.info("Created tissue derivative: %s", deriv_path)
-    return deriv_path
-
-def build_decon_base_command(scan_path, censor_path, motion_path, CSF_path=None, WM_path=None, CSF_deriv_path=None, WM_deriv_path=None, tr=None):
-    """Build base 3dDeconvolve command with standard nuisance regressors.
-
-    Constructs the invariant portion of the 3dDeconvolve command shared by both
-    task_act (full GLM) and task_conn (design matrix only, -x1D_stop). The caller
-    is responsible for appending stimulus timing and output flags.
-
-    Parameters
-    ----------
-    scan_path : str
-        Path to the input NIfTI time series.
-    censor_path : str
-        Path to the binary censor file.
-    motion_path : str
-        Path to the prepared motion regressor file.
-    CSF_path : str or None, optional
-        Path to the CSF mean signal file.
-    WM_path : str or None, optional
-        Path to the WM mean signal file.
-    CSF_deriv_path : str or None, optional
-        Path to the first temporal derivative of CSF signal.
-    WM_deriv_path : str or None, optional
-        Path to the first temporal derivative of WM signal.
-    tr : float or None, optional
-        Repetition time in seconds; adds -TR_times if provided.
-
-    Returns
-    -------
-    list of str
-        Partial 3dDeconvolve command: [-quiet, -input, -polort A, -censor,
-        motion -ortvec, optional tissue -ortvec flags, optional -TR_times].
-    """
-    cmd = ["3dDeconvolve", "-quiet",
-           "-input", scan_path,
-           "-polort", "A",
-           "-censor", censor_path,
-           "-ortvec", motion_path, "motion_regressors"]
-    if tr is not None:
-        cmd.extend(["-TR_times", str(tr)])
-    if CSF_path is not None:
-        cmd.extend(["-ortvec", CSF_path, "CSF_regressor"])
-    if WM_path is not None:
-        cmd.extend(["-ortvec", WM_path, "WM_regressor"])
-    if CSF_deriv_path is not None:
-        cmd.extend(["-ortvec", CSF_deriv_path, "CSF_deriv_regressor"])
-    if WM_deriv_path is not None:
-        cmd.extend(["-ortvec", WM_deriv_path, "WM_deriv_regressor"])
-    return cmd
-
-def clean_deconvolve_err(out_dir=None):
-    """Remove 3dDeconvolve.err file if it exists (always generated by AFNI).
-
-    Checks both the current working directory and out_dir (if provided).
-    """
-    for directory in filter(None, [".", out_dir]):
-        err_path = os.path.join(directory, "3dDeconvolve.err")
-        if os.path.exists(err_path):
-            os.remove(err_path)
+def hrf_for_durations(hrf_model, custom_hrf, durations):
+    """Return the AFNI stim_times model string; duration models use the mean
+    of *durations* (1.0 when empty)."""
+    if hrf_model in HRF_DURATION_MODELS:
+        mean_dur = float(durations.mean()) if len(durations) else 1.0
+        return build_hrf_string(hrf_model, mean_dur=mean_dur)
+    return build_hrf_string(hrf_model, custom_hrf=custom_hrf)
 
 def log_hrf_model(hrf_model, custom_hrf, logger):
     """Log the HRF model being used."""
@@ -1107,9 +388,131 @@ def log_nuisance_model(CSF_path, WM_path, logger, use_tissue_derivs=False):
             nuisance_parts.append("WM_deriv")
     logger.info("Nuisance regressors: %s", ", ".join(nuisance_parts))
 
-def run_afni_command(command, capture_output=False, description="", logger=None):
+
+# ---------------------------------------------------------------------------
+# Numeric I/O helpers
+# ---------------------------------------------------------------------------
+
+def load_numeric_table(path, what: str) -> np.ndarray:
+    """Load a numeric text file as a 2-D ndarray.
+
+    Parameters
+    ----------
+    path : str
+        Path to the text file.
+    what : str
+        Description for error messages (e.g. ``'motion'``).
+
+    Returns
+    -------
+    np.ndarray
+        2-D array (rows x columns).
+
+    Raises
+    ------
+    InputError
+        If the file cannot be read or parsed.
     """
-    Run an AFNI command via subprocess with standardized error handling.
+    try:
+        data = np.loadtxt(path, ndmin=2)
+    except Exception as e:
+        raise InputError(f"Cannot read {what} file '{path}': {e}") from e
+    return data
+
+
+def format_table(array: np.ndarray, fmt="%.8f") -> str:
+    """Format a 2-D array as tab-delimited text with a trailing newline.
+
+    This is the canonical format for Python-written 1D text files in the
+    package. The engine uses byte-exact comparison against this text.
+
+    Parameters
+    ----------
+    array : np.ndarray
+        2-D array (will be reshaped to 2-D if 1-D).
+    fmt : str
+        printf-style format for each value.
+
+    Returns
+    -------
+    str
+        Tab-delimited text with a trailing newline.
+    """
+    if array.ndim == 1:
+        array = array.reshape(-1, 1)
+    lines = []
+    for row in array:
+        lines.append("\t".join(fmt % v for v in row))
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Within-run tissue derivative
+# ---------------------------------------------------------------------------
+
+def compute_tissue_derivative(values: np.ndarray, run_lengths: list[int]) -> np.ndarray:
+    """Compute per-run first temporal derivative of a tissue signal.
+
+    For each run segment the first difference is computed with the first
+    element set to 0 (np.diff with prepend of the segment's first value),
+    and the segments are concatenated.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        1-D array of tissue signal values (all runs concatenated).
+    run_lengths : list[int]
+        Number of TRs in each run.
+
+    Returns
+    -------
+    np.ndarray
+        1-D array of derivatives, same length as *values*.
+
+    Raises
+    ------
+    InputError
+        If *values* is not 1-D or run lengths do not sum to its length.
+    """
+    if values.ndim != 1:
+        raise InputError(
+            f"Tissue signal must be 1-D, got shape {values.shape}."
+        )
+    if sum(run_lengths) != len(values):
+        raise InputError(
+            f"Run lengths sum to {sum(run_lengths)} but tissue signal "
+            f"has {len(values)} values."
+        )
+    segments = []
+    offset = 0
+    for n in run_lengths:
+        seg = values[offset : offset + n]
+        deriv = np.diff(seg, prepend=seg[0])
+        segments.append(deriv)
+        offset += n
+    return np.concatenate(segments)
+
+
+def write_tissue_derivative(src_path, name, run_lengths, out_path):
+    """Write the per-run first derivative of the first column of a tissue
+    file and return the written text."""
+    t = load_numeric_table(src_path, name)
+    col = t[:, 0] if t.ndim > 1 else t.ravel()
+    text = format_table(compute_tissue_derivative(col, run_lengths).reshape(-1, 1))
+    with open(out_path, "w", newline="") as f:
+        f.write(text)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# AFNI Command Execution
+# ---------------------------------------------------------------------------
+
+def run_afni_command(command, capture_output=False, description="", logger=None, cwd=None):
+    """Run an AFNI command via subprocess with standardized error handling.
+
+    On success, if the command is ``3dDeconvolve``, any AFNI warning blocks
+    in stderr are logged at WARNING.
 
     Parameters
     ----------
@@ -1120,6 +523,8 @@ def run_afni_command(command, capture_output=False, description="", logger=None)
     description : str
         Human-readable description for logging.
     logger : logging.Logger, optional
+    cwd : str or None, optional
+        Working directory for the subprocess.
 
     Returns
     -------
@@ -1138,14 +543,19 @@ def run_afni_command(command, capture_output=False, description="", logger=None)
 
     try:
         env = os.environ.copy()
-        env['AFNI_COMPRESSOR'] = 'GZIP'
+        env["AFNI_COMPRESSOR"] = "GZIP"
+        env["AFNI_USE_ERROR_FILE"] = "NO"
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
             check=True,
             env=env,
+            cwd=cwd,
         )
+        # Log AFNI warnings from 3dDeconvolve
+        if os.path.basename(command[0]) == "3dDeconvolve":
+            _log_afni_warnings(result.stderr, logger)
         if capture_output:
             return result.stdout
         return result
@@ -1158,21 +568,104 @@ def run_afni_command(command, capture_output=False, description="", logger=None)
             logger.error(msg)
         raise ToolExecutionError(msg) from e
 
-def get_3dinfo_properties(nifti_path, logger=None):
-    """
-    Get key properties from a NIfTI file using targeted 3dinfo flags.
+
+def run_afni_capture(command, description="", logger=None, cwd=None):
+    """Run an AFNI command and return the CompletedProcess without raising on failure.
+
+    Unlike ``run_afni_command``, this function never raises for a nonzero
+    exit code. It raises ``ToolExecutionError`` only if the executable
+    cannot be started (OSError).
+
+    Parameters
+    ----------
+    command : list of str
+        The command and arguments.
+    description : str
+        Human-readable description for error messages.
+    logger : logging.Logger, optional
+    cwd : str or None, optional
+        Working directory for the subprocess.
 
     Returns
     -------
-    dict with keys: 'space', 'orient', 'spacing', 'dmax'
+    subprocess.CompletedProcess
+    """
+    if logger:
+        logger.debug("Running (capture): %s", " ".join(command))
+
+    env = os.environ.copy()
+    env["AFNI_COMPRESSOR"] = "GZIP"
+    env["AFNI_USE_ERROR_FILE"] = "NO"
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            cwd=cwd,
+        )
+    except OSError as e:
+        raise ToolExecutionError(
+            f"Could not start AFNI command ({description}): "
+            f"{' '.join(command)}: {e}"
+        ) from e
+
+
+def _log_afni_warnings(stderr: str, logger) -> None:
+    """Log AFNI warning blocks from stderr at WARNING level.
+
+    A warning block starts at a line containing ``*+ WARNING`` and continues
+    with lines that do not start with ``++``, ``**``, ``*+`` or `` + ``.
+    """
+    if not logger or not stderr:
+        return
+    lines = stderr.splitlines()
+    block = []
+    in_block = False
+    for line in lines:
+        if "*+ WARNING" in line:
+            if block:
+                logger.warning("AFNI: %s", "\n".join(block))
+            block = [line]
+            in_block = True
+        elif in_block:
+            stripped = line.lstrip()
+            if stripped.startswith(("++", "**", "*+", "+ ")):
+                # End of block
+                logger.warning("AFNI: %s", "\n".join(block))
+                block = []
+                in_block = False
+            else:
+                block.append(line)
+    if block:
+        logger.warning("AFNI: %s", "\n".join(block))
+
+
+# ---------------------------------------------------------------------------
+# 3dinfo
+# ---------------------------------------------------------------------------
+
+def get_3dinfo_properties(nifti_path, logger=None, keys=None):
+    """
+    Get key properties from a NIfTI file using targeted 3dinfo flags.
+
+    Parameters
+    ----------
+    keys : iterable of str, optional
+        Subset of the available keys to query; all keys when None.
+
+    Returns
+    -------
+    dict with the requested keys among 'space' and 'dmax'
     """
     props = {}
     queries = {
         "space": ["-space"],
-        "orient": ["-orient"],
-        "spacing": ["-ad3"],
         "dmax": ["-dmax"],
     }
+    if keys is not None:
+        queries = {k: v for k, v in queries.items() if k in keys}
     for key, flags in queries.items():
         try:
             out = run_afni_command(
@@ -1189,407 +682,348 @@ def get_3dinfo_properties(nifti_path, logger=None):
 
     return props
 
-# ----------------------------------------------------------------------------
-# Template/ROI Helpers
-# ----------------------------------------------------------------------------
 
-def validate_template(scan_path, template_path, out_dir, force_diff_atlas, conn_type=None, logger=None):
+# ---------------------------------------------------------------------------
+# 3dDeconvolve base command builders
+# ---------------------------------------------------------------------------
 
-    """
-    Validate a template NIfTI against a scan, checking atlas space, orientation,
-    grid spacing, and ROI content. Resample template if grid mismatch detected.
-
-    Parameters
-    ----------
-    scan_path : str
-        Path to the input scan NIfTI.
-    template_path : str
-        Path to the template NIfTI.
-    out_dir : str
-        Output directory (for resampled templates).
-    force_diff_atlas : bool
-        If True, allow atlas mismatch with a warning.
-    conn_type : str or None
-        None = skip binary/ROI check (e.g. task_act extraction-only)
-        'seed_to_voxel' = require binary mask (max=1)
-        'parcellated' = require 2+ ROIs (max>=2)
-        'extract' = any non-empty template
-    logger : logging.Logger, optional
-
-    Returns
-    -------
-    str
-        Path to the (possibly resampled) template.
-    """
-    _log = logger or logging.getLogger(__name__)
-
-    # Get template properties
-    tpl = get_3dinfo_properties(template_path, logger=logger)
-    if any(v is None for v in tpl.values()):
-        raise InputError(f"Could not get info from --template_path {template_path} with AFNI's 3dinfo - please check your template.")
-
-    # Validate ROI content via dmax
-    try:
-        dmax_val = float(tpl["dmax"])
-        int_upper = int(dmax_val)
-    except ValueError:
-        raise GuardError(f"Template provided to --template_path contained non-numeric data max value ('{tpl['dmax']}') - please check your template.")
-
-    if dmax_val != int_upper:
-        raise InputError("Template provided to --template_path contained floats, and should only contain ints (ROI set or binary mask) - please check your template.")
-    if int_upper == 0:
-        raise InputError("Template provided to --template_path contained no data - please check your template.")
-
-    # conn_type-specific checks
-    if conn_type == "parcellated" and int_upper < 2:
-        raise ConfigError("Template provided to --template_path contained a binary mask. With --calc_conn 'parcellated', template must have at least 2 ROIs.")
-    if conn_type == "seed_to_voxel" and int_upper > 1:
-        raise ConfigError("Template provided to --template_path contained an ROI set. With --calc_conn 'seed_to_voxel', template must be a binary mask for a single ROI.")
-
-    # Get scan properties
-    scn = get_3dinfo_properties(scan_path, logger=logger)
-    if any(v is None for v in [scn["space"], scn["orient"], scn["spacing"]]):
-        raise InputError(f"Could not get info from --scan_path {scan_path} with AFNI's 3dinfo - please check your scan.")
-
-    _log.info("Specs for scan %s and template %s", scan_path, template_path)
-    _log.info("  orient template: %s | orient scan: %s", tpl["orient"], scn["orient"])
-    _log.info("  atlas  template: %s | atlas  scan: %s", tpl["space"], scn["space"])
-    _log.info("  spacing template: %s | spacing scan: %s", tpl["spacing"], scn["spacing"])
-
-    # Atlas space check
-    if tpl["space"] != scn["space"]:
-        if force_diff_atlas:
-            _log.warning("%s and %s are in different standard template spaces, but proceeding anyway with --force_diff_atlas.", scan_path, template_path)
-        else:
-            raise InputError(f"Atlas space mismatch between --scan_path {scan_path} and --template_path {template_path} - scan and template must be registered to the same atlas.")
-
-    # Orientation / grid spacing check — resample if mismatch
-    if tpl["orient"] != scn["orient"] or tpl["spacing"] != scn["spacing"]:
-        _log.warning("Orientation and/or grid spacing for --scan_path %s and --template_path %s do not match.", scan_path, template_path)
-        _log.info("Resampling --template_path %s to match --scan_path %s.", template_path, scan_path)
-
-        template_base = os.path.basename(template_path)
-        template_file_pre = template_base.replace(".nii.gz", "").replace(".nii", "")
-        resampled_path = os.path.join(out_dir, f"{template_file_pre}_resampled.nii.gz")
-
-        # Stale resampled template check: if it exists, verify grid still matches
-        needs_resample = True
-        if os.path.exists(resampled_path):
-            resamp_props = get_3dinfo_properties(resampled_path, logger=logger)
-            if resamp_props["orient"] == scn["orient"] and resamp_props["spacing"] == scn["spacing"]:
-                _log.info("Resampled template %s already exists and matches scan grid.", resampled_path)
-                needs_resample = False
-            else:
-                _log.warning("Existing resampled template %s has stale grid. Re-resampling.", resampled_path)
-                os.remove(resampled_path)
-
-        if needs_resample:
-            run_afni_command(
-                ["3dresample", "-master", scan_path, "-input", template_path,
-                 "-prefix", resampled_path],
-                description="resample template to scan grid",
-                logger=logger,
-            )
-
-            if os.path.exists(resampled_path):
-                _log.info("Successfully resampled template; saved to %s", resampled_path)
-            else:
-                raise ToolExecutionError(f"Could not resample --template_path {template_path}. Please manually resample and try again.")
-
-        return resampled_path
-    else:
-        return template_path
-
-def extract_roi_stats(nifti_path, template_path, average_type, logger=None):
-    """
-    Extract ROI-level statistics from a NIfTI file using a template via 3dROIstats.
+def build_decon_base_command(input_spec, censor_path, motion_path, ortvecs,
+                             run_starts, mask_path, tr):
+    """Build the base 3dDeconvolve command with nuisance regressors.
 
     Parameters
     ----------
-    nifti_path : str
-        Path to input NIfTI (can include sub-brik selectors).
-    template_path : str
-        Path to the ROI template NIfTI.
-    average_type : str
-        "mean" or "median".
-    logger : logging.Logger, optional
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns named ROI_1, ROI_2, ... with the extracted statistics.
-    """
-    _log = logger or logging.getLogger(__name__)
-
-    extract_cmd = ["3dROIstats", f"-nz{average_type}", "-1Dformat",
-                   "-mask", template_path, nifti_path]
-    extract_out = run_afni_command(
-        extract_cmd,
-        capture_output=True,
-        description=f"3dROIstats on {nifti_path}",
-        logger=logger,
-    )
-
-    # Parse the -1Dformat output.
-    # Format: line 0 "#File\tSub-brick", line 1 = column headers,
-    #         then for each sub-brick: label line (starts with #) + data line.
-    #         Data lines are at indices 3, 5, 7, ... (every other line from 3).
-    try:
-        lines = extract_out.strip().split("\n")
-        headers = [h.strip() for h in lines[1].split("\t") if h.strip() and h.strip() != "#"]
-        # Collect all data lines (non-comment lines after the header)
-        rows = []
-        for line in lines[2:]:
-            if line.startswith("#"):
-                continue
-            values = [v.strip() for v in line.split("\t") if v.strip()]
-            if not values:
-                continue
-            if len(headers) != len(values):
-                raise ValueError(f"Header count ({len(headers)}) != value count ({len(values)})")
-            rows.append([float(v) for v in values])
-        if not rows:
-            raise ValueError("No data lines found in 3dROIstats output")
-        out_df = pd.DataFrame(rows, columns=headers)
-    except (IndexError, ValueError) as e:
-        raise GuardError(f"Could not parse 3dROIstats output for {nifti_path}: {e}") from e
-
-    # Filter columns based on average type
-    ave_type_flag = "NZMed" if average_type == "median" else "NZMean"
-    cols_to_keep = [colname for colname in out_df.columns if ave_type_flag in colname]
-
-    if len(cols_to_keep) == 0:
-        raise GuardError(f"No columns matching '{ave_type_flag}' found in 3dROIstats output. Available columns: {list(out_df.columns)}")
-
-    new_df = out_df[cols_to_keep].copy()
-    new_df.rename(
-        columns={oldname: "ROI_" + str(oldname).split("_")[1] for oldname in new_df.columns},
-        inplace=True,
-    )
-    return new_df
-
-# ----------------------------------------------------------------------------
-# Min-Outlier EPI
-# ----------------------------------------------------------------------------
-
-def gen_min_outlier_epi(scan_path, out_dir, out_file_pre, label, logger):
-    """Extract the minimum-outlier EPI frame from a 4D scan.
-
-    Identifies the TR with the lowest voxelwise outlier fraction (via AFNI's
-    ``3dToutcount -automask -fraction``) and extracts that single volume with
-    ``3dbucket``. This produces a representative EPI frame suitable for
-    alignment QC without the blurring introduced by temporal averaging.
-
-    Parameters
-    ----------
-    scan_path : str
-        Path to the 4D NIfTI scan.
-    out_dir : str
-        Output directory.
-    out_file_pre : str
-        Output filename prefix.
-    label : str
-        Descriptive label appended to the filename. Use ``""`` for task
-        pipelines (single scan) or ``"run1"``, ``"run2"``, etc. for
-        rest_conn (per-run).
-    logger : logging.Logger
-
-    Returns
-    -------
-    str
-        Path to the extracted single-volume NIfTI.
-    """
-    # Build output filename
-    if label:
-        out_name = f"{out_file_pre}_{label}_min_outlier_epi.nii.gz"
-    else:
-        out_name = f"{out_file_pre}_min_outlier_epi.nii.gz"
-    out_path = os.path.join(out_dir, out_name)
-
-    # Skip if already exists
-    if os.path.exists(out_path):
-        logger.info("Min-outlier EPI already exists: %s", out_path)
-        return out_path
-
-    # Run 3dToutcount to get per-TR outlier fractions
-    toutcount_cmd = ["3dToutcount", "-automask", "-fraction", "-quiet", scan_path]
-    try:
-        toutcount_out = run_afni_command(
-            toutcount_cmd, capture_output=True,
-            description="3dToutcount min-outlier scan", logger=logger)
-    except Exception as e:
-        raise ToolExecutionError(f"3dToutcount failed for {scan_path}: {e}") from e
-
-    # Parse outlier fractions (one float per TR)
-    try:
-        fractions = np.array([float(v) for v in toutcount_out.strip().split()])
-    except (ValueError, AttributeError) as e:
-        raise GuardError(f"Could not parse 3dToutcount output for {scan_path}: {e}") from e
-
-    if len(fractions) == 0:
-        raise GuardError(f"3dToutcount returned no data for {scan_path}.")
-
-    min_idx = int(np.argmin(fractions))
-    logger.info("Min-outlier TR for %s: index %d (outlier fraction = %.6f).",
-                out_name, min_idx, fractions[min_idx])
-
-    # Extract the minimum-outlier volume
-    bucket_cmd = ["3dbucket", "-prefix", out_path, f"{scan_path}[{min_idx}]"]
-    try:
-        run_afni_command(bucket_cmd, description="3dbucket min-outlier EPI", logger=logger)
-    except Exception as e:
-        raise ToolExecutionError(f"3dbucket failed for {scan_path}[{min_idx}]: {e}") from e
-
-    if os.path.exists(out_path):
-        logger.info("Successfully extracted min-outlier EPI: %s", out_path)
-    else:
-        raise ToolExecutionError(f"Failed to create min-outlier EPI: {out_path}")
-
-    return out_path
-
-
-def scale_to_psc(scan_path, out_dir, out_file_pre, label, logger):
-    """Scale a 4D NIfTI to percent signal change (PSC).
-
-    Computes the voxelwise temporal mean via 3dTstat, then divides each
-    voxel's time series by its mean and multiplies by 100, with a 200%
-    ceiling and zero-guard via step functions.
-
-    Parameters
-    ----------
-    scan_path : str
-        Path to the input 4D NIfTI.
-    out_dir : str
-        Output directory.
-    out_file_pre : str
-        Output filename prefix.
-    label : str
-        Descriptive label appended to filenames. Use "" for task pipelines
-        (single concatenated scan) or "run1", "run2", etc. for rest_conn.
-    logger : logging.Logger
-
-    Returns
-    -------
-    str
-        Path to the PSC-scaled 4D NIfTI.
-    """
-    if label:
-        mean_name = f"{out_file_pre}_{label}_mean.nii.gz"
-        psc_name = f"{out_file_pre}_{label}_psc.nii.gz"
-    else:
-        mean_name = f"{out_file_pre}_mean.nii.gz"
-        psc_name = f"{out_file_pre}_psc.nii.gz"
-    mean_path = os.path.join(out_dir, mean_name)
-    psc_path = os.path.join(out_dir, psc_name)
-
-    if os.path.exists(psc_path):
-        logger.info("PSC-scaled file already exists: %s", psc_path)
-        return psc_path
-
-    run_afni_command(
-        ["3dTstat", "-mean", "-prefix", mean_path, scan_path],
-        description="3dTstat temporal mean for PSC scaling",
-        logger=logger,
-    )
-
-    run_afni_command(
-        ["3dcalc",
-         "-a", scan_path,
-         "-b", mean_path,
-         "-expr", "min(200,a/b*100)*step(a)*step(b)",
-         "-prefix", psc_path],
-        description="3dcalc PSC scaling",
-        logger=logger,
-    )
-
-    logger.info("PSC-scaled scan written to %s", psc_path)
-    return psc_path
-
-
-# ----------------------------------------------------------------------------
-# QC Summary Output
-# ----------------------------------------------------------------------------
-
-def write_qc_summary(out_dir, out_file_pre, qc_data, logger):
-    """Write a QC summary JSON file.
-
-    Parameters
-    ----------
-    out_dir : str
-        Output directory.
-    out_file_pre : str
-        Output file prefix.
-    qc_data : dict
-        QC data to write. Typical keys include:
-        - analysis_type, hrf_model, fd_threshold, censor_prev_tr
-        - n_trs_total, n_trs_censored, pct_censored
-        - per_condition_trial_counts, per_condition_surviving_trials (task only)
-        - dof (degrees of freedom)
-        - per_run_censoring (rest_conn only)
-    logger : logging.Logger
-    """
-    qc_path = os.path.join(out_dir, f"{out_file_pre}_qc_summary.json")
-    try:
-        with open(qc_path, 'w') as f:
-            json.dump(qc_data, f, indent=2)
-        logger.info("QC summary written to %s", qc_path)
-    except OSError as e:
-        logger.warning("Could not write QC summary to %s: %s", qc_path, e)
-
-
-def compute_dof(censor_path, n_regressors, logger, tr=None):
-    """Compute degrees of freedom from censor file and regressor count.
-
-    Parameters
-    ----------
+    input_spec : str
+        Path (or AFNI sub-brick selector) for -input.
     censor_path : str
-        Path to the censor file (binary 1D).
-    n_regressors : int
-        Total number of regressors in the model.
-    logger : logging.Logger
-    tr : float or None, optional
-        Repetition time in seconds. When provided, the AFNI polort A
-        polynomial regressor count (1 + floor(duration / 150)) is computed
-        from the censor file length and added to n_regressors before the
-        DOF check. When None (default), no polort adjustment is applied.
+        Path to the binary censor file.
+    motion_path : str
+        Path to the prepared motion regressor file.
+    ortvecs : list of (str, str)
+        Additional -ortvec pairs ``(path, name)``.
+    run_starts : list of int or None
+        Concatenation offsets for -concat. Pass None or a single-element
+        list to omit -concat.
+    mask_path : str or None
+        Path to a mask file (omitted when None).
+    tr : float
+        Repetition time in seconds.
 
     Returns
     -------
-    int or None
-        Degrees of freedom (n_uncensored - adjusted_n_regressors), or None
-        if the censor file could not be read. When tr is provided, the
-        returned DOF accounts for the polort A adjustment.
+    list of str
+        Partial 3dDeconvolve command (caller appends stimulus and output flags).
+    """
+    cmd = [
+        "3dDeconvolve", "-quiet",
+        "-input", input_spec,
+        "-polort", "A",
+    ]
+    if run_starts is not None and len(run_starts) > 1:
+        concat_str = "1D: " + " ".join(str(s) for s in run_starts)
+        cmd.extend(["-concat", concat_str])
+    if mask_path:
+        cmd.extend(["-mask", mask_path])
+    cmd.extend(["-censor", censor_path])
+    cmd.extend(["-ortvec", motion_path, "motion_regressors"])
+    for path, name in ortvecs:
+        cmd.extend(["-ortvec", path, name])
+    cmd.extend(["-TR_times", str(tr), "-local_times"])
+    return cmd
+
+
+def build_decon_nodata_command(total_trs, tr, run_starts, polort):
+    """Build a 3dDeconvolve -nodata command for dry runs.
+
+    Parameters
+    ----------
+    total_trs : int
+        Total number of TRs.
+    tr : float
+        Repetition time in seconds.
+    run_starts : list of int or None
+        Concatenation offsets for -concat.
+    polort : str or int
+        Polort value (e.g. ``"A"``, ``"-1"``).
+
+    Returns
+    -------
+    list of str
+        Partial 3dDeconvolve command.
+    """
+    cmd = [
+        "3dDeconvolve", "-nodata", str(total_trs), str(tr),
+        "-polort", str(polort),
+    ]
+    if run_starts is not None and len(run_starts) > 1:
+        concat_str = "1D: " + " ".join(str(s) for s in run_starts)
+        cmd.extend(["-concat", concat_str])
+    cmd.extend(["-local_times"])
+    return cmd
+
+
+# ---------------------------------------------------------------------------
+# REML_cmd collection
+# ---------------------------------------------------------------------------
+
+def collect_reml_cmds(staging_dir, pre, step):
+    """Collect and rename REML_cmd files from a staging directory.
+
+    Unprefixed REML_cmd files (e.g. ``3dDeconvolve.REML_cmd``,
+    ``Decon.REML_cmd``) are renamed to ``{pre}_{step}.REML_cmd``. More
+    than one unprefixed file raises GuardError.
+
+    Parameters
+    ----------
+    staging_dir : str
+        Absolute path to the staging directory.
+    pre : str
+        Output file prefix.
+    step : str
+        Step label for the renamed file.
+
+    Returns
+    -------
+    list of (str, str)
+        Each element is ``(relpath, 'reml_cmd')`` where relpath is the
+        filename relative to the staging directory.
 
     Raises
     ------
-    ModelError
-        If DOF < 1 (too many TRs censored and/or too many regressors).
+    GuardError
+        If multiple unprefixed REML_cmd files exist or a prefixed file
+        does not start with *pre*.
     """
-    try:
-        censor_data = np.loadtxt(censor_path)
-        n_uncensored = int(np.sum(censor_data == 1))
-        if tr is not None:
-            n_poly = 1 + int((len(censor_data) * tr) / 150.0)
-            n_regressors = n_regressors + n_poly
-    except Exception:
-        logger.warning("Could not read censor file for DOF check.")
-        return None
-    dof = n_uncensored - n_regressors
-    logger.info("Estimated DOF: %d (uncensored TRs: %d, regressors: %d)",
-                dof, n_uncensored, n_regressors)
-    if dof < 1:
-        raise ModelError(
-            f"Insufficient degrees of freedom (DOF={dof}). "
-            "Too many TRs censored and/or too many regressors for AFNI "
-            "to produce valid output. Consider relaxing the FD threshold "
-            "or reducing the model complexity."
+    from . import names as _names  # avoid circular at module level
+
+    results = []
+    unprefixed = []
+    for entry in os.listdir(staging_dir):
+        if entry.endswith(".REML_cmd"):
+            full = os.path.join(staging_dir, entry)
+            if not os.path.isfile(full):
+                continue
+            if entry.startswith(pre):
+                results.append((entry, "reml_cmd"))
+            else:
+                unprefixed.append(entry)
+
+    if len(unprefixed) > 1:
+        raise GuardError(
+            f"Multiple unprefixed REML_cmd files in {staging_dir}: {unprefixed}"
         )
-    return dof
+    if unprefixed:
+        old = os.path.join(staging_dir, unprefixed[0])
+        new_name = _names.reml_cmd(pre, step)
+        new = os.path.join(staging_dir, new_name)
+        os.replace(old, new)
+        results.append((new_name, "reml_cmd"))
+
+    # Validate prefixed files
+    for relpath, _ in results:
+        if not relpath.startswith(pre):
+            raise GuardError(
+                f"REML_cmd file '{relpath}' does not start with prefix '{pre}'."
+            )
+
+    return results
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Min-outlier EPI extraction
+# ---------------------------------------------------------------------------
+
+def gen_min_outlier_epi(source_path, start, n_vols, out_path, logger, cwd=None):
+    """Extract the minimum-outlier EPI frame from a volume range.
+
+    Parameters
+    ----------
+    source_path : str
+        Path to the 4D NIfTI scan.
+    start : int
+        First volume index (0-based).
+    n_vols : int
+        Number of volumes in the range.
+    out_path : str
+        Path for the output single-volume NIfTI.
+    logger : logging.Logger
+    cwd : str or None, optional
+        Working directory for the subprocess.
+
+    Returns
+    -------
+    dict
+        ``{'tr_index': int, 'fraction': float}``
+
+    Raises
+    ------
+    ToolExecutionError
+        If 3dToutcount output cannot be parsed or 3dbucket fails.
+    """
+    selector = f"{source_path}[{start}..{start + n_vols - 1}]"
+    toutcount_out = run_afni_command(
+        ["3dToutcount", "-automask", "-fraction", selector],
+        capture_output=True,
+        description="3dToutcount min-outlier scan",
+        logger=logger,
+        cwd=cwd,
+    )
+
+    try:
+        fractions = [float(v) for v in toutcount_out.strip().split()]
+    except (ValueError, AttributeError) as e:
+        raise ToolExecutionError(
+            f"Could not parse 3dToutcount output for {selector}: {e}"
+        ) from e
+
+    if not fractions:
+        raise ToolExecutionError(
+            f"3dToutcount returned no data for {selector}."
+        )
+
+    idx = int(np.argmin(fractions))
+    logger.info(
+        "Min-outlier TR: index %d (outlier fraction = %.6f).",
+        idx, fractions[idx],
+    )
+
+    run_afni_command(
+        ["3dbucket", "-prefix", out_path,
+         f"{source_path}[{start + idx}]"],
+        description="3dbucket min-outlier EPI",
+        logger=logger,
+        cwd=cwd,
+    )
+
+    return {"tr_index": idx, "fraction": fractions[idx]}
+
+
+# ---------------------------------------------------------------------------
+# Censor-interpolation and bandpass filtering of 1D files
+# ---------------------------------------------------------------------------
+
+def censor_interpolate_1d_afni(input_path, tr, censor_path, out_dir,
+                                out_prefix, label, logger, cwd=None):
+    """Interpolate censored TRs in a nuisance regressor 1D file using AFNI 3dTproject -cenmode NTRP.
+
+    Invokes ``3dTproject`` with ``-cenmode NTRP`` to replace censored TRs with
+    interpolated values in the input 1D file.  Because AFNI interprets .1D files
+    as rows=voxels, cols=timepoints, the input is presented to 3dTproject with a
+    trailing apostrophe (AFNI transpose operator) so the time axis is read
+    correctly.  After the command executes, ``1dtranspose`` is applied to restore
+    rows=TRs, cols=columns for all downstream consumers.
+
+    Parameters
+    ----------
+    input_path : str
+        Path to the input 1D file (rows=TRs orientation).
+    tr : float
+        Repetition time in seconds.
+    censor_path : str
+        Path to the AFNI-format censor file (1=keep, 0=censor).
+    out_dir : str
+        Output directory for the interpolated file.
+    out_prefix : str
+        Filename prefix for the output filename.
+    label : str
+        Descriptive label appended to the output filename.
+    logger : logging.Logger
+    cwd : str or None, optional
+        Working directory for the subprocess.
+
+    Returns
+    -------
+    str
+        Absolute path to the interpolated 1D file.
+    """
+    out_path = os.path.join(out_dir, f"{out_prefix}_{label}_interp.1D")
+
+    cmd = ["3dTproject",
+           "-polort", "-1",
+           "-dt", str(tr),
+           "-input", f"{input_path}'",
+           "-censor", censor_path,
+           "-cenmode", "NTRP",
+           "-prefix", out_path]
+
+    run_afni_command(cmd, description=f"3dTproject NTRP interpolate {label}",
+                     logger=logger, cwd=cwd)
+
+    if not os.path.exists(out_path):
+        raise ToolExecutionError(f"Expected NTRP-interpolated 1D file not found: {out_path}")
+
+    # Restore rows=TRs, cols=cols orientation (3dTproject output is transposed)
+    transposed_path = out_path + ".transposed.1D"
+    transpose_cmd = ["1dtranspose", out_path, transposed_path]
+    run_afni_command(transpose_cmd, description=f"1dtranspose interpolate {label}",
+                     logger=logger, cwd=cwd)
+    if not os.path.exists(transposed_path):
+        raise ToolExecutionError(f"1dtranspose failed for interpolated 1D file: {out_path}")
+    os.replace(transposed_path, out_path)
+
+    logger.info("NTRP-interpolated 1D file (rows=TRs, cols=cols) saved to %s", out_path)
+    return out_path
+
+
+def bandpass_filter_1d_afni(input_path, tr, bandpass, out_dir, out_prefix,
+                             label, logger, cwd=None):
+    """Bandpass-filter a nuisance regressor 1D file using AFNI 3dBandpass.
+
+    3dBandpass applies its default quadratic detrend, matching the BOLD path.
+
+    Parameters
+    ----------
+    input_path : str
+        Path to the input 1D file (rows=TRs orientation).
+    tr : float
+        Repetition time in seconds.
+    bandpass : list or tuple of float
+        ``[fbot, ftop]`` passband in Hz.
+    out_dir : str
+        Output directory for the filtered file.
+    out_prefix : str
+        Filename prefix for the output filename.
+    label : str
+        Descriptive label appended to the output filename.
+    logger : logging.Logger
+    cwd : str or None, optional
+        Working directory for the subprocess.
+
+    Returns
+    -------
+    str
+        Absolute path to the bandpass-filtered 1D file.
+    """
+    out_path = os.path.join(out_dir, f"{out_prefix}_{label}_bp.1D")
+
+    cmd = ["3dBandpass",
+           "-dt", str(tr),
+           "-prefix", out_path,
+           str(bandpass[0]), str(bandpass[1]),
+           f"{input_path}'"]
+
+    run_afni_command(cmd, description=f"3dBandpass {label}",
+                     logger=logger, cwd=cwd)
+
+    if not os.path.exists(out_path):
+        raise ToolExecutionError(f"Expected bandpass-filtered 1D file not found: {out_path}")
+
+    # Restore rows=TRs, cols=cols orientation (3dBandpass output is transposed)
+    transposed_path = out_path + ".transposed.1D"
+    transpose_cmd = ["1dtranspose", out_path, transposed_path]
+    run_afni_command(transpose_cmd, description=f"1dtranspose {label}",
+                     logger=logger, cwd=cwd)
+    if not os.path.exists(transposed_path):
+        raise ToolExecutionError(f"1dtranspose failed for bandpass-filtered 1D file: {out_path}")
+    os.replace(transposed_path, out_path)
+
+    logger.info("Bandpass-filtered 1D file (rows=TRs, cols=cols) saved to %s", out_path)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # Contrast Parsing
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def valid_contrast_functions(contrast_list, contrast_labs_list, cond_list, logger=None):
     """Parse and validate linear contrast equations.
@@ -1603,7 +1037,10 @@ def valid_contrast_functions(contrast_list, contrast_labs_list, cond_list, logge
 
     # Check that contrast_list and contrast_labs_list are same size
     if len(contrast_list) != len(contrast_labs_list):
-        raise ConfigError("Every contrast in --contrast_functions must have a label in --contrast_labels")
+        raise ConfigError(
+            f"Every contrast function must have exactly one contrast label "
+            f"({len(contrast_list)} functions, {len(contrast_labs_list)} labels)."
+        )
 
     # Regex for a single term: optional sign, a numeric coefficient, *, condition name
     _TERM_RE = re.compile(r'([+-]?\d*\.?\d+)\*(\w+)')
@@ -1649,28 +1086,25 @@ def valid_contrast_functions(contrast_list, contrast_labs_list, cond_list, logge
         # Check all contrast conditions exist in cond_list
         for item in conds:
             if item not in cond_list:
-                raise ConfigError(f"Contrast '{raw}' references condition '{item}' which is not in --cond_labels ({cond_list}).")
-
-        # Validate coefficients are valid floats
-        for item in coefs:
-            try:
-                float(item)
-            except ValueError:
-                raise ConfigError(f"Contrast '{raw}' has invalid coefficient '{item}'.")
+                raise ConfigError(
+                    f"Contrast '{raw}' references condition '{item}' "
+                    f"which is not among the configured condition labels ({cond_list})."
+                )
 
         # Warn about zero coefficients (technically valid but likely a mistake)
         for coef, cond in zip(coefs, conds):
             if float(coef) == 0.0:
-                logger.warning("Contrast '%s': coefficient for '%s' is 0 — "
-                               "this condition will have no effect.", raw, cond)
+                if logger:
+                    logger.warning("Contrast '%s': coefficient for '%s' is 0 -- "
+                                   "this condition will have no effect.", raw, cond)
 
         out.append({'COEFS': coefs, 'CONDS': conds})
     return out
 
 
-# ----------------------------------------------------------------------------
-# Connectivity Contrast Helpers
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Filename Sanitization
+# ---------------------------------------------------------------------------
 
 def sanitize_filename_label(label):
     """Replace filesystem-unsafe characters with underscores.
@@ -1682,348 +1116,3 @@ def sanitize_filename_label(label):
     sanitized = re.sub(r'[^\w.\-]', '_', label)
     sanitized = re.sub(r'_+', '_', sanitized)
     return sanitized.strip('_')
-
-
-def build_conn_output_path(out_dir, conn_out_file_pre, condition, fishZ, pcorr, calc_conn):
-    """Construct the expected connectivity output path for a given condition.
-
-    Parameters
-    ----------
-    out_dir : str
-        Output directory.
-    conn_out_file_pre : str
-        Connectivity output file prefix.
-    condition : str
-        Condition name.
-    fishZ : bool
-        Whether Fisher Z-transform was applied.
-    pcorr : bool
-        Whether partial correlation was used.
-    calc_conn : str
-        Either 'parcellated' or 'seed_to_voxel'.
-
-    Returns
-    -------
-    str
-        Full path to the expected connectivity output file.
-    """
-    prefix = f"{conn_out_file_pre}_{condition}"
-    out_path = os.path.join(out_dir, prefix)
-
-    if calc_conn == "parcellated":
-        if fishZ and pcorr:
-            out_path += "_pcorr_fishZ_mat.txt"
-        elif fishZ:
-            out_path += "_fishZ_mat.txt"
-        elif pcorr:
-            out_path += "_pcorr_mat.txt"
-        else:
-            out_path += "_corr_mat.txt"
-    else:  # seed_to_voxel
-        if fishZ and pcorr:
-            out_path += "_pcorr_fishZ.nii.gz"
-        elif fishZ:
-            out_path += "_fishZ.nii.gz"
-        elif pcorr:
-            out_path += "_pcorr.nii.gz"
-        else:
-            out_path += "_corr.nii.gz"
-
-    return out_path
-
-
-def compute_matrix_contrast(condition_matrix_paths, coefs, out_path, logger):
-    """Apply a weighted linear combination to tab-delimited square connectivity matrices.
-
-    Parameters
-    ----------
-    condition_matrix_paths : list of str
-        Paths to the condition-specific connectivity matrices (tab-delimited text).
-    coefs : list of str
-        Coefficients corresponding to each matrix (as strings, will be cast to float).
-    out_path : str
-        Path to save the resulting contrast matrix.
-    logger : logging.Logger
-
-    Raises
-    ------
-    InputError
-        If matrices have mismatched dimensions or cannot be loaded.
-    """
-    matrices = []
-    for path in condition_matrix_paths:
-        try:
-            mat = np.loadtxt(path, delimiter='\t')
-        except Exception as e:
-            raise InputError(f"Could not load connectivity matrix '{path}': {e}") from e
-        matrices.append(mat)
-
-    # Validate all matrices have identical dimensions
-    ref_shape = matrices[0].shape
-    for i, mat in enumerate(matrices[1:], start=1):
-        if mat.shape != ref_shape:
-            raise InputError(
-                f"Connectivity matrix dimension mismatch: '{condition_matrix_paths[i]}' has shape {mat.shape}, "
-                f"expected {ref_shape} (from '{condition_matrix_paths[0]}')."
-            )
-
-    # Compute weighted linear combination
-    result = np.zeros(ref_shape)
-    for coef_str, mat in zip(coefs, matrices):
-        result += float(coef_str) * mat
-
-    # Write using standard I/O (avoids numpy DataSource path resolution issues)
-    if result.ndim == 1:
-        result = result.reshape(1, -1)
-    with open(out_path, 'w') as f:
-        for row in result:
-            f.write('\t'.join(f'{val:.8f}' for val in row) + '\n')
-    logger.info("Connectivity contrast matrix saved to %s", out_path)
-
-
-# ----------------------------------------------------------------------------
-# Connectivity Functions
-# ----------------------------------------------------------------------------
-
-def seed_to_voxel_conn(inset_path, out_dir, conn_out_file_pre, template_path, fishZ, pcorr, condition=None, logger=None):
-
-    """
-    Run seed-to-voxel functional connectivity using AFNI's 3dNetCorr.
-
-    Parameters
-    ----------
-    inset_path : str
-        Path to the input time series / beta series NIfTI.
-    out_dir : str
-        Output directory.
-    conn_out_file_pre : str
-        Output file prefix.
-    template_path : str
-        Path to the binary seed mask.
-    fishZ : bool
-        Whether to Fisher Z-transform correlations.
-    pcorr : bool
-        Whether to use partial correlation.
-    condition : str or None
-        If provided, included in the output filename (task-based).
-        If None, omitted (resting-state).
-    logger : logging.Logger, optional
-    """
-    _log = logger or logging.getLogger(__name__)
-
-    # Build output prefix and final path
-    if condition is not None:
-        prefix = f"{conn_out_file_pre}_{condition}"
-    else:
-        prefix = conn_out_file_pre
-
-    out_path = os.path.join(out_dir, prefix)
-    if fishZ and pcorr:
-        out_path += "_pcorr_fishZ.nii.gz"
-    elif fishZ:
-        out_path += "_fishZ.nii.gz"
-    elif pcorr:
-        out_path += "_pcorr.nii.gz"
-    else:
-        out_path += "_corr.nii.gz"
-
-    if os.path.exists(out_path):
-        _log.info("Functional connectivity for %s already exists.", prefix)
-        return
-
-    # Build and run 3dNetCorr
-    netcorr_prefix = os.path.join(out_dir, prefix)
-    netCorr_command = [
-        "3dNetCorr", "-prefix", netcorr_prefix,
-        "-inset", inset_path,
-        "-in_rois", template_path, "-push_thru_many_zeros",
-        "-ts_wb_corr", "-nifti",
-    ]
-    if fishZ:
-        netCorr_command.append("-ts_wb_Z")
-    if pcorr:
-        netCorr_command.append("-part_corr")
-
-    try:
-        run_afni_command(netCorr_command, description="3dNetCorr seed-to-voxel", logger=logger)
-    except ToolExecutionError:
-        _log.warning("Could not create functional connectivity for seed %s.", template_path)
-        return
-
-    # Clean up auxiliary outputs
-    for ext in ["_000.niml.dset", "_000.roidat", "_000.netcc"]:
-        aux = f"{netcorr_prefix}{ext}"
-        if os.path.exists(aux):
-            os.remove(aux)
-
-    # Move the connectivity map from the INDIV directory
-    indiv_dir = f"{netcorr_prefix}_000_INDIV"
-    if os.path.isdir(indiv_dir):
-        if fishZ:
-            src_file = os.path.join(indiv_dir, "WB_Z_ROI_001.nii.gz")
-            alt_file = os.path.join(indiv_dir, "WB_CORR_ROI_001.nii.gz")
-            if os.path.exists(src_file):
-                os.rename(src_file, out_path)
-                if os.path.exists(alt_file):
-                    os.remove(alt_file)
-            else:
-                _log.warning("Could not create functional connectivity for seed %s.", template_path)
-        else:
-            src_file = os.path.join(indiv_dir, "WB_CORR_ROI_001.nii.gz")
-            if os.path.exists(src_file):
-                os.rename(src_file, out_path)
-            else:
-                _log.warning("Could not create functional connectivity for seed %s.", template_path)
-
-        # Remove the (now empty) INDIV directory
-        try:
-            os.rmdir(indiv_dir)
-        except OSError:
-            shutil.rmtree(indiv_dir, ignore_errors=True)
-
-        if os.path.exists(out_path):
-            _log.info("Seed-to-voxel functional connectivity maps created for %s with seed from template %s.", prefix, template_path)
-        else:
-            _log.warning("Could not move functional connectivity file for seed %s. Check permissions and rerun.", template_path)
-    else:
-        _log.warning("Could not create functional connectivity for seed %s.", template_path)
-
-def format_netcorr_mat(netcorr_file, fishZ, pcorr, curr_out_path):
-    """Parse a 3dNetCorr .netcc output file and save the desired matrix as tab-delimited text.
-
-    The .netcc file contains multiple labeled matrix sections. The section to extract
-    depends on the fishZ and pcorr flags:
-    - fishZ=False, pcorr=False  → CC (Pearson correlation)
-    - fishZ=False, pcorr=True   → PC (partial correlation)
-    - fishZ=True,  pcorr=False  → FZ (Fisher Z-transformed correlation)
-    - fishZ=True,  pcorr=True   → PCB (Fisher Z-transformed partial correlation)
-
-    Parameters
-    ----------
-    netcorr_file : str
-        Path to the 3dNetCorr .netcc output file.
-    fishZ : bool
-        Whether Fisher Z-transform was requested.
-    pcorr : bool
-        Whether partial correlation was requested.
-    curr_out_path : str
-        Destination path for the tab-delimited matrix text file.
-    """
-    if not fishZ and not pcorr:
-        entry_to_check = "CC"
-        end_to_check = "Z"
-    elif not fishZ and pcorr:
-        entry_to_check = "PC"
-        end_to_check = "PCB"
-    elif fishZ and not pcorr:
-        entry_to_check = "FZ"
-        end_to_check = "Z"
-    else:
-        entry_to_check = "PCB"
-        end_to_check = "Z"
-
-    conn_mat = []
-    with open(netcorr_file) as f:
-        for line in f:
-            if line:
-                parts = line.split()
-                conn_mat.append([entry.strip() for entry in parts])
-
-    start_row = 0
-    end_row = 0
-    for i, entry in enumerate(conn_mat):
-        if len(entry) == 2 and entry[1] == entry_to_check:
-            start_row = i + 1
-            for j, next_entry in enumerate(conn_mat[i + 1:]):
-                if len(next_entry) == 2 and next_entry[1] == end_to_check:
-                    end_row = j + i + 1
-                    break
-            if end_row == 0:
-                end_row = len(conn_mat)
-            break
-
-    out_conn_mat = conn_mat[start_row:end_row]
-    with open(curr_out_path, "w") as f:
-        for row in out_conn_mat:
-            f.write("\t".join(str(x) for x in row) + "\n")
-
-def parcellated_conn(inset_path, out_dir, conn_out_file_pre, template_path, fishZ, pcorr, condition=None, logger=None):
-
-    """
-    Run parcellated (ROI-to-ROI) functional connectivity using AFNI's 3dNetCorr.
-
-    Parameters
-    ----------
-    inset_path : str
-        Path to the input time series / beta series NIfTI.
-    out_dir : str
-        Output directory.
-    conn_out_file_pre : str
-        Output file prefix.
-    template_path : str
-        Path to the multi-ROI parcellation template.
-    fishZ : bool
-        Whether to Fisher Z-transform correlations.
-    pcorr : bool
-        Whether to use partial correlation.
-    condition : str or None
-        If provided, included in the output filename (task-based).
-        If None, omitted (resting-state).
-    logger : logging.Logger, optional
-    """
-    _log = logger or logging.getLogger(__name__)
-
-    # Build output prefix and final path
-    if condition is not None:
-        prefix = f"{conn_out_file_pre}_{condition}"
-    else:
-        prefix = conn_out_file_pre
-
-    out_path = os.path.join(out_dir, prefix)
-    if fishZ and pcorr:
-        out_path += "_pcorr_fishZ_mat.txt"
-    elif fishZ:
-        out_path += "_fishZ_mat.txt"
-    elif pcorr:
-        out_path += "_pcorr_mat.txt"
-    else:
-        out_path += "_corr_mat.txt"
-
-    if os.path.exists(out_path):
-        _log.info("Functional connectivity for %s already exists.", prefix)
-        return
-
-    # Build and run 3dNetCorr
-    netcorr_prefix = os.path.join(out_dir, prefix)
-    netCorr_command = [
-        "3dNetCorr", "-prefix", netcorr_prefix,
-        "-inset", inset_path,
-        "-in_rois", template_path, "-push_thru_many_zeros",
-    ]
-    if fishZ:
-        netCorr_command.append("-fish_z")
-    if pcorr:
-        netCorr_command.append("-part_corr")
-
-    try:
-        run_afni_command(netCorr_command, description="3dNetCorr parcellated", logger=logger)
-    except ToolExecutionError:
-        _log.warning("Could not create functional connectivity for template %s.", template_path)
-        return
-
-    # Clean up auxiliary outputs
-    for ext in ["_000.niml.dset", "_000.roidat"]:
-        aux = f"{netcorr_prefix}{ext}"
-        if os.path.exists(aux):
-            os.remove(aux)
-
-    netcc_file = f"{netcorr_prefix}_000.netcc"
-    if os.path.exists(netcc_file):
-        format_netcorr_mat(netcc_file, fishZ, pcorr, out_path)
-        if os.path.exists(out_path):
-            os.remove(netcc_file)
-            _log.info("Parcellated functional connectivity matrix created for %s with ROIs from template %s.", prefix, template_path)
-        else:
-            raise ToolExecutionError(f"Could not format functional connectivity for template {template_path}. Likely an internal bug.")
-    else:
-        raise ToolExecutionError(f"Could not create functional connectivity for template {template_path}.")

@@ -49,6 +49,6 @@
   <action_items>
     <item priority="P2" target_mode="document" description="Update INPUT_SPECIFICATION.md to describe the new rest_conn use_sequenced_bandpass boolean key (default False), its effect (selects sequenced six-step Ciric-inspired denoising path instead of the default simultaneous 3dTproject path), and its interaction with keep_run_res_dtseries (False clears the per-run intermediate subdirectory; True or any failure preserves it for inspection)." />
     <item priority="P2" target_mode="document" description="Update README.md key-features list to mention the new sequenced-bandpass option for users with high-motion data who experience excessive DOF loss with the default simultaneous pipeline." />
-    <item priority="P2" target_mode="document" description="Add module-level docstring entries to rest_conn_first_level.py introducing _generate_run_residual_simultaneous and _generate_run_residual_sequenced as the two backends; reference the Ciric et al. 2017 (PMID 30446748) and Hallquist et al. 2013 motivations briefly so future readers understand the design rationale." />
+    <item priority="P2" target_mode="document" description="Add module-level docstring entries to rest_conn_first_level.py introducing _generate_run_residual_simultaneous and _generate_run_residual_sequenced as the two backends; reference the Ciric et al. 2017 (PMID 28302591) and Hallquist et al. 2013 motivations briefly so future readers understand the design rationale." />
   </action_items>
 </test_report>

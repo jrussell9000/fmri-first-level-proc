@@ -3,26 +3,45 @@
 # ============================================================================
 #
 # Usage:
-#   run-first-level --config example_config.yaml --dry-run
-#   run-first-level --config example_config.yaml
-#   run-first-level --config example_config.yaml --analyses 0 2
+#   fmri-first-level-proc --config example_config.yaml --dry-run
+#   fmri-first-level-proc --config example_config.yaml
+#   fmri-first-level-proc --config example_config.yaml --analyses 0 2
 #      --analyses 0 2 => only first and third analysis blocks will be run
 #
 # This file demonstrates all three analysis types with every available option.
 # Replace placeholder paths with real file paths before running.
-
+#
+# Events files may use BIDS columns (onset, duration, trial_type) or
+# CONDITION columns (CONDITION, ONSET, DURATION), tab- or comma-delimited.
+#
+# Output prefixes (out_file_pre, extract_out_file_pre, conn_out_file_pre)
+# and condition labels must use only letters, digits, '.', '_' or '-' and
+# start with a letter or digit. Quote numeric condition codes ("1").
+#
+# Each analysis block is validated and run independently; --dry-run also
+# checks every block's input files. Each block's outcome is recorded in
+# its {out_file_pre}_qc_summary.json under run_status.
+#
+# BIDS discovery (instead of paths): set derivatives_dirs (a YAML list) and,
+# in the block, subject and task as quoted strings, e.g.
+#   derivatives_dirs: ["/path/to/derivatives"]
+#   subject: "01"
+#   session: "baseline"
+#   task: "nback"
+#
 # ============================================================================
 
 # --------------------------------------------------------------------------
 # GLOBAL SETTINGS
 # --------------------------------------------------------------------------
 # These values apply uniformly to all analysis blocks. They cannot be
-# overridden per-block.
+# overridden per-block: placing tr, num_cores, template_path or
+# force_diff_atlas inside an analysis block is a ConfigError.
 
 global:
   num_cores: 1                   # CPU cores for AFNI parallel processing
-  tr: 0.8                        # Repetition time in seconds (applies to all scans)
-  template_path: null            # Path to shared ROI template (.nii.gz), or null
+  tr: 0.8                        # Repetition time in seconds (applies to all scans; must match each scan's header TR)
+  template_path: "/path/to/template.nii.gz"  # Shared ROI template (.nii.gz); required by every extraction and connectivity option below (null only if none are used)
   force_diff_atlas: false        # true = allow atlas mismatch (USE WITH CAUTION)
 
 # --------------------------------------------------------------------------
@@ -37,10 +56,13 @@ analyses:
   # ========================================================================
   # Runs first-level regression with 3dDeconvolve, optionally extracts
   # condition/contrast-specific maps and parcel-level statistics.
+  #
+  # This example uses Mode B: a single concatenated scan with run_lengths
+  # and run_labels describing the run boundaries within it.
   - name: "nback_activation"
     type: "task_act"
 
-    # -- Per-participant input file paths --
+    # -- Per-participant input file paths (Mode B: single concatenated file) --
     paths:
       scan_path: "/path/to/subj001_nback_concat.nii.gz"
       task_timing_path: "/path/to/subj001_nback_timing.csv"
@@ -48,23 +70,52 @@ analyses:
       CSF_path: null             # mean CSF BOLD signal per TR, or null
       WM_path: null              # mean WM BOLD signal per TR, or null
 
+    # -- Mode A alternative (commented out): per-run files instead of a
+    #    single concatenated scan with run_lengths. Mode A and Mode B
+    #    cannot be mixed within one analysis block. --
+    # paths:
+    #   scan_paths:
+    #     - "/path/to/subj001_nback_run1.nii.gz"
+    #     - "/path/to/subj001_nback_run2.nii.gz"
+    #   task_timing_paths:
+    #     - "/path/to/subj001_nback_run1_timing.csv"
+    #     - "/path/to/subj001_nback_run2_timing.csv"
+    #   motion_paths:
+    #     - "/path/to/subj001_nback_run1_motion.txt"
+    #     - "/path/to/subj001_nback_run2_motion.txt"
+    #   CSF_path: null
+    #   WM_path: null
+
+    # -- Run structure (required) --
+    run_lengths: [300, 300]        # volumes per run, in acquisition order (Mode B only)
+    run_labels: [1, 2]             # integer run identity, aligned with run_lengths
+
     # -- Output settings --
     out_dir: "/path/to/output/subj001/nback_act"
     out_file_pre: "subj001_nback_baseline"
 
-    # -- Condition labels (must match CONDITION column in timing CSV) --
+    # -- Condition labels (must match trial_type (BIDS) or CONDITION values in the events file) --
     cond_labels: ["stimFear", "stimSad", "stimNeu"]
 
     # -- Block settings --
-    remove_previous: false       # true = delete all files in out_dir before running
+    remove_previous: false       # true = delete all files recorded in this analysis's ledger before running
     average_type: "mean"         # "mean" or "median" for parcel averaging
-    fd_threshold: 0.9            # FD threshold (mm) for motion censoring
+    fd_threshold: 0.9            # Power et al. (2012) framewise displacement censor threshold (mm; 50 mm sphere; a TR is censored when FD > fd_threshold)
     censor_prev_tr: true         # Also censor the TR before each high-motion TR
     hrf_model: "GAM"             # "GAM" | "BLOCK" | "dmBLOCK" | "SPMG1" | "custom"
     custom_hrf: null             # Required when hrf_model is "custom", e.g. "TENT(0,14,8)"
     include_motion_derivs: false # true = use first 12 columns (base + derivs); false = use first 6 columns only
     use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM) as additional regressors
     scale_to_psc: true           # true = scale BOLD to percent signal change before regression (recommended)
+    roi_zero_handling: "exclude" # "exclude" = ignore zero-valued voxels in parcel aggregation; "include" = include them
+
+    # -- Spatial smoothing (optional) --
+    smoothing:
+      enabled: false              # true = apply 3dBlurToFWHM to voxelwise outputs only
+      fwhm: null                  # target FWHM in mm (at most two decimal places); required when enabled
+      # When enabled, smoothed voxelwise outputs (and their index JSONs) are
+      # written alongside the unsmoothed outputs with a "_s{N}mm" filename
+      # suffix. Parcel-level CSVs are always computed from unsmoothed data.
 
     # -- Contrasts --
     # functions: null = disabled; list of equations = enabled
@@ -78,8 +129,8 @@ analyses:
 
     # -- Extraction --
     extraction:
-      stat_buckets: ["Tstat", "Zstat"]  # list of stat types to extract as multi-sub-brick NIfTIs; valid: "Coef", "Tstat", "Fstat", "R^2", "Zstat"; null = disabled
-      extract_out_file_pre: "subj001_nback_baseline_Shen368"
+      stat_buckets: ["Coef", "Tstat", "Fstat", "R^2", "Zstat"]  # stat types to extract as multi-sub-brick NIfTIs (each includes its Full_ model sub-brick where AFNI writes one); sub-bricks are keyed by their 3dinfo label in {ext}_{stat}_index.json; null = disabled
+      extract_out_file_pre: "subj001_nback_baseline_Shen368"  # required by stat_buckets, extract_resids and extract_raw_ptseries
       extract_resids: false      # true = extract residuals as well as stats
       extract_raw_ptseries: false  # true = extract pre-regression parcellated time series (requires template_path and extract_out_file_pre)
 
@@ -88,15 +139,27 @@ analyses:
   # ========================================================================
   # Generates beta series via 3dLSS, optionally extracts parcel-level beta
   # series, and optionally computes functional connectivity.
+  #
+  # This example uses Mode A: per-run files with run_labels inferred from
+  # discovery or supplied explicitly.
   - name: "nback_connectivity"
     type: "task_conn"
 
     paths:
-      scan_path: "/path/to/subj001_nback_concat.nii.gz"
-      task_timing_path: "/path/to/subj001_nback_timing.csv"
-      motion_path: "/path/to/subj001_nback_motion.txt"
+      scan_paths:
+        - "/path/to/subj001_nback_run1.nii.gz"
+        - "/path/to/subj001_nback_run2.nii.gz"
+      task_timing_paths:
+        - "/path/to/subj001_nback_run1_timing.csv"
+        - "/path/to/subj001_nback_run2_timing.csv"
+      motion_paths:
+        - "/path/to/subj001_nback_run1_motion.txt"
+        - "/path/to/subj001_nback_run2_motion.txt"
       CSF_path: null            # mean CSF BOLD signal per TR, or null
       WM_path: null             # mean WM BOLD signal per TR, or null
+
+    # -- Run structure (required) --
+    run_labels: [1, 2]           # integer run identity, aligned with scan_paths (Mode A)
 
     out_dir: "/path/to/output/subj001/nback_conn"
     out_file_pre: "subj001_nback_baseline"
@@ -106,17 +169,28 @@ analyses:
     cond_beta_labels: ["stimFear", "stimSad", "stimNeu"]
 
     # -- Block settings --
-    remove_previous: false       # true = delete all files in out_dir before running
+    remove_previous: false       # true = delete all files recorded in this analysis's ledger before running
     average_type: "mean"         # "mean" or "median" for parcel averaging
-    fd_threshold: 0.9            # FD threshold (mm) for motion censoring
+    fd_threshold: 0.9            # Power et al. (2012) framewise displacement censor threshold (mm; 50 mm sphere; a TR is censored when FD > fd_threshold)
     censor_prev_tr: true         # Also censor the TR before each high-motion TR
     hrf_model: "GAM"             # "GAM" | "BLOCK" | "dmBLOCK" | "SPMG1" | "custom"
     custom_hrf: null             # Required when hrf_model is "custom", e.g. "TENT(0,14,8)"
     include_motion_derivs: false # true = use first 12 columns (base + derivs); false = use first 6 columns only
     use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM) as additional regressors
     scale_to_psc: true           # true = scale BOLD to percent signal change before regression (recommended)
+    roi_zero_handling: "exclude" # "exclude" = ignore zero-valued voxels in parcel aggregation; "include" = include them
+
+    # -- Spatial smoothing (optional) --
+    smoothing:
+      enabled: false
+      fwhm: null                  # target FWHM in mm (at most two decimal places); required when enabled
+      # When enabled, smoothed voxelwise outputs (LSS, beta series, seed maps)
+      # are written alongside unsmoothed outputs with a "_s{N}mm" suffix.
+      # Parcel-level beta series CSVs are never smoothed.
 
     # -- Extraction --
+    # 3dLSS sub-brick identity is written to {pre}_concat_LSS_index.json and
+    # per-condition {pre}_concat_bseries_{cond}_index.json.
     extraction:
       extract_pbseries: true     # true = extract parcel beta series, false = skip
       extract_out_file_pre: "subj001_nback_baseline_Shen368"
@@ -126,12 +200,13 @@ analyses:
     connectivity:
       calc_conn: "parcellated"   # null = disabled; "seed_to_voxel" | "parcellated" = enabled
       conn_out_file_pre: "subj001_nback_baseline_Shen368"
-      pcorr: false               # use partial correlation
+      pcorr: false               # use partial correlation (parcellated only)
       fishZ: true                # use Fisher Z transform on correlation coefficients
       # -- Connectivity Contrasts --
       # Linear combinations of condition-level connectivity outputs.
-      # Requires connectivity to be enabled (calc_conn != null). Contrast conditions must
-      # reference conditions in cond_beta_labels that have valid connectivity output files.
+      # Requires connectivity to be enabled (contrasts with calc_conn: null are a ConfigError).
+      # A contrast whose conditions lack a connectivity output is skipped with a
+      # CONTRAST_DROPPED warning.
       # functions: null = disabled; list of equations = enabled
       contrasts:
         functions:
@@ -146,7 +221,7 @@ analyses:
   # ========================================================================
   # Generates residual time series via 3dTproject, optionally extracts
   # parcel-level time series, and optionally computes functional connectivity.
-  # NOTE: rest_conn uses lists for paths (one entry per run).
+  # NOTE: rest_conn always uses per-run lists for paths (one entry per run).
   - name: "rest_connectivity"
     type: "rest_conn"
 
@@ -166,21 +241,33 @@ analyses:
         - "/path/to/subj001_rest_run2_WM.txt"
       GS_paths: null             # null = no global signal regression; list of paths = enable GSR
 
+    # -- Run structure (required) --
+    run_labels: [1, 2]           # integer run identity, aligned with scan_paths
+
     out_dir: "/path/to/output/subj001/rest_conn"
     out_file_pre: "subj001_rest_baseline"
 
     # -- Block settings --
-    remove_previous: false       # true = delete all files in out_dir before running
+    remove_previous: false       # true = delete all files recorded in this analysis's ledger before running
     average_type: "mean"         # "mean" or "median" for parcel averaging
-    fd_threshold: 0.9            # FD threshold (mm) for motion censoring
+    fd_threshold: 0.9            # Power et al. (2012) framewise displacement censor threshold (mm; 50 mm sphere; a TR is censored when FD > fd_threshold)
     censor_prev_tr: true         # Also censor the TR before each high-motion TR
-    notch_filter_band: [0.31, 0.43]  # Respiration notch filter Hz band (null = disabled)
+    notch_filter_band: [0.31, 0.43]  # Respiration notch filter Hz band applied to the motion used for FD censoring only (null = disabled)
     bandpass: [0.01, 0.1]        # Required: [low, high] Hz
     motion_deriv_degree: 2       # Required: number of derivative orders (total motion cols = 6 * degree); e.g. 2 = base + 1st derivs = 12 cols
-    keep_run_res_dtseries: true  # true = keep all run-specific dtseries (false to save space)
+    keep_run_res_dtseries: true  # true = per-run residual stages; per-run residual dtseries kept as outputs. false = one concatenated residual stage; per-run residuals never written
     use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM/GS) as additional regressors
-    use_sequenced_bandpass: false  # true = use sequenced denoising path (Ciric-inspired): NTRP-interpolate -> 3dBandpass -> regress (no -bandpass at regression). Opt in for high-motion data where bandpass-implied DOF cost is excessive.
+    use_sequenced_bandpass: false  # true = use sequenced denoising path (Power et al. 2014; Hallquist et al. 2013; linear NTRP rather than spectral interpolation): NTRP-interpolate -> 3dBandpass -> regress (no -bandpass at regression). Opt in for high-motion data where bandpass-implied DOF cost is excessive.
     scale_to_psc: true           # true = scale BOLD to percent signal change before regression (recommended)
+    roi_zero_handling: "exclude" # "exclude" = ignore zero-valued voxels in parcel aggregation; "include" = include them
+
+    # -- Spatial smoothing (optional) --
+    smoothing:
+      enabled: false
+      fwhm: null                  # target FWHM in mm (at most two decimal places); required when enabled
+      # When enabled, smoothed residual dtseries are written alongside the
+      # unsmoothed outputs with a "_s{N}mm" suffix. Parcel-level time series
+      # are never smoothed.
 
     # -- Extraction --
     extraction:
@@ -192,5 +279,5 @@ analyses:
     connectivity:
       calc_conn: "parcellated"   # null = disabled; "seed_to_voxel" | "parcellated" = enabled
       conn_out_file_pre: "subj001_rest_baseline_R_amyg"
-      pcorr: false               # use partial correlation
+      pcorr: false               # use partial correlation (parcellated only)
       fishZ: true                # use Fisher Z transform on correlation coefficients

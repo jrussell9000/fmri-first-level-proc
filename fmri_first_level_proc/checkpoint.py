@@ -1,337 +1,304 @@
-#!/usr/bin/env python3
+"""Append-only JSONL ledger for stage-level processing state.
 
-# ============================================================================
-# CHECKPOINT / RESUME LEDGER
-# Append-only JSONL ledger recording per-stage completion state.
-# Supports DAG-aware resume: identifies which stages must re-run based on
-# missing entries or config hash invalidation, with downstream cascade.
-#
-# Author: Taylor J. Keding, Ph.D.
-# Version: 3.0.0
-# Last updated: 08/12/26
-# ============================================================================
+Three record types:
+
+- **staged**: written after outputs are validated and before they are promoted
+  (os.replace) from the staging directory into out_dir.  Staged records track
+  what a step intends to place in out_dir; they are cleanup tracking only and
+  never evidence of content integrity.
+
+- **completion**: written after promotion succeeds for a ledgered stage.
+  Completion entries are the sole reuse gate: a stage is reused only when a
+  valid completion entry exists with a matching stage hash and all listed
+  output paths still exist on disk.
+
+- **retired**: written after outputs from prior invocations are deleted by the
+  retirement sweep at the end of a run.
+
+All records are serialized as one JSON object per line (keys sorted,
+separators ``(",", ":")``), always containing ``"record_type"`` and
+``"ledger_format": 2``.
+"""
 
 import dataclasses
 import datetime
-import glob
 import hashlib
 import json
 import os
 
 
+LEDGER_FORMAT = 2
+
+
 # ---------------------------------------------------------------------------
-# Ledger entry
+# Record dataclasses
 # ---------------------------------------------------------------------------
 
 @dataclasses.dataclass
-class LedgerEntry:
-    """Single DAG stage completion record written to the JSONL ledger."""
+class OutputRecord:
+    """One output path (relative to out_dir) and its class."""
+    path: str
+    cls: str  # "final" | "intermediate"
 
-    stage_id: str
-    scope_key: str
-    status: str               # 'completed' | 'reconstructed'
-    timestamp_utc: str        # ISO 8601
+
+@dataclasses.dataclass
+class StagedRecord:
+    """Outputs a stage is about to promote, written before promotion."""
+    step: str
+    outputs: list  # list of OutputRecord
+    timestamp_utc: str
+
+
+@dataclasses.dataclass
+class CompletionRecord:
+    """Successful stage completion: hash, outputs, QC fragment, warnings, versions."""
+    step: str
+    stage_hash: str
+    outputs: list  # list of OutputRecord
+    qc: dict
+    warnings: list  # list of {code, severity, message, user_facing}
+    versions: dict
+    timestamp_utc: str
     wall_clock_s: float
-    config_hash: str | None
-    qc_summary: dict
-    output_files: list[str]
+
+
+@dataclasses.dataclass
+class RetiredRecord:
+    """Paths deleted by the retirement sweep."""
+    paths: list  # list of relpath strings
+    timestamp_utc: str
 
 
 # ---------------------------------------------------------------------------
-# DAG stage lists
+# Serialization helpers
 # ---------------------------------------------------------------------------
 
-DAG_TASK_ACT: list[str] = [
-    "TA.prep",
-    "TA.glm",
-    "TA.extract",
-    "TA.qc",
-]
+def utc_now():
+    """Return the current UTC time as an ISO-8601 string."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-DAG_TASK_CONN: list[str] = [
-    "TC.prep",
-    "TC.design",
-    "TC.beta",
-    "TC.conn",
-    "TC.qc",
-]
 
-DAG_REST_CONN_PER_RUN: list[str] = [
-    "RC.prep.{n}",
-    "RC.resid.{n}",
-]
+def _serialize_output(out):
+    return {"path": out.path, "class": out.cls}
 
-DAG_REST_CONN_POST: list[str] = [
-    "RC.concat",
-    "RC.conn",
-    "RC.qc",
-]
+
+def _serialize_record(record):
+    if isinstance(record, StagedRecord):
+        return json.dumps(
+            {
+                "ledger_format": LEDGER_FORMAT,
+                "outputs": [_serialize_output(o) for o in record.outputs],
+                "record_type": "staged",
+                "step": record.step,
+                "timestamp_utc": record.timestamp_utc,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    if isinstance(record, CompletionRecord):
+        return json.dumps(
+            {
+                "ledger_format": LEDGER_FORMAT,
+                "outputs": [_serialize_output(o) for o in record.outputs],
+                "qc": record.qc,
+                "record_type": "completion",
+                "stage_hash": record.stage_hash,
+                "step": record.step,
+                "timestamp_utc": record.timestamp_utc,
+                "versions": record.versions,
+                "wall_clock_s": record.wall_clock_s,
+                "warnings": record.warnings,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    if isinstance(record, RetiredRecord):
+        return json.dumps(
+            {
+                "ledger_format": LEDGER_FORMAT,
+                "paths": record.paths,
+                "record_type": "retired",
+                "timestamp_utc": record.timestamp_utc,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    raise TypeError(f"Unknown record type: {type(record)}")
+
+
+def append_record(ledger_path, record):
+    """Append a single record to the ledger file (fsync)."""
+    line = _serialize_record(record) + "\n"
+    fd = os.open(ledger_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    try:
+        os.write(fd, line.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
-# Ledger I/O
+# Reading
 # ---------------------------------------------------------------------------
 
-def append_ledger_entry(ledger_path: str, entry: LedgerEntry) -> None:
-    """Append one LedgerEntry as a JSON line to the ledger file.
+@dataclasses.dataclass
+class LedgerHistory:
+    """Parsed ledger records plus the line numbers that could not be parsed."""
+    records: list  # parsed record dataclasses in file order
+    unreadable_lines: list  # 1-based line numbers
 
-    Uses OS-level fsync after each write to guarantee durability. The ledger
-    file is created if it does not already exist.
 
-    Parameters
-    ----------
-    ledger_path:
-        Absolute path to the JSONL ledger file.
-    entry:
-        Populated LedgerEntry to serialize and append.
+_REQUIRED_KEYS = {
+    "staged": {"step": str, "outputs": list, "timestamp_utc": str},
+    "completion": {
+        "step": str,
+        "stage_hash": str,
+        "outputs": list,
+        "qc": dict,
+        "warnings": list,
+        "versions": dict,
+        "timestamp_utc": str,
+        "wall_clock_s": (int, float),
+    },
+    "retired": {"paths": list, "timestamp_utc": str},
+}
+
+
+def _parse_output(obj):
+    return OutputRecord(path=obj["path"], cls=obj["class"])
+
+
+def _try_parse_line(obj):
+    """Return a record dataclass or None if the line is unreadable."""
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("ledger_format") != LEDGER_FORMAT:
+        return None
+    rtype = obj.get("record_type")
+    if rtype not in _REQUIRED_KEYS:
+        return None
+    for key, expected_type in _REQUIRED_KEYS[rtype].items():
+        val = obj.get(key)
+        if val is None and key not in obj:
+            return None
+        if not isinstance(val, expected_type):
+            return None
+    if rtype == "staged":
+        return StagedRecord(
+            step=obj["step"],
+            outputs=[_parse_output(o) for o in obj["outputs"]],
+            timestamp_utc=obj["timestamp_utc"],
+        )
+    if rtype == "completion":
+        return CompletionRecord(
+            step=obj["step"],
+            stage_hash=obj["stage_hash"],
+            outputs=[_parse_output(o) for o in obj["outputs"]],
+            qc=obj["qc"],
+            warnings=obj["warnings"],
+            versions=obj["versions"],
+            timestamp_utc=obj["timestamp_utc"],
+            wall_clock_s=obj["wall_clock_s"],
+        )
+    if rtype == "retired":
+        return RetiredRecord(
+            paths=obj["paths"],
+            timestamp_utc=obj["timestamp_utc"],
+        )
+    return None
+
+
+def read_history(ledger_path):
+    """Read a ledger file and return a LedgerHistory.
+
+    Missing file returns an empty history.  Lines that cannot be parsed
+    are recorded in ``unreadable_lines`` (1-based) but never raise.
     """
-    line = json.dumps(dataclasses.asdict(entry))
-    with open(ledger_path, "a") as fh:
-        fh.write(line + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-
-
-def read_ledger(ledger_path: str) -> dict[tuple[str, str], LedgerEntry]:
-    """Parse the JSONL ledger and return the latest entry per (stage_id, scope_key).
-
-    Last-writer-wins: if the same (stage_id, scope_key) pair appears multiple
-    times, the final occurrence in the file is authoritative. Returns an empty
-    dict when the file is absent rather than raising.
-
-    Parameters
-    ----------
-    ledger_path:
-        Absolute path to the JSONL ledger file.
-
-    Returns
-    -------
-    dict mapping (stage_id, scope_key) to the most-recently-written LedgerEntry.
-    """
-    if not os.path.isfile(ledger_path):
-        return {}
-
-    result: dict[tuple[str, str], LedgerEntry] = {}
-    with open(ledger_path) as fh:
-        for raw_line in fh:
-            raw_line = raw_line.strip()
-            if not raw_line:
+    records = []
+    unreadable = []
+    if not os.path.exists(ledger_path):
+        return LedgerHistory(records=records, unreadable_lines=unreadable)
+    with open(ledger_path, "r", encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            raw = raw.strip()
+            if not raw:
                 continue
             try:
-                record = json.loads(raw_line)
-                entry = LedgerEntry(**record)
-                result[(entry.stage_id, entry.scope_key)] = entry
-            except (json.JSONDecodeError, TypeError):
-                # Corrupted line: skip and continue to recover as much as possible.
+                obj = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                unreadable.append(lineno)
                 continue
+            parsed = _try_parse_line(obj)
+            if parsed is None:
+                unreadable.append(lineno)
+            else:
+                records.append(parsed)
+    return LedgerHistory(records=records, unreadable_lines=unreadable)
 
+
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
+
+def latest_completion(history, step):
+    """Return the last CompletionRecord for *step*, or None."""
+    result = None
+    for rec in history.records:
+        if isinstance(rec, CompletionRecord) and rec.step == step:
+            result = rec
     return result
 
 
+def recorded_paths(history):
+    """Return every output path mentioned in staged and completion records."""
+    paths = set()
+    for rec in history.records:
+        if isinstance(rec, (StagedRecord, CompletionRecord)):
+            for out in rec.outputs:
+                paths.add(out.path)
+    return paths
+
+
 # ---------------------------------------------------------------------------
-# DAG resolution
+# Hashing
 # ---------------------------------------------------------------------------
 
-def resolve_rerun_set(
-    ledger: dict[tuple[str, str], LedgerEntry],
-    dag: list[str],
-    scope_key: str,
-    current_config_hash: str,
-) -> list[str]:
-    """Determine which DAG stages must run for a given scope_key.
+def sha256_file(path):
+    """Return the hex SHA-256 digest of *path* (streamed in 1 MiB chunks)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
-    Walk the DAG in topological order. A stage is added to the rerun set when:
-    (a) no completed ledger entry exists for (stage_id, scope_key), or
-    (b) the recorded config_hash does not match current_config_hash.
 
-    Once any stage is invalidated, all downstream stages in the DAG are also
-    invalidated regardless of their individual ledger state (cascade rule).
+def _jsonable(obj):
+    """Convert Python objects to JSON-compatible types for canonical hashing."""
+    if isinstance(obj, set):
+        return sorted(obj)
+    if isinstance(obj, tuple):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_jsonable(v) for v in obj]
+    return obj
 
-    Parameters
-    ----------
-    ledger:
-        Mapping returned by read_ledger().
-    dag:
-        Ordered list of stage_id strings for this analysis type.
-    scope_key:
-        Identifies the subject/run/session being evaluated.
-    current_config_hash:
-        SHA-256 hex digest of the current config produced by compute_config_hash().
 
-    Returns
-    -------
-    Ordered list of stage_ids that must be executed.
+def canonical_json(obj):
+    """Return a deterministic JSON string for hashing.
+
+    Sets are sorted; tuples become lists.  Anything else that is not
+    JSON-serializable raises TypeError.
     """
-    rerun: list[str] = []
-    cascade_active = False
-
-    for stage_id in dag:
-        if cascade_active:
-            rerun.append(stage_id)
-            continue
-
-        key = (stage_id, scope_key)
-        entry = ledger.get(key)
-
-        if entry is None:
-            # Stage has never completed.
-            rerun.append(stage_id)
-            cascade_active = True
-            continue
-
-        if entry.config_hash != current_config_hash:
-            # Config changed: this stage and all downstream stages must re-run.
-            rerun.append(stage_id)
-            cascade_active = True
-            continue
-
-    return rerun
+    return json.dumps(
+        _jsonable(obj), sort_keys=True, separators=(",", ":")
+    )
 
 
-# ---------------------------------------------------------------------------
-# Reconstruction from artifacts
-# ---------------------------------------------------------------------------
-
-# Artifact glob patterns used to infer stage completion from output files.
-# Each tuple is (stage_id, glob_pattern_relative_to_output_dir).
-_TASK_ACT_ARTIFACT_PATTERNS: list[tuple[str, str]] = [
-    ("TA.prep",    "*_censor.1D"),
-    ("TA.glm",     "*_stats.HEAD"),
-    ("TA.extract", "*_activation*.txt"),
-    ("TA.qc",      "*_qc_summary.json"),
-]
-
-_TASK_CONN_ARTIFACT_PATTERNS: list[tuple[str, str]] = [
-    ("TC.prep",   "*_censor.1D"),
-    ("TC.design", "*_onset_*.1D"),
-    ("TC.beta",   "*_beta*.HEAD"),
-    ("TC.conn",   "*_connectivity*.txt"),
-    ("TC.qc",     "*_qc_summary.json"),
-]
-
-_REST_CONN_POST_ARTIFACT_PATTERNS: list[tuple[str, str]] = [
-    ("RC.concat", "*_concat*.dtseries.nii"),
-    ("RC.conn",   "*_connectivity*.txt"),
-    ("RC.qc",     "*_qc_summary.json"),
-]
-
-
-def auto_reconstruct_ledger(
-    output_dir: str,
-    analysis_type: str,
-    scope_key: str,
-) -> list[LedgerEntry]:
-    """Infer ledger entries from existing output artifacts in output_dir.
-
-    Scans for known artifact patterns associated with each DAG stage and
-    creates 'reconstructed' LedgerEntry records for stages whose primary
-    artifacts are present. Per-run rest_conn stages (RC.prep.{n},
-    RC.resid.{n}) are inferred from per-run subdirectory structure.
-
-    Parameters
-    ----------
-    output_dir:
-        Directory that was the target of a prior pipeline run.
-    analysis_type:
-        One of 'task_act', 'task_conn', or 'rest_conn'.
-    scope_key:
-        Scope identifier to embed in reconstructed entries.
-
-    Returns
-    -------
-    List of LedgerEntry objects with status='reconstructed'. Caller is
-    responsible for writing these to the ledger via append_ledger_entry().
-    """
-    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    entries: list[LedgerEntry] = []
-
-    def _found_files(pattern: str) -> list[str]:
-        return sorted(glob.glob(os.path.join(output_dir, pattern)))
-
-    if analysis_type == "task_act":
-        patterns = _TASK_ACT_ARTIFACT_PATTERNS
-    elif analysis_type == "task_conn":
-        patterns = _TASK_CONN_ARTIFACT_PATTERNS
-    elif analysis_type == "rest_conn":
-        patterns = _REST_CONN_POST_ARTIFACT_PATTERNS
-    else:
-        return entries
-
-    # Shared: post-concat and final stages.
-    for stage_id, pattern in patterns:
-        matched = _found_files(pattern)
-        if matched:
-            entries.append(LedgerEntry(
-                stage_id=stage_id,
-                scope_key=scope_key,
-                status="reconstructed",
-                timestamp_utc=timestamp,
-                wall_clock_s=0.0,
-                config_hash=None,
-                qc_summary={},
-                output_files=matched,
-            ))
-
-    # Per-run rest_conn stages: detect run subdirectories.
-    if analysis_type == "rest_conn":
-        run_dirs = sorted(
-            d for d in glob.glob(os.path.join(output_dir, "run-*"))
-            if os.path.isdir(d)
-        )
-        for run_dir in run_dirs:
-            run_label = os.path.basename(run_dir)
-            # RC.prep.{n}: censor file present in run directory.
-            prep_files = sorted(glob.glob(os.path.join(run_dir, "*_censor.1D")))
-            if prep_files:
-                entries.append(LedgerEntry(
-                    stage_id=f"RC.prep.{run_label}",
-                    scope_key=scope_key,
-                    status="reconstructed",
-                    timestamp_utc=timestamp,
-                    wall_clock_s=0.0,
-                    config_hash=None,
-                    qc_summary={},
-                    output_files=prep_files,
-                ))
-            # RC.resid.{n}: residual dtseries present in run directory.
-            resid_files = sorted(
-                glob.glob(os.path.join(run_dir, "*_resid*.dtseries.nii"))
-                + glob.glob(os.path.join(run_dir, "*_res*.HEAD"))
-            )
-            if resid_files:
-                entries.append(LedgerEntry(
-                    stage_id=f"RC.resid.{run_label}",
-                    scope_key=scope_key,
-                    status="reconstructed",
-                    timestamp_utc=timestamp,
-                    wall_clock_s=0.0,
-                    config_hash=None,
-                    qc_summary={},
-                    output_files=resid_files,
-                ))
-
-    return entries
-
-
-# ---------------------------------------------------------------------------
-# Config hashing
-# ---------------------------------------------------------------------------
-
-def compute_config_hash(config) -> str:
-    """Compute a deterministic SHA-256 digest of a config dataclass instance.
-
-    Serializes the config via dataclasses.asdict() with sorted keys, encodes
-    as UTF-8, and returns the hex digest. Identical configs always produce the
-    same digest; any field change produces a distinct digest.
-
-    Parameters
-    ----------
-    config:
-        Any dataclass instance representing a pipeline configuration.
-
-    Returns
-    -------
-    64-character lowercase SHA-256 hex digest string.
-    """
-    canonical = json.dumps(dataclasses.asdict(config), sort_keys=True)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+def compute_stage_hash(payload):
+    """Return the SHA-256 hex digest of the canonical JSON of *payload*."""
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
