@@ -18,6 +18,10 @@ A YAML-driven Python framework for first-level fMRI analysis (Task Activation, T
 - **Pre-Regression Extraction:** Optional `extract_raw_ptseries` toggle to capture parcellated time series before nuisance regression.
 - **Parallel Processing:** `num_cores` sets one CPU budget per block: `3dDeconvolve -jobs`, `OMP_NUM_THREADS` for every AFNI call, and concurrent processing of independent runs/conditions within that budget.
 
+## ABCD staging
+
+An optional module prepares ABCD sessions from local func derivatives and runs them: see [docs/abcd_staging.md](docs/abcd_staging.md).
+
 ## Prerequisites
 
 - Python >= 3.12

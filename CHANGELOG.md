@@ -4,6 +4,16 @@ All notable changes to this fork of fmri-first-level-proc. Versions follow
 [Semantic Versioning](https://semver.org/). Issue numbers refer to
 `jrussell9000/fmri-first-level-proc`.
 
+## [4.1.0] — 2026-11-02
+
+### Added
+
+- **`fmri_first_level_proc.abcd`** and the **`fmri-first-level-abcd`** CLI: stage one ABCD
+  session from a local directory and run its analyses, with `proc_config_final.yaml`
+  as the template. Moved from cloudpipe's `stage_first_level.py`, with its rules and
+  tests unchanged. It works only on local files. The core does not import it, and it
+  needs the new `abcd` extra (`nibabel`, `scipy`). See `docs/abcd_staging.md`.
+
 ## [4.0.1] — 2026-11-02
 
 ### Changed
