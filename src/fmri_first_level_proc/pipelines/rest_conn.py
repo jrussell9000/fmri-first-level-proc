@@ -36,7 +36,7 @@ INPUTS:
     format = list(string(path_to_GS_TS_txt)); no headers; rows=TR/frame, single column = mean global signal for frame
     NOTE: GSR is controversial -- it can remove neural signal and introduce artifactual anti-correlations. Use with caution and report in methods.
 --bandpass: bandpass filter frequencies [low high] in Hz (default: [0.01, 0.1]); set to null in YAML config to disable
---polort: hardcoded to -1 (no explicit detrending; bandpass filtering in 3dTproject subsumes polynomial detrending)
+--polort: 3dTproject -polort 2 when bandpass[0] > 0, else 1 + floor(run duration / 150 s), per run; sequenced backend: -polort -1, with 3dBandpass's quadratic detrend instead
 --use_tissue_derivs: (no value) include this option to add first temporal derivatives of tissue signals (CSF/WM, and GS when enabled) as additional nuisance regressors
 --remove_previous: (no value) include this option if "out_dir" should have all files removed before processing starts (including connectivity); if not included, will not overwrite pre-existing files
 --extract_ptseries: include this option if you want residual time series extracted for parcels/ROIs (requires --template_path be provided)
@@ -81,11 +81,13 @@ import numpy as np
 from ..afni import parallel_map, run_afni_command, uses_num_cores
 from ..manifest import manifested
 from ..config import ResolvedConfig
-from ..connectivity import parcellated_conn, seed_to_voxel_conn
+from ..connectivity import parcellated_conn, seed_to_voxel_conn, seed_to_voxel_smoothed
 from ..design import compute_dof
 from ..exceptions import ConfigError, ModelError, ToolExecutionError
-from ..fileutils import remove_files_from_dir
+from ..fileutils import remove_files_from_dir, with_token
+from ..inputs import check_inputs
 from ..preprocessing import (
+    CENSOR_METRIC,
     bandpass_filter_1d_afni,
     censor_interpolate_1d_afni,
     compute_tissue_derivative,
@@ -103,6 +105,7 @@ from ..reporting import (
     setup_logging,
     write_qc_summary,
 )
+from ..smoothing import smooth_rest_runs, smoothing_token
 from ..templates import (
     extract_roi_stats,
     validate_connectivity_options,
@@ -139,7 +142,7 @@ def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared
         Path to the run's prepared motion file (motion_deriv_degree*6 columns).
     config : ResolvedConfig
         Pipeline configuration. Must include CSF_paths, WM_paths, GS_paths,
-        use_tissue_derivs, polort handling (hardcoded -1), bandpass, out_dir,
+        use_tissue_derivs, bandpass, out_dir,
         out_file_pre, tr.
     logger : logging.Logger
 
@@ -170,7 +173,8 @@ def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared
         if config.GS_paths is not None:
             gs_deriv = compute_tissue_derivative(config.GS_paths[run_idx], config.out_dir, config.out_file_pre, f"run{run_idx+1}_GS", logger)
             tproj_command.extend(["-ort", gs_deriv])
-    tproj_command.extend(["-polort", "-1"])
+    n_trs = len(np.loadtxt(censor_path))
+    tproj_command.extend(["-polort", str(_simultaneous_polort(n_trs, config))])
     if config.bandpass is not None:
         tproj_command.extend(["-bandpass", str(config.bandpass[0]), str(config.bandpass[1])])
     tproj_command.extend(["-prefix", run_out])
@@ -189,6 +193,18 @@ def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared
         return None
 
 
+def _simultaneous_polort(n_trs, config):
+    """Polynomial degree for the simultaneous backend's 3dTproject call.
+
+    Sinusoids don't span quadratic trends, and 3dTproject's help advises against
+    -polort -1 when the data mean is non-zero. Degree 2 is the highest that makes
+    sense once low frequencies are bandpassed out; without a low cut, use polort A's rule.
+    """
+    if config.bandpass is not None and config.bandpass[0] > 0:
+        return 2
+    return 1 + int(n_trs * config.tr / 150.0)
+
+
 def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_motion, config, logger):
     """Generate per-run residual via sequenced denoising (Ciric-inspired).
 
@@ -196,7 +212,7 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
       (1) Confounds already generated upstream (motion, censor, tissue signals).
       (2-3) 3dTproject -polort -1 -censor X.1D -cenmode NTRP on BOLD to interpolate
            censored TRs.
-      (4) 3dBandpass -nodetrend on interpolated BOLD to band-limit the signal.
+      (4) 3dBandpass on interpolated BOLD to detrend (quadratic) and band-limit the signal.
       (5) For each nuisance regressor file (motion, CSF, WM, optional GS, optional
           tissue derivatives), apply the same NTRP-interp + 3dBandpass pipeline
           using censor_interpolate_1d_afni and bandpass_filter_1d_afni.
@@ -260,7 +276,6 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
         # Step 4: 3dBandpass BOLD
         bold_bp = inter_dir / f"{config.out_file_pre}_{label}_bold_bp.nii.gz"
         bp_cmd = ["3dBandpass",
-                  "-nodetrend",
                   "-dt", str(config.tr),
                   "-prefix", bold_bp,
                   str(config.bandpass[0]), str(config.bandpass[1]),
@@ -351,7 +366,7 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
             logger.info("Keeping sequenced intermediates at %s (keep_run_res_dtseries=True).", inter_dir)
 
 
-def gen_residual_ts(config, logger):
+def gen_residual_ts(config, logger, unscaled_scans=None):
     """Generate per-run residual dense time series and concatenate across runs.
 
     For each run: optionally notch-filters motion parameters, generates an FD-based
@@ -374,13 +389,17 @@ def gen_residual_ts(config, logger):
         GS_paths, out_dir, out_file_pre, tr, fd_threshold, censor_prev_tr,
         notch_filter_band, bandpass, use_tissue_derivs, keep_run_res_dtseries).
     logger : logging.Logger
+    unscaled_scans : list of str, optional
+        The runs' scans before PSC scaling, for the smoothing mask. Defaults to
+        config.scan_paths.
 
     Returns
     -------
-    list[int | None]
+    (list[int | None], list[dict])
         Per-run DOF estimates (None for runs where DOF could not be computed
-        or where ModelError was raised). Warnings are accumulated via the
-        module-level warning accumulator (get_warnings).
+        or where ModelError was raised), and smoothing_per_run records (empty
+        without smoothing). Warnings are accumulated via the module-level
+        warning accumulator (get_warnings).
 
     Raises
     ------
@@ -390,6 +409,7 @@ def gen_residual_ts(config, logger):
     # Check if concatenated residual dtseries exists
     concat_path = _concat_residual_path(config)
     per_run_dof = []
+    smoothing_records = []
     if not concat_path.exists():
 
         # Validate and prepare motion files, generate censor files per run
@@ -415,7 +435,10 @@ def gen_residual_ts(config, logger):
             prepared_motion.append(prepared)
 
             # Per-run DOF check
-            n_regressors = use_cols  # polort -1 -> 0 polynomial regressors
+            n_regressors = use_cols
+            if not config.use_sequenced_bandpass:
+                # The sequenced backend detrends in 3dBandpass, before its regression
+                n_regressors += _simultaneous_polort(len(np.loadtxt(censor_path)), config) + 1
             n_regressors += 2  # CSF + WM (always present)
             if config.GS_paths is not None:
                 n_regressors += 1
@@ -445,8 +468,8 @@ def gen_residual_ts(config, logger):
         # Runs are independent; process them concurrently within the num_cores budget.
         # A None result means the backend logged a failure and the run is skipped.
         # parallel_map keeps run order, which 3dTcat relies on.
-        completed_runs = [r for r in parallel_map(residual_for_run, range(len(config.scan_paths)))
-                          if r is not None]
+        residuals = parallel_map(residual_for_run, range(len(config.scan_paths)))
+        completed_runs = [r for r in residuals if r is not None]
 
         if not completed_runs:
             raise ToolExecutionError(
@@ -464,6 +487,13 @@ def gen_residual_ts(config, logger):
                 f"Failed to create concatenated residual dtseries for {config.out_file_pre}."
             )
 
+        # Smooth from the per-run residuals, before they can be removed below
+        if config.smoothing_enabled:
+            scans = unscaled_scans or config.scan_paths
+            completed = [i for i, r in enumerate(residuals) if r is not None]
+            smoothing_records = smooth_rest_runs([(i + 1, residuals[i]) for i in completed],
+                                                 [scans[i] for i in completed], concat_path, config, logger)
+
         # If keep_run_res_dtseries is False (default True), remove per-run residual files
         if not config.keep_run_res_dtseries:
             for comp_run in completed_runs:
@@ -476,7 +506,7 @@ def gen_residual_ts(config, logger):
     else:
         logger.info("%s already exists.", concat_path)
 
-    return per_run_dof
+    return per_run_dof, smoothing_records
 
 def gen_ptseries(config, logger):
     """Extract ROI-level residual parcel time series from the concatenated dtseries.
@@ -502,7 +532,8 @@ def gen_ptseries(config, logger):
     # Check if output already exists
     if not ptseries_path.exists():
 
-        new_df = extract_roi_stats(_concat_residual_path(config), config.template_path, config.average_type, logger=logger)
+        new_df = extract_roi_stats(_concat_residual_path(config), config.template_path, config.average_type, logger=logger,
+                                   roi_zero_handling=config.roi_zero_handling)
 
         # Save ptseries
         new_df.to_csv(ptseries_path)
@@ -554,6 +585,11 @@ def gen_conn(config, logger):
             condition=None,
             logger=logger,
         )
+        if config.smoothing_enabled:
+            token = smoothing_token(config.smoothing_fwhm)
+            seed_to_voxel_smoothed(inset_path, with_token(inset_path, token), config.out_dir,
+                                   config.conn_out_file_pre, config.template_path, config.fishZ,
+                                   config.pcorr, token, condition=None, logger=logger)
 
 @manifested
 @uses_num_cores
@@ -620,6 +656,7 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         raise ConfigError(
             f"All path lists must be the same length. Got: {path_lengths}"
         )
+    check_inputs(config, logger)
 
     logger.info("Residual dense time series will be created for resting-state fMRI.")
     if config.use_tissue_derivs:
@@ -666,9 +703,12 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         scan = config.scan_paths[i]
         gen_min_outlier_epi(scan, config.out_dir, config.out_file_pre, f"run{i+1}", logger)
         if config.scale_to_psc:
-            return str(scale_to_psc(scan, config.out_dir, config.out_file_pre, f"run{i+1}", logger))
+            return str(scale_to_psc(scan, config.out_dir, config.out_file_pre, f"run{i+1}", logger,
+                                    qc_records=psc_per_run, run=i + 1))
         return scan
 
+    unscaled_scans = list(config.scan_paths)
+    psc_per_run = []
     config.scan_paths = parallel_map(prepare_run_scan, range(len(config.scan_paths)))
 
     # Extract pre-regression parcellated time series per run if requested
@@ -686,7 +726,8 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         for i, scan in enumerate(config.scan_paths):
             raw_out = Path(config.out_dir) / f"{config.extract_out_file_pre}_run{i+1}_raw_ptseries.csv"
             if not raw_out.exists():
-                raw_df = extract_roi_stats(scan, validated_tpl, config.average_type, logger=logger)
+                raw_df = extract_roi_stats(scan, validated_tpl, config.average_type, logger=logger,
+                                           roi_zero_handling=config.roi_zero_handling)
                 raw_df.to_csv(raw_out)
                 if raw_out.exists():
                     logger.info("Extracted raw ptseries for run %d to %s.", i+1, raw_out)
@@ -701,15 +742,20 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     qc_data = {
         "analysis_type": "rest_conn",
         "fd_threshold": config.fd_threshold,
+        "censor_metric": CENSOR_METRIC,
         "censor_prev_tr": config.censor_prev_tr,
         "bandpass": config.bandpass,
         "per_run_censoring": [],
     }
 
     # Generate residual dense time series (regression for denoising, censoring, and temporal filtering)
-    per_run_dof = gen_residual_ts(config, logger)
+    per_run_dof, smoothing_records = gen_residual_ts(config, logger, unscaled_scans)
     if per_run_dof:
         qc_data["per_run_dof"] = per_run_dof
+    if config.scale_to_psc:
+        qc_data["psc_per_run"] = sorted(psc_per_run, key=lambda record: record["run"])
+    if smoothing_records:
+        qc_data["smoothing_per_run"] = smoothing_records
 
     # Collect per-run censor stats (censor files were created inside gen_residual_ts)
     for i in range(len(config.scan_paths)):
@@ -760,6 +806,11 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     candidates.append(_concat_residual_path(config))
     if config.keep_run_res_dtseries:
         candidates.extend(_run_residual_path(config, i) for i in range(n_runs))
+    if config.smoothing_enabled:
+        token = smoothing_token(config.smoothing_fwhm)
+        candidates.append(with_token(_concat_residual_path(config), token))
+        if config.keep_run_res_dtseries:
+            candidates.extend(with_token(_run_residual_path(config, i), token) for i in range(n_runs))
     if getattr(config, 'extract_raw_ptseries', False) and config.extract_out_file_pre is not None:
         candidates.extend(out_dir / f"{config.extract_out_file_pre}_run{i+1}_raw_ptseries.csv" for i in range(n_runs))
     if config.extract_ptseries and config.extract_out_file_pre is not None:

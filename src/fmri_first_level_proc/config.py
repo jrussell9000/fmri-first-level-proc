@@ -48,6 +48,7 @@ errors; raises InputError for missing user-specified files.
 
 import dataclasses
 import logging
+import math
 from pathlib import Path
 from typing import NoReturn
 
@@ -55,13 +56,14 @@ import yaml
 
 from .bids import discover_inputs
 from .exceptions import ConfigError, InputError
-from .design import VALID_HRF_MODELS, validate_custom_hrf, needs_married_timing
+from .design import VALID_HRF_MODELS, valid_contrast_functions, validate_custom_hrf, needs_married_timing
 from .runtime import available_cpus
 
 VALID_TYPES = {"task_act", "task_conn", "rest_conn"}
 VALID_STAT_BUCKET_TYPES = {"Coef", "Tstat", "Fstat", "R^2", "Zstat"}
 VALID_AVE_TYPES = {"mean", "median"}
 VALID_CONN_TYPES = {"seed_to_voxel", "parcellated"}
+VALID_ROI_ZERO_HANDLING = ("exclude", "include")
 
 # Boolean flag keys (null -> False when merging)
 BOOL_KEYS = (
@@ -113,6 +115,10 @@ class ResolvedConfig:
     scan_path: str | None = None
     task_timing_path: str | None = None
     motion_path: str | None = None
+    run_lengths: list[int] | None = None
+    roi_zero_handling: str = "exclude"
+    smoothing_enabled: bool = False
+    smoothing_fwhm: float | None = None
     hrf_model: str | None = None
     custom_hrf: str | None = None
     CSF_path: str | None = None
@@ -162,6 +168,24 @@ class ResolvedConfig:
 # ---------------------------------------------------------------------------
 # Private error helpers
 # ---------------------------------------------------------------------------
+
+def _validate_smoothing(smoothing, label, logger) -> None:
+    """Check a block's smoothing section: {enabled: bool, fwhm: float}."""
+    if smoothing is None:
+        return
+    if not isinstance(smoothing, dict):
+        _cfg_err(logger, "[%s] smoothing must be a mapping {enabled: bool, fwhm: number}.", label)
+    enabled = smoothing.get("enabled", False)
+    if not isinstance(enabled, bool):
+        _cfg_err(logger, "[%s] smoothing.enabled must be a boolean.", label)
+    if not enabled:
+        return
+    fwhm = smoothing.get("fwhm")
+    valid_type = isinstance(fwhm, int | float) and not isinstance(fwhm, bool)
+    if not valid_type or not math.isfinite(fwhm) or fwhm <= 0 or round(fwhm, 2) != fwhm:
+        _cfg_err(logger, "[%s] smoothing.fwhm must be a finite number > 0 with at most two "
+                         "decimal places when smoothing.enabled is true, got %r.", label, fwhm)
+
 
 def _cfg_err(logger: logging.Logger | None, msg: str, *args) -> NoReturn:
     """Log at error level (if logger provided) then raise ConfigError."""
@@ -313,6 +337,13 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                     fpath = paths[pkey]
                     if not Path(fpath).is_file():
                         _inp_err(logger, "[%s] File does not exist: paths.%s = '%s'.", label, pkey, fpath)
+            # Optional run lengths of a concatenated scan (skip if null)
+            run_lengths = paths.get("run_lengths")
+            if run_lengths is not None and not (
+                isinstance(run_lengths, list) and run_lengths
+                and all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in run_lengths)
+            ):
+                _cfg_err(logger, "[%s] paths.run_lengths must be a non-empty list of positive integers.", label)
             # Optional tissue regressor paths (skip if null)
             for opt_pkey in ("CSF_path", "WM_path"):
                 if opt_pkey in paths and paths[opt_pkey] is not None:
@@ -441,6 +472,12 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
             except OSError as e:
                 _cfg_err(logger, "[%s] Cannot create out_dir '%s': %s", label, out_dir, e)
 
+        # -- ROI averaging and smoothing --
+        if block.get("roi_zero_handling", "exclude") not in VALID_ROI_ZERO_HANDLING:
+            _cfg_err(logger, "[%s] roi_zero_handling must be one of %s, got '%s'.",
+                     label, VALID_ROI_ZERO_HANDLING, block["roi_zero_handling"])
+        _validate_smoothing(block.get("smoothing"), label, logger)
+
         # -- Contrasts validation --
         if atype == "task_act" and "contrasts" in block:
             contrasts = block["contrasts"]
@@ -450,6 +487,7 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                 if len(funcs) != len(clabels):
                     _cfg_err(logger,
                              "[%s] contrasts.functions and contrasts.labels must be the same length.", label)
+                valid_contrast_functions(funcs, clabels, block["cond_labels"], logger=logger)
             elif funcs is not None and clabels is None:
                 _cfg_err(logger,
                          "[%s] contrasts.functions provided but contrasts.labels is missing.", label)
@@ -464,6 +502,7 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                         _cfg_err(logger,
                                  "[%s] connectivity.contrasts.functions and "
                                  "connectivity.contrasts.labels must be the same length.", label)
+                    valid_contrast_functions(funcs, clabels, block["cond_beta_labels"], logger=logger)
                 elif funcs is not None and clabels is None:
                     _cfg_err(logger,
                              "[%s] connectivity.contrasts.functions provided but "
@@ -557,18 +596,21 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
         if tpl is not None and not Path(tpl).is_file():
             _inp_err(logger, "[%s] template_path file does not exist: '%s'.", label, tpl)
 
-    # -- Duplicate (out_dir, out_file_pre) pair check --
-    seen_pairs: dict[tuple[str, str], str] = {}
+    # -- Cross-block output collisions: no output prefix twice in one directory --
+    seen_prefixes: dict[tuple[Path, str], str] = {}
     for idx, block in enumerate(raw_config["analyses"]):
         label = block.get("name", f"analyses[{idx}]")
-        pair = (block["out_dir"], block["out_file_pre"])
-        if pair in seen_pairs:
-            _cfg_err(
-                logger,
-                "[%s] Duplicate (out_dir, out_file_pre) pair: ('%s', '%s') -- also used by [%s]. "
-                "Output files would collide.",
-                label, pair[0], pair[1], seen_pairs[pair])
-        seen_pairs[pair] = label
+        out_dir = Path(block["out_dir"]).resolve()
+        prefixes = {block["out_file_pre"],
+                    (block.get("extraction") or {}).get("extract_out_file_pre"),
+                    (block.get("connectivity") or {}).get("conn_out_file_pre")} - {None}
+        for prefix in sorted(prefixes):
+            if (out_dir, prefix) in seen_prefixes:
+                _cfg_err(logger,
+                         "[%s] Output prefix '%s' in out_dir '%s' is also used by [%s]. "
+                         "Output files would collide.",
+                         label, prefix, out_dir, seen_prefixes[(out_dir, prefix)])
+            seen_prefixes[(out_dir, prefix)] = label
 
     raw_config["global"] = global_cfg
     return raw_config
@@ -641,7 +683,12 @@ def resolve_config(
         force_diff_atlas=force_diff_atlas,
         scale_to_psc=bool(validated_block.get("scale_to_psc", True)),
         derivatives_dirs=derivatives_dirs,
+        roi_zero_handling=validated_block.get("roi_zero_handling", "exclude"),
     )
+    smoothing = validated_block.get("smoothing") or {}
+    if smoothing.get("enabled", False):
+        cfg.smoothing_enabled = True
+        cfg.smoothing_fwhm = float(smoothing["fwhm"])
 
     # -- Type-specific field population --
     # Use .get() for path slots so that BIDS discovery can fill gaps below.
@@ -649,6 +696,7 @@ def resolve_config(
         cfg.scan_path = paths.get("scan_path")
         cfg.task_timing_path = paths.get("task_timing_path")
         cfg.motion_path = paths.get("motion_path")
+        cfg.run_lengths = paths.get("run_lengths")
         cfg.cond_labels = validated_block["cond_labels"]
         cfg.hrf_model = validated_block["hrf_model"]
         cfg.custom_hrf = validated_block.get("custom_hrf", None)
@@ -681,6 +729,7 @@ def resolve_config(
         cfg.scan_path = paths.get("scan_path")
         cfg.task_timing_path = paths.get("task_timing_path")
         cfg.motion_path = paths.get("motion_path")
+        cfg.run_lengths = paths.get("run_lengths")
         cfg.cond_beta_labels = validated_block["cond_beta_labels"]
         cfg.hrf_model = validated_block["hrf_model"]
         cfg.custom_hrf = validated_block.get("custom_hrf", None)

@@ -1,6 +1,7 @@
 """Motion/censor preparation, nuisance-regressor filtering, PSC scaling, and min-outlier EPI."""
 
 import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,10 @@ from .exceptions import GuardError, InputError, ToolExecutionError
 # ----------------------------------------------------------------------------
 CENSOR_WARN_THRESHOLD = 30.0    # % censored → warning
 CENSOR_HIGH_THRESHOLD = 50.0    # % censored → strong warning
+
+CENSOR_METRIC = "power_fd"
+FD_RADIUS_MM = 50.0             # head radius converting rotations to arc length (Power et al., 2012)
+PSC_NONPOSITIVE_LIMIT = 25.0    # % of non-constant voxels with mean <= 0 → input is demeaned
 
 
 def _labeled_name(out_file_pre, label, suffix):
@@ -84,10 +89,8 @@ def prepare_motion_file(motion_path, use_columns, out_dir, out_prefix, label, lo
     Rotation parameters are assumed to be in **degrees**. The pipeline passes
     motion values through to AFNI without unit conversion. The expected column
     order is ``[tx, ty, tz, rx, ry, rz, ...]`` (translations in mm first,
-    rotations in degrees second). AFNI's ``1d_tool.py -censor_motion`` uses
-    an Euclidean norm without radius scaling, so 1 degree ~ 1 mm of arc at
-    the standard ~57.3 mm head radius -- this is AFNI's intended convention.
-    Passing radians instead of degrees will underweight rotational FD by ~57x.
+    rotations in degrees second). Passing radians instead of degrees will
+    underweight rotational FD by ~57x (see power_fd).
     """
     try:
         data = np.loadtxt(motion_path)
@@ -107,12 +110,41 @@ def prepare_motion_file(motion_path, use_columns, out_dir, out_prefix, label, lo
     return prepared_path
 
 
-def create_censor_file(motion_path, fd_threshold, censor_prev_tr, out_dir, out_prefix, label, logger):
-    """
-    Generate a censor file from motion regressors using AFNI's 1d_tool.py.
+def power_fd(motion, run_lengths=None):
+    """Compute Power et al. (2012) framewise displacement.
 
-    Extracts the first 6 columns (base motion parameters) from the motion file,
-    then runs 1d_tool.py to create an FD-based censor file.
+    FD is the sum of absolute backward differences of the six motion parameters,
+    with rotations converted to arc length on a 50 mm sphere.
+
+    Parameters
+    ----------
+    motion : np.ndarray
+        (N, >=6) array whose first six columns are [tx, ty, tz, rx, ry, rz],
+        translations in mm and rotations in degrees.
+    run_lengths : list of int or None
+        TRs per concatenated run. FD is 0 at each run's first TR, since the
+        difference across a run boundary is not head motion.
+
+    Returns
+    -------
+    np.ndarray
+        FD per TR (length N). The first TR is 0.
+    """
+    deltas = np.vstack([np.zeros((1, 6)), np.diff(motion[:, :6], axis=0)])
+    deltas[:, 3:6] = np.radians(deltas[:, 3:6]) * FD_RADIUS_MM
+    fd = np.abs(deltas).sum(axis=1)
+    if run_lengths:
+        fd[np.cumsum(run_lengths)[:-1]] = 0.0
+    return fd
+
+
+def create_censor_file(motion_path, fd_threshold, censor_prev_tr, out_dir, out_prefix, label, logger, run_lengths=None):
+    """
+    Generate a censor file from motion regressors using Power framewise displacement.
+
+    A TR is censored when FD > fd_threshold. Writes the FD series to
+    ``{out_prefix}_{label}_fd.1D`` and the censor vector to
+    ``{out_prefix}_{label}_censor.1D``.
 
     Parameters
     ----------
@@ -129,34 +161,48 @@ def create_censor_file(motion_path, fd_threshold, censor_prev_tr, out_dir, out_p
     label : str
         Descriptive label (e.g. "concat", "run1").
     logger : logging.Logger
+    run_lengths : list of int or None
+        TRs per concatenated run; see power_fd.
 
     Returns
     -------
     pathlib.Path
         Path to the generated censor file.
-    """
-    # 1d_tool.py auto-appends _censor.1D to the prefix
-    censor_prefix = Path(out_dir) / f"{out_prefix}_{label}"
-    censor_path = censor_prefix.with_name(f"{censor_prefix.name}_censor.1D")
 
-    # Skip if censor file already exists (1d_tool.py won't overwrite)
+    Raises
+    ------
+    InputError
+        If the motion file is unreadable, has fewer than 6 columns, holds
+        non-finite values (NaN compares False, so that TR would not be censored),
+        or does not match run_lengths.
+    """
+    censor_path = Path(out_dir) / f"{out_prefix}_{label}_censor.1D"
+
+    # Skip if censor file already exists
     if censor_path.exists():
         logger.info("Censor file %s already exists (skipping generation).", censor_path)
     else:
-        # Extract first 6 columns (base motion only) for FD calculation
-        motion_6col = prepare_motion_file(motion_path, 6, out_dir, out_prefix, f"{label}_censor_src", logger)
+        try:
+            motion = np.loadtxt(motion_path, ndmin=2)
+        except Exception as e:
+            raise InputError(f"Cannot read motion file '{motion_path}': {e}") from e
+        if motion.shape[1] < 6:
+            raise InputError(f"Motion file '{motion_path}' has {motion.shape[1]} columns, expected >= 6.")
+        if not np.isfinite(motion[:, :6]).all():
+            raise InputError(f"Motion file '{motion_path}' has non-finite values in its first 6 columns.")
+        if run_lengths and sum(run_lengths) != len(motion):
+            raise InputError(f"Motion file '{motion_path}' has {len(motion)} rows, "
+                             f"but run_lengths {run_lengths} sum to {sum(run_lengths)}.")
 
-        # Build 1d_tool.py command
-        cmd = ["1d_tool.py",
-               "-infile", motion_6col,
-               "-censor_motion", str(fd_threshold), censor_prefix]
+        fd = power_fd(motion, run_lengths)
+        high_motion = fd > fd_threshold
+        keep = ~high_motion
         if censor_prev_tr:
-            cmd.append("-censor_prev_TR")
+            # FD is 0 at each run's first TR, so this never crosses a run boundary
+            keep[:-1] &= ~high_motion[1:]
 
-        run_afni_command(cmd, description=f"1d_tool.py censor {label}", logger=logger)
-
-        if not censor_path.exists():
-            raise ToolExecutionError(f"Expected censor file not found: {censor_path}")
+        np.savetxt(censor_path.with_name(f"{out_prefix}_{label}_fd.1D"), fd, fmt="%.6f")
+        np.savetxt(censor_path, keep.astype(int), fmt="%d")
 
     # Log count of censored TRs and warn at thresholds
     try:
@@ -295,14 +341,11 @@ def censor_interpolate_1d_afni(input_path, tr, censor_path, out_dir, out_prefix,
 
 def bandpass_filter_1d_afni(input_path, tr, bandpass, out_dir, out_prefix, label, logger):
     """
-    Bandpass-filter a nuisance regressor 1D file using AFNI 3dBandpass -nodetrend.
+    Bandpass-filter a nuisance regressor 1D file using AFNI 3dBandpass.
 
-    Invokes ``3dBandpass`` with ``-nodetrend`` to apply a bandpass filter to the
-    input 1D file over the passband specified by ``bandpass[0]`` (fbot) and
-    ``bandpass[1]`` (ftop).  The ``-nodetrend`` flag is required to preserve
-    consistency with the ``polort -1`` convention used throughout the pipeline
-    (i.e., no polynomial detrending is applied here, because detrending is handled
-    separately), and the passband matches the BOLD bandpass step so that nuisance
+    Invokes ``3dBandpass`` to apply its quadratic detrend and a bandpass filter to
+    the input 1D file over the passband specified by ``bandpass[0]`` (fbot) and
+    ``bandpass[1]`` (ftop).  Both match the BOLD bandpass step so that nuisance
     regressors and BOLD data share the same frequency content.  Because AFNI
     interprets .1D files as rows=voxels, cols=timepoints, the input is presented to
     3dBandpass with a trailing apostrophe (AFNI transpose operator) so the time axis
@@ -341,7 +384,6 @@ def bandpass_filter_1d_afni(input_path, tr, bandpass, out_dir, out_prefix, label
     input_path = _as_1d(input_path, out_dir, out_prefix, label)
 
     cmd = ["3dBandpass",
-           "-nodetrend",
            "-dt", str(tr),
            "-prefix", out_path,
            str(bandpass[0]), str(bandpass[1]),
@@ -354,7 +396,7 @@ def bandpass_filter_1d_afni(input_path, tr, bandpass, out_dir, out_prefix, label
     return out_path
 
 
-def compute_tissue_derivative(tissue_path, out_dir, out_prefix, tissue_label, logger):
+def compute_tissue_derivative(tissue_path, out_dir, out_prefix, tissue_label, logger, run_lengths=None):
     """
     Compute the first temporal derivative of a tissue signal file.
 
@@ -372,6 +414,8 @@ def compute_tissue_derivative(tissue_path, out_dir, out_prefix, tissue_label, lo
     tissue_label : str
         Label for the tissue type (e.g. "CSF", "WM", "run1_CSF").
     logger : logging.Logger
+    run_lengths : list of int or None
+        TRs per concatenated run. The derivative is 0 at each run's first TR.
 
     Returns
     -------
@@ -385,6 +429,8 @@ def compute_tissue_derivative(tissue_path, out_dir, out_prefix, tissue_label, lo
     if data.ndim != 1:
         raise InputError(f"Tissue file '{tissue_path}' must be single-column, got shape {data.shape}.")
     deriv = np.diff(data, prepend=data[0])
+    if run_lengths:
+        deriv[np.cumsum(run_lengths)[:-1]] = 0.0
     deriv_path = Path(out_dir) / f"{out_prefix}_{tissue_label}_deriv.txt"
     np.savetxt(deriv_path, deriv, fmt="%.8f")
     logger.info("Created tissue derivative: %s", deriv_path)
@@ -463,12 +509,109 @@ def gen_min_outlier_epi(scan_path, out_dir, out_file_pre, label, logger):
     return out_path
 
 
-def scale_to_psc(scan_path, out_dir, out_file_pre, label, logger):
+def run_segments(scan_path, run_lengths=None):
+    """(run number, AFNI selector) for each run of a scan; a scan without run_lengths is one run."""
+    if not run_lengths or len(run_lengths) < 2:
+        return [(1, str(scan_path))]
+    segments = []
+    start = 0
+    for run, n_trs in enumerate(run_lengths, 1):
+        segments.append((run, f"{scan_path}[{start}..{start + n_trs - 1}]"))
+        start += n_trs
+    return segments
+
+
+def count_nonzero(path, logger):
+    """Count a dataset's non-zero voxels."""
+    out = run_afni_command(["3dBrickStat", "-non-zero", "-count", path], capture_output=True,
+                           description="3dBrickStat -count", logger=logger)
+    return int(out.split()[0])
+
+
+def nonconstant_mask(input_spec, mask_path, logger):
+    """Write a mask of the voxels whose maximum differs from their minimum."""
+    mask_path = Path(mask_path)
+    range_path = mask_path.with_name(f"range_{mask_path.name}")
+    run_afni_command(["3dTstat", "-max", "-min", "-prefix", range_path, input_spec],
+                     description="3dTstat max and min", logger=logger)
+    run_afni_command(["3dcalc", "-a", f"{range_path}[0]", "-b", f"{range_path}[1]",
+                      "-expr", "step(a-b)", "-prefix", mask_path],
+                     description="3dcalc non-constant mask", logger=logger)
+    return mask_path
+
+
+def psc_qc(input_spec, mean_path, run, logger):
+    """Build a psc_per_run record for one run, and refuse demeaned input.
+
+    Raises
+    ------
+    InputError
+        If PSC_NONPOSITIVE_LIMIT percent or more of the non-constant voxels have a
+        temporal mean <= 0. Dividing by such a mean gives no percent signal change.
+    """
+    mean_path = Path(mean_path)
+    with tempfile.TemporaryDirectory(dir=mean_path.parent) as tmp:
+        tmp = Path(tmp)
+        mask = nonconstant_mask(input_spec, tmp / "mask.nii.gz", logger)
+        n_mask = count_nonzero(mask, logger)
+        if n_mask == 0:
+            return {"run": run, "n_mask_voxels": 0, "n_guarded_voxels": None, "pct_guarded_voxels": None,
+                    "n_capped_voxels": None, "pct_capped_voxels": None,
+                    "n_nonpositive_mean_voxels": None, "pct_nonpositive_mean_voxels": None}
+        data_range = tmp / "range_mask.nii.gz"
+
+        def count(name, *inputs, expr):
+            path = tmp / f"{name}.nii.gz"
+            run_afni_command(["3dcalc", *inputs, "-expr", expr, "-prefix", path],
+                             description=f"3dcalc PSC QC {name}", logger=logger)
+            return count_nonzero(path, logger)
+
+        n_guarded = count("guarded", "-a", mask, "-b", f"{data_range}[1]", "-c", mean_path,
+                          expr="a*or(not(ispositive(b)),not(ispositive(c)))")
+        n_capped = count("capped", "-a", mask, "-b", mean_path, "-c", f"{data_range}[0]",
+                         expr="a*ispositive(b)*step(c-2*b)")
+        n_nonpositive = count("nonpositive", "-a", mask, "-b", mean_path, expr="a*not(ispositive(b))")
+
+    pct_nonpositive = round(100.0 * n_nonpositive / n_mask, 2)
+    if pct_nonpositive >= PSC_NONPOSITIVE_LIMIT:
+        raise InputError(f"Run {run}: {pct_nonpositive}% of non-constant voxels have a temporal mean <= 0, "
+                         "so the input looks demeaned. Percent signal change needs a positive baseline; "
+                         "set scale_to_psc: false for demeaned input.")
+    return {"run": run, "n_mask_voxels": n_mask,
+            "n_guarded_voxels": n_guarded, "pct_guarded_voxels": round(100.0 * n_guarded / n_mask, 2),
+            "n_capped_voxels": n_capped, "pct_capped_voxels": round(100.0 * n_capped / n_mask, 2),
+            "n_nonpositive_mean_voxels": n_nonpositive, "pct_nonpositive_mean_voxels": pct_nonpositive}
+
+
+def psc_scale(input_spec, mean_path, psc_path, logger):
+    """Write the voxelwise mean of input_spec and input_spec scaled to PSC."""
+    run_afni_command(
+        ["3dTstat", "-mean", "-prefix", mean_path, input_spec],
+        description="3dTstat temporal mean for PSC scaling",
+        logger=logger,
+    )
+
+    run_afni_command(
+        ["3dcalc",
+         "-a", input_spec,
+         "-b", mean_path,
+         "-expr", "min(200,a/b*100)*step(a)*step(b)",
+         "-prefix", psc_path],
+        description="3dcalc PSC scaling",
+        logger=logger,
+    )
+
+
+def scale_to_psc(scan_path, out_dir, out_file_pre, label, logger, run_lengths=None, qc_records=None, run=1):
     """Scale a 4D NIfTI to percent signal change (PSC).
 
     Computes the voxelwise temporal mean via 3dTstat, then divides each
     voxel's time series by its mean and multiplies by 100, with a 200%
     ceiling and zero-guard via step functions.
+
+    With more than one run in run_lengths, each run is scaled by its own mean
+    and the scaled runs are concatenated, so that the mean is
+    ``{out_file_pre}_run{N}_mean.nii.gz`` per run.
 
     Parameters
     ----------
@@ -482,34 +625,50 @@ def scale_to_psc(scan_path, out_dir, out_file_pre, label, logger):
         Descriptive label appended to filenames. Use "" for task pipelines
         (single concatenated scan) or "run1", "run2", etc. for rest_conn.
     logger : logging.Logger
+    run_lengths : list of int or None
+        TRs per concatenated run.
+    qc_records : list or None
+        If given, each run's psc_qc record is appended to it.
+    run : int
+        Run number for the record when the scan is a single run.
 
     Returns
     -------
     pathlib.Path
         Path to the PSC-scaled 4D NIfTI.
+
+    Raises
+    ------
+    InputError
+        If the input looks demeaned; see psc_qc.
     """
-    mean_path = Path(out_dir) / _labeled_name(out_file_pre, label, "mean.nii.gz")
-    psc_path = Path(out_dir) / _labeled_name(out_file_pre, label, "psc.nii.gz")
+    out_dir = Path(out_dir)
+    psc_path = out_dir / _labeled_name(out_file_pre, label, "psc.nii.gz")
 
     if psc_path.exists():
         logger.info("PSC-scaled file already exists: %s", psc_path)
         return psc_path
 
-    run_afni_command(
-        ["3dTstat", "-mean", "-prefix", mean_path, scan_path],
-        description="3dTstat temporal mean for PSC scaling",
-        logger=logger,
-    )
-
-    run_afni_command(
-        ["3dcalc",
-         "-a", scan_path,
-         "-b", mean_path,
-         "-expr", "min(200,a/b*100)*step(a)*step(b)",
-         "-prefix", psc_path],
-        description="3dcalc PSC scaling",
-        logger=logger,
-    )
+    segments = run_segments(scan_path, run_lengths)
+    if len(segments) > 1:
+        run_psc_paths = []
+        for segment_run, spec in segments:
+            run_label = f"{label}_run{segment_run}" if label else f"run{segment_run}"
+            run_psc = out_dir / _labeled_name(out_file_pre, run_label, "psc.nii.gz")
+            mean_path = out_dir / _labeled_name(out_file_pre, run_label, "mean.nii.gz")
+            psc_scale(spec, mean_path, run_psc, logger)
+            if qc_records is not None:
+                qc_records.append(psc_qc(spec, mean_path, segment_run, logger))
+            run_psc_paths.append(run_psc)
+        run_afni_command(["3dTcat", "-prefix", psc_path, *run_psc_paths],
+                         description="3dTcat per-run PSC scans", logger=logger)
+        for run_psc in run_psc_paths:
+            run_psc.unlink()
+    else:
+        mean_path = out_dir / _labeled_name(out_file_pre, label, "mean.nii.gz")
+        psc_scale(scan_path, mean_path, psc_path, logger)
+        if qc_records is not None:
+            qc_records.append(psc_qc(scan_path, mean_path, run, logger))
 
     logger.info("PSC-scaled scan written to %s", psc_path)
     return psc_path

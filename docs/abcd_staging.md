@@ -63,11 +63,13 @@ the reason; the two tissue rows above are needed only for `fixed`.
   following trial and starts after the run's last frame, and the next run's first trial
   precedes its first cue, the cue moves back to 3.0 s before that trial.
 - **Motion:** translations first, in degrees, with first derivatives taken before
-  trimming. An isolated NaN becomes 999 so that FD censoring removes that TR.
+  trimming. ABCD's confounds already hold degrees, so rotations pass through unconverted. An
+  isolated NaN becomes 999 so that FD censoring removes that TR.
 - **n-back events:** a 0-back cue takes its block's condition and a 2-back cue becomes
   `instruction`. `dummy` rows are dropped.
-- **n-back runs** are concatenated, masked by the intersection of their brain masks. A run
-  that fails staging is excluded and recorded, and the rest continue.
+- **n-back runs** are concatenated, masked by the intersection of their brain masks, and
+  their lengths are passed as `run_lengths`, so each run gets its own baseline and PSC mean.
+  A run that fails staging is excluded and recorded, and the rest continue.
 - **Rest WM mask:** as fMRIPrep builds `white_matter`: dilated grey matter removed, moved
   to the BOLD grid as partial-volume fractions, brain-masked, kept above 0.99.
 - **Rest CSF mask:** restricted to the ventricles with FastSurfer's `label-CSF_mask`, then

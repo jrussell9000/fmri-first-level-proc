@@ -62,7 +62,7 @@ def available_cpus(environ=None, cgroup_root: Path = Path("/sys/fs/cgroup")) -> 
         return limit, "cgroup CPU limit"
     return _schedulable_cpus(), "schedulable CPUs"
 
-# Complete AFNI binary list (15 binaries, verified by codebase grep)
+# Complete AFNI binary list
 _AFNI_BINARIES: list[str] = [
     "3dDeconvolve",
     "3dTproject",
@@ -77,8 +77,12 @@ _AFNI_BINARIES: list[str] = [
     "3dcalc",
     "3dLSS",
     "3dTcat",
-    "1d_tool.py",
     "1dtranspose",
+    "3dBlurToFWHM",
+    "3dFWHMx",
+    "3dMean",
+    "3dBrickStat",
+    "3dTcorr1D",
 ]
 
 

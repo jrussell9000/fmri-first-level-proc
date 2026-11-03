@@ -92,14 +92,18 @@ from ..design import (
     log_nuisance_model,
     needs_married_timing,
     read_and_validate_stim_data,
+    trial_energy_ratios,
+    trial_records,
     valid_contrast_functions,
     write_onset_file,
 )
 from ..exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
-from ..fileutils import remove_files_from_dir, sanitize_filename_label
+from ..fileutils import remove_files_from_dir, sanitize_filename_label, with_token
+from ..inputs import check_inputs
 from ..preprocessing import (
     CENSOR_HIGH_THRESHOLD,
     compute_tissue_derivative,
+    CENSOR_METRIC,
     create_censor_file,
     gen_min_outlier_epi,
     prepare_motion_file,
@@ -113,6 +117,7 @@ from ..reporting import (
     setup_logging,
     write_qc_summary,
 )
+from ..smoothing import smooth_task_scan, smoothing_token
 from ..templates import extract_roi_stats, validate_template
 
 # Surviving trial count below which TRIALS_FEW warning is emitted (condition still included)
@@ -167,15 +172,16 @@ def _onset_path(config: ResolvedConfig, cond: str) -> Path:
     return Path(config.out_dir) / f"{config.out_file_pre}_concat_{cond}_onsets.txt"
 
 
-def _bucket_stats_path(config: ResolvedConfig) -> Path:
-    return Path(config.out_dir) / f"{config.out_file_pre}_concat_bucket_stats.nii.gz"
+def _bucket_stats_path(config: ResolvedConfig, token: str = "") -> Path:
+    return with_token(Path(config.out_dir) / f"{config.out_file_pre}_concat_bucket_stats.nii.gz", token)
 
 
-def _bucket_resids_path(config: ResolvedConfig) -> Path:
-    return Path(config.out_dir) / f"{config.out_file_pre}_concat_bucket_resids.nii.gz"
+def _bucket_resids_path(config: ResolvedConfig, token: str = "") -> Path:
+    return with_token(Path(config.out_dir) / f"{config.out_file_pre}_concat_bucket_resids.nii.gz", token)
 
 
-def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: logging.Logger) -> None:
+def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: logging.Logger,
+                    scan_path: str | Path | None = None, token: str = "") -> None:
     """Execute the 3dDeconvolve activation first-level regression.
 
     Builds the full 3dDeconvolve command including nuisance regressors
@@ -193,13 +199,17 @@ def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: log
         out_dir, out_file_pre, cond_labels, hrf_model, custom_hrf,
         contrast_functions, contrast_labels, num_cores, tr.
     logger : logging.Logger
+    scan_path : str or pathlib.Path, optional
+        Model input in place of config.scan_path, for the smoothed GLM.
+    token : str
+        Smoothing token for the output file names.
 
     Raises
     ------
     ToolExecutionError
         If 3dDeconvolve fails or does not produce the expected bucket stats file.
     """
-    bucket_path = _bucket_stats_path(config)
+    bucket_path = _bucket_stats_path(config, token)
 
     # Check if outputs exist
     if not bucket_path.exists():
@@ -209,15 +219,17 @@ def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: log
         WM_deriv_path = None
         if config.use_tissue_derivs:
             if config.CSF_path is not None:
-                CSF_deriv_path = compute_tissue_derivative(config.CSF_path, config.out_dir, config.out_file_pre, "CSF", logger)
+                CSF_deriv_path = compute_tissue_derivative(config.CSF_path, config.out_dir, config.out_file_pre, "CSF", logger,
+                                                           run_lengths=config.run_lengths)
             if config.WM_path is not None:
-                WM_deriv_path = compute_tissue_derivative(config.WM_path, config.out_dir, config.out_file_pre, "WM", logger)
+                WM_deriv_path = compute_tissue_derivative(config.WM_path, config.out_dir, config.out_file_pre, "WM", logger,
+                                                          run_lengths=config.run_lengths)
 
         # Set-up base command, including temporal detrending, frame censors, and motion regressors
-        decon_command = build_decon_base_command(config.scan_path, config.censor_path, config.motion_path,
+        decon_command = build_decon_base_command(scan_path or config.scan_path, config.censor_path, config.motion_path,
                                                  CSF_path=config.CSF_path, WM_path=config.WM_path,
                                                  CSF_deriv_path=CSF_deriv_path, WM_deriv_path=WM_deriv_path,
-                                                 tr=config.tr)
+                                                 tr=config.tr, run_lengths=config.run_lengths)
         decon_command.extend(["-num_stimts", f"{len(config.cond_labels)}"])
 
         # Iteratively add stim timing for conditions
@@ -244,7 +256,7 @@ def run_first_level(stim_data: pd.DataFrame, config: ResolvedConfig, logger: log
                                       "-glt_label", f"{ci+1}", f"{config.contrast_labels[ci]}"])
 
         # Add statistics output
-        decon_command.extend(["-errts", _bucket_resids_path(config),
+        decon_command.extend(["-errts", _bucket_resids_path(config, token),
                               "-fout", "-rout", "-tout",
                               "-bucket", bucket_path,
                               "-jobs", f"{config.num_cores}"])
@@ -347,7 +359,7 @@ def _get_subbrik_stat_aux(bucket_path, subbrik_index, logger=None):
     return []
 
 
-def generate_bucket_stats_index(config: ResolvedConfig, logger: logging.Logger) -> Path:
+def generate_bucket_stats_index(config: ResolvedConfig, logger: logging.Logger, token: str = "") -> Path:
     """Generate a JSON index mapping every sub-brick label in the bucket stats output to its 0-based index.
 
     Parameters
@@ -361,14 +373,14 @@ def generate_bucket_stats_index(config: ResolvedConfig, logger: logging.Logger) 
     pathlib.Path
         Path to the written index JSON file.
     """
-    index_path = Path(config.out_dir) / f"{config.out_file_pre}_concat_bucket_stats_index.json"
+    index_path = with_token(Path(config.out_dir) / f"{config.out_file_pre}_concat_bucket_stats_index.json", token)
 
     if index_path.exists():
         logger.info("Bucket stats index already exists: %s", index_path)
         return index_path
 
     info = run_afni_command(
-        ['3dinfo', '-label', _bucket_stats_path(config)],
+        ['3dinfo', '-label', _bucket_stats_path(config, token)],
         capture_output=True,
         description="3dinfo label for bucket stats index",
         logger=logger,
@@ -382,7 +394,7 @@ def generate_bucket_stats_index(config: ResolvedConfig, logger: logging.Logger) 
     return index_path
 
 
-def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list[str]:
+def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger, token: str = "") -> list[str]:
     """Extract stat-type-based bucket outputs from the 3dDeconvolve bucket dataset.
 
     For each stat type in config.stat_buckets, this function:
@@ -395,6 +407,9 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
 
     For Zstat: finds Tstat sub-bricks, converts each to Z via 3dcalc fitt_t2z(),
     then assembles the Z volumes into the bucket.
+
+    With a smoothing token, only the voxelwise bucket and index are written: parcel-level
+    outputs never come from smoothed data.
 
     Parameters
     ----------
@@ -409,7 +424,7 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
         Paths of all output files created.
     """
     out_dir = Path(config.out_dir)
-    bucket_path = _bucket_stats_path(config)
+    bucket_path = _bucket_stats_path(config, token)
     output_files = []
 
     labels_out = run_afni_command(
@@ -437,8 +452,8 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
         logger.info("Found %d sub-bricks for stat type '%s': %s",
                     len(matched), stat_type, [m[0] for m in matched])
 
-        bucket_out = out_dir / f"{config.extract_out_file_pre}_{stat_type}_bucket.nii.gz"
-        index_out = out_dir / f"{config.extract_out_file_pre}_{stat_type}_index.json"
+        bucket_out = with_token(out_dir / f"{config.extract_out_file_pre}_{stat_type}_bucket.nii.gz", token)
+        index_out = with_token(out_dir / f"{config.extract_out_file_pre}_{stat_type}_index.json", token)
 
         if not bucket_out.exists():
             if need_t2z:
@@ -487,14 +502,15 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
         output_files.append(str(index_out))
         logger.info("Wrote %s index: %s", stat_type, index_out)
 
-        if config.template_path is not None and config.template_path != "WB":
+        if not token and config.template_path is not None and config.template_path != "WB":
             csv_out = out_dir / f"{config.extract_out_file_pre}_{stat_type}_parcellated.csv"
             if not csv_out.exists():
                 rows = {}
                 for new_idx, (label, _) in enumerate(matched):
                     roi_df = extract_roi_stats(
                         f"{bucket_out}[{new_idx}]",
-                        config.template_path, config.average_type, logger=logger)
+                        config.template_path, config.average_type, logger=logger,
+                        roi_zero_handling=config.roi_zero_handling)
                     rows[label] = roi_df.iloc[0]
                 parcellated_df = pd.DataFrame(rows).T
                 parcellated_df.index.name = "condition"
@@ -504,11 +520,12 @@ def extract_stat_buckets(config: ResolvedConfig, logger: logging.Logger) -> list
                 logger.info("%s parcellated CSV already exists: %s", stat_type, csv_out)
             output_files.append(str(csv_out))
 
-    if config.extract_resids:
+    if config.extract_resids and not token:
         resid_csv = out_dir / f"{config.extract_out_file_pre}_resids.csv"
         if not resid_csv.exists():
             resid_df = extract_roi_stats(
-                _bucket_resids_path(config), config.template_path, config.average_type, logger=logger)
+                _bucket_resids_path(config), config.template_path, config.average_type, logger=logger,
+                roi_zero_handling=config.roi_zero_handling)
             resid_df.to_csv(resid_csv)
             if resid_csv.exists():
                 logger.info("Extracted residuals to %s", resid_csv)
@@ -579,6 +596,7 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         logger = setup_logging("task_act_first_level")
 
     config = copy.copy(config)
+    check_inputs(config, logger, write_timing_errors=True)
     clear_warnings()
 
     logger.info("First-level regression will use the following task conditions: %s", config.cond_labels)
@@ -641,7 +659,8 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
                 config.scan_path, config.template_path,
                 config.out_dir, config.force_diff_atlas, conn_type="extract", logger=logger
             )
-            raw_df = extract_roi_stats(config.scan_path, validated_tpl, config.average_type, logger=logger)
+            raw_df = extract_roi_stats(config.scan_path, validated_tpl, config.average_type, logger=logger,
+                                       roi_zero_handling=config.roi_zero_handling)
             raw_df.to_csv(raw_out)
             if raw_out.exists():
                 logger.info("Extracted raw (pre-regression) ptseries to %s.", raw_out)
@@ -656,15 +675,18 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     gen_min_outlier_epi(config.scan_path, config.out_dir, config.out_file_pre, "", logger)
 
     # PSC scaling (after min-outlier EPI, before regression)
+    unscaled_scan = config.scan_path
+    psc_per_run = []
     if config.scale_to_psc:
         psc_path = scale_to_psc(
-            config.scan_path, config.out_dir, config.out_file_pre, "", logger)
+            config.scan_path, config.out_dir, config.out_file_pre, "", logger,
+            run_lengths=config.run_lengths, qc_records=psc_per_run)
         config.scan_path = str(psc_path)
 
     # Generate censor file from motion regressors (before prepare_motion_file overwrites path)
     config.censor_path = str(create_censor_file(
         config.motion_path, config.fd_threshold, config.censor_prev_tr,
-        config.out_dir, config.out_file_pre, "concat", logger))
+        config.out_dir, config.out_file_pre, "concat", logger, run_lengths=config.run_lengths))
 
     # Validate and prepare motion regressors
     use_cols = 12 if config.include_motion_derivs else 6
@@ -675,7 +697,8 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     stim_data = read_stim_data(config, logger)
 
     # Per-condition trial survival QC
-    trial_survival = check_trial_survival(stim_data, config.cond_labels, config.censor_path, config.tr, logger)
+    trial_ratios = trial_energy_ratios(stim_data, config.cond_labels, config.censor_path, config, logger)
+    trial_survival = check_trial_survival(trial_ratios, logger)
 
     # Warn for conditions with few but sufficient surviving trials
     for cond, n_surv in trial_survival.items():
@@ -734,13 +757,14 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
             n_regressors += 1
         if config.WM_path is not None:
             n_regressors += 1
-    dof = compute_dof(config.censor_path, n_regressors, logger, tr=config.tr)
+    dof = compute_dof(config.censor_path, n_regressors, logger, tr=config.tr, run_lengths=config.run_lengths)
 
     # Build QC summary data
     qc_data = {
         "analysis_type": "task_act",
         "hrf_model": config.hrf_model if config.hrf_model != "custom" else f"custom ({config.custom_hrf})",
         "fd_threshold": config.fd_threshold,
+        "censor_metric": CENSOR_METRIC,
         "censor_prev_tr": config.censor_prev_tr,
     }
     try:
@@ -753,6 +777,9 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     qc_data["per_condition_trial_counts"] = {c: int(len(stim_data[stim_data['trial_type'] == c])) for c in config.cond_labels}
     qc_data["per_condition_surviving_trials"] = trial_survival
     qc_data["dof"] = dof
+    qc_data["trials"] = trial_records(stim_data, trial_ratios, config.tr, config.run_lengths)
+    if config.scale_to_psc:
+        qc_data["psc_per_run"] = psc_per_run
 
     # Warn if censoring rate exceeds the high threshold
     if qc_data.get("pct_censored", 0.0) > CENSOR_HIGH_THRESHOLD:
@@ -773,6 +800,17 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     if config.stat_buckets:
         extraction_files = extract_stat_buckets(config, logger)
 
+    # Second GLM on the smoothed input, with the same design and contrasts
+    smoothed_candidates = []
+    if config.smoothing_enabled:
+        token = smoothing_token(config.smoothing_fwhm)
+        smoothed_scan, qc_data["smoothing_per_run"] = smooth_task_scan(unscaled_scan, config, logger)
+        run_first_level(stim_data, config, logger, scan_path=smoothed_scan, token=token)
+        smoothed_candidates = [smoothed_scan, _bucket_stats_path(config, token), _bucket_resids_path(config, token),
+                               generate_bucket_stats_index(config, logger, token)]
+        if config.stat_buckets:
+            extraction_files.extend(extract_stat_buckets(config, logger, token))
+
     # Write QC summary
     write_qc_summary(config.out_dir, config.out_file_pre, qc_data, logger)
 
@@ -783,6 +821,7 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         _bucket_stats_path(config),
         _bucket_resids_path(config),
         bucket_stats_index_path,
+        *smoothed_candidates,
     ]
     output_files = [str(p) for p in candidates if p.exists()]
     output_files.extend(extraction_files)

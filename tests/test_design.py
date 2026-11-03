@@ -1,5 +1,7 @@
 """Pure-function tests for HRF, stimulus timing, contrast, and DOF helpers."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,6 +11,8 @@ from fmri_first_level_proc.design import (
     build_decon_base_command,
     build_hrf_string,
     check_trial_survival,
+    trial_energy_ratios,
+    trial_records,
     compute_dof,
     needs_married_timing,
     read_and_validate_stim_data,
@@ -121,20 +125,48 @@ def test_write_onset_file_single_and_married(tmp_path, logger):
     assert validate_onset_file_format(str(married), False, logger=logger) is False
 
 
-def test_check_trial_survival(tmp_path, logger):
+def test_check_trial_survival_counts_ratios_above_zero(logger):
+    assert check_trial_survival({"A": [1.0, 0.0, 0.001], "B": [0.0]}, logger) == {"A": 2, "B": 0}
+
+
+def test_parse_x1d_and_pooled_ratios(tmp_path, monkeypatch, logger):
+    """Two basis columns per trial: a trial's ratio is pooled over both, in onset order."""
+    def fake_deconvolve(command, **kwargs):
+        rows = np.zeros((6, 4))
+        rows[[0, 1], 0], rows[[0, 1], 1] = 1.0, 1.0  # trial 0: rows 0-1, censored row 1
+        rows[[2, 3], 2], rows[[2, 3], 3] = 1.0, 1.0  # trial 1: rows 2-3, all censored
+        path = command[command.index("-x1D") + 1]
+        with open(path, "w") as f:
+            f.write('# ColumnLabels = "stim1#0_0 ; stim1#0_1 ; stim1#1_0 ; stim1#1_1"\n')
+            np.savetxt(f, rows)
+
+    monkeypatch.setattr("fmri_first_level_proc.design.run_afni_command", fake_deconvolve)
     censor = tmp_path / "censor.1D"
-    np.savetxt(censor, [1, 1, 0, 1, 1, 0, 1, 1, 1, 1])
-    df = pd.DataFrame({"trial_type": ["A", "A", "A", "B"], "onset": [0.0, 2.0, 4.0, 5.0]})
-    # tr=1: A onsets at TRs 0, 2 (censored), 4; B at TR 5 (censored)
-    assert check_trial_survival(df, ["A", "B"], str(censor), 1.0, logger) == {"A": 2, "B": 0}
+    np.savetxt(censor, [1, 0, 0, 0, 1, 1])
+    df = pd.DataFrame({"trial_type": ["A", "A"], "onset": [0.0, 2.0], "duration": [1.0, 1.0]})
+    config = SimpleNamespace(tr=1.0, hrf_model="TENT", custom_hrf=None, run_lengths=None, out_dir=str(tmp_path))
+    monkeypatch.setattr("fmri_first_level_proc.design.build_hrf_string", lambda *a, **k: "TENT(0,2,2)")
+    assert trial_energy_ratios(df, ["A"], str(censor), config, logger) == {"A": [0.5, 0.0]}
+    assert [p.name for p in tmp_path.iterdir()] == ["censor.1D"]
+
+
+def test_trial_records_flag_survival(logger):
+    df = pd.DataFrame({"trial_type": ["A", "B", "A"], "onset": [10.0, 20.0, 90.0], "duration": [2.0, 2.0, 2.0]})
+    records = trial_records(df, {"A": [0.25, 0.0], "B": [1.0]}, 2.0, [40, 60])
+    assert records[0] == {"run": 1, "condition": "A", "onset": 10.0, "duration": 2.0,
+                          "estimability": 0.25, "survived": True}
+    assert (records[1]["run"], records[1]["survived"]) == (2, False)
+    assert records[2]["condition"] == "B"
 
 
 def test_compute_dof(tmp_path, logger):
     censor = tmp_path / "censor.1D"
     np.savetxt(censor, [1] * 200 + [0] * 100)
     assert compute_dof(str(censor), 10, logger) == 190
-    # polort A: 1 + floor(300 TRs * 1.0 s / 150) = 3 extra regressors
-    assert compute_dof(str(censor), 10, logger, tr=1.0) == 187
+    # polort A: degree 1 + floor(300 TRs * 1.0 s / 150) = 3, so 4 extra regressors
+    assert compute_dof(str(censor), 10, logger, tr=1.0) == 186
+    # Two runs: degree 1 + floor(200 s / 150) = 2 from the longest run, so 3 regressors per run
+    assert compute_dof(str(censor), 10, logger, tr=1.0, run_lengths=[100, 200]) == 184
     with pytest.raises(ModelError):
         compute_dof(str(censor), 200, logger)
     assert compute_dof(str(tmp_path / "missing.1D"), 1, logger) is None

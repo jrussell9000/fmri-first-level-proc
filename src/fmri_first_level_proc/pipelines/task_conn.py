@@ -75,6 +75,7 @@ OUTPUTS:
 
 # Imports
 import copy
+import json
 import logging
 from pathlib import Path
 
@@ -86,6 +87,7 @@ from ..manifest import manifested
 from ..config import ResolvedConfig
 from ..connectivity import (
     build_conn_output_path,
+    seed_to_voxel_smoothed,
     compute_matrix_contrast,
     parcellated_conn,
     seed_to_voxel_conn,
@@ -99,15 +101,20 @@ from ..design import (
     log_hrf_model,
     log_nuisance_model,
     needs_married_timing,
+    onset_run,
+    trial_energy_ratios,
+    trial_records,
     read_and_validate_stim_data,
     valid_contrast_functions,
     write_onset_file,
 )
 from ..exceptions import ConfigError, InputError, ModelError, ToolExecutionError
-from ..fileutils import remove_files_from_dir, sanitize_filename_label
+from ..fileutils import remove_files_from_dir, sanitize_filename_label, with_token
+from ..inputs import check_inputs
 from ..preprocessing import (
     CENSOR_HIGH_THRESHOLD,
     compute_tissue_derivative,
+    CENSOR_METRIC,
     create_censor_file,
     gen_min_outlier_epi,
     prepare_motion_file,
@@ -121,6 +128,7 @@ from ..reporting import (
     setup_logging,
     write_qc_summary,
 )
+from ..smoothing import smooth_task_scan, smoothing_token
 from ..templates import (
     extract_roi_stats,
     validate_connectivity_options,
@@ -238,15 +246,17 @@ def gen_design_matrix(stim_data, config: ResolvedConfig, logger):
         WM_deriv_path = None
         if config.use_tissue_derivs:
             if config.CSF_path is not None:
-                CSF_deriv_path = compute_tissue_derivative(config.CSF_path, config.out_dir, config.out_file_pre, "CSF", logger)
+                CSF_deriv_path = compute_tissue_derivative(config.CSF_path, config.out_dir, config.out_file_pre, "CSF", logger,
+                                                           run_lengths=config.run_lengths)
             if config.WM_path is not None:
-                WM_deriv_path = compute_tissue_derivative(config.WM_path, config.out_dir, config.out_file_pre, "WM", logger)
+                WM_deriv_path = compute_tissue_derivative(config.WM_path, config.out_dir, config.out_file_pre, "WM", logger,
+                                                          run_lengths=config.run_lengths)
 
         # Set-up base command, including temporal detrending, frame censors, and motion regressors
         decon_command = build_decon_base_command(config.scan_path, config.censor_path, config.motion_path,
                                                  CSF_path=config.CSF_path, WM_path=config.WM_path,
                                                  CSF_deriv_path=CSF_deriv_path, WM_deriv_path=WM_deriv_path,
-                                                 tr=config.tr)
+                                                 tr=config.tr, run_lengths=config.run_lengths)
         decon_command.extend(["-num_stimts", f"{1+len(stim_data['trial_type'].unique())-len(config.cond_beta_labels)}"])
 
         # Iteratively add stim timing for conditions NOT included in beta series
@@ -291,7 +301,7 @@ def gen_design_matrix(stim_data, config: ResolvedConfig, logger):
     # Remove err file that always seems to be output
     clean_deconvolve_err(config.out_dir)
 
-def gen_beta_series(stim_data, config: ResolvedConfig, beta_cond_order, logger):
+def gen_beta_series(stim_data, config: ResolvedConfig, beta_cond_order, trial_ratios, logger, scan_path=None, token=""):
     """Generate the full-task LSS beta series and condition-specific beta volumes.
 
     Runs 3dLSS on the design matrix to produce the full-task beta series NIfTI
@@ -321,15 +331,15 @@ def gen_beta_series(stim_data, config: ResolvedConfig, beta_cond_order, logger):
         condition-specific beta series.
     """
     out_dir = Path(config.out_dir)
-    lss_path = out_dir / f"{config.out_file_pre}_concat_LSS.nii.gz"
+    lss_path = with_token(out_dir / f"{config.out_file_pre}_concat_LSS.nii.gz", token)
 
     # Check if full-task beta series already exists
     if not lss_path.exists():
 
         # Build the 3dLSS command and create full-task beta series
         lss_command = ["3dLSS", "-matrix", out_dir / f"{config.out_file_pre}_concat_bseries_dmat.x1D",
-                       "-input", config.scan_path,
-                       "-save1D", out_dir / f"{config.out_file_pre}_concat_LSS.1d",
+                       "-input", scan_path or config.scan_path,
+                       "-save1D", with_token(out_dir / f"{config.out_file_pre}_concat_LSS.1d", token),
                        "-prefix", lss_path]
         run_afni_command(lss_command, description="3dLSS beta series", logger=logger)
 
@@ -347,17 +357,30 @@ def gen_beta_series(stim_data, config: ResolvedConfig, beta_cond_order, logger):
     # This ensures total_used correctly maps to 3dLSS sub-brick indices.
     bseries_out = {"CONDITION": [], "PATH": []}
     total_used = 0
+    lss_index = []
     for curr_cond in beta_cond_order:
 
         # Get onset times for the condition
         cond = stim_data[stim_data['trial_type'] == curr_cond]['onset']
-        bseries_path = out_dir / f"{config.out_file_pre}_concat_bseries_{curr_cond}.nii.gz"
+        bseries_path = with_token(out_dir / f"{config.out_file_pre}_concat_bseries_{curr_cond}.nii.gz", token)
+        bseries_index = []
+        for trial_number, (onset, ratio) in enumerate(zip(cond, trial_ratios[curr_cond], strict=True)):
+            survived = ratio > 0
+            trial = {"lss_index": total_used + trial_number,
+                     "beta_series_position": len(bseries_index) if survived else None,
+                     "run": onset_run(onset, config.tr, config.run_lengths), "onset": float(onset)}
+            if survived:
+                bseries_index.append(trial)
+            lss_index.append({**trial, "condition": curr_cond, "survived": survived})
+        bseries_index_path = with_token(out_dir / f"{config.out_file_pre}_concat_bseries_{curr_cond}_index.json", token)
+        bseries_index_path.write_text(json.dumps(bseries_index, indent=2))
 
         # Check if condition-specific beta series already exists
         if not bseries_path.exists():
 
             # Sub-brick selector for this condition's trials, e.g. "[6,7,8]"
-            calc_indices_str = "[" + ",".join(str(total_used + n) for n in range(len(cond))) + "]"
+            # A trial whose whole response is censored stays in the LSS model but leaves the series
+            calc_indices_str = "[" + ",".join(str(trial["lss_index"]) for trial in bseries_index) + "]"
 
             # Build the 3dcalc command and create task condition beta series
             calc_command = ["3dcalc", "-a", f"{lss_path}{calc_indices_str}",
@@ -378,6 +401,9 @@ def gen_beta_series(stim_data, config: ResolvedConfig, beta_cond_order, logger):
             bseries_out["PATH"].append(bseries_path)
 
         total_used += len(cond)
+
+    with_token(out_dir / f"{config.out_file_pre}_concat_LSS_index.json", token).write_text(
+        json.dumps(lss_index, indent=2))
 
     # Something went wrong if our output is empty
     if len(bseries_out["CONDITION"]) == 0:
@@ -413,7 +439,8 @@ def gen_pbseries(bseries_info, config: ResolvedConfig, logger):
             logger.info("%s already exists (skipping).", pbseries_path)
             return
 
-        new_df = extract_roi_stats(bseries_path, config.template_path, config.average_type, logger=logger)
+        new_df = extract_roi_stats(bseries_path, config.template_path, config.average_type, logger=logger,
+                                   roi_zero_handling=config.roi_zero_handling)
 
         # Save pbseries
         new_df.to_csv(pbseries_path)
@@ -461,7 +488,21 @@ def gen_conn(bseries_info, config: ResolvedConfig, logger):
     # Conditions are independent; run 3dNetCorr concurrently within the num_cores budget
     parallel_map(conn_for_condition, zip(bseries_info['CONDITION'], bseries_info['PATH']))
 
-def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, config: ResolvedConfig, logger):
+def gen_smoothed_seed_maps(bseries_info, smoothed_info, config: ResolvedConfig, token, logger):
+    """Write each condition's smoothed seed map: the unsmoothed beta series supplies the
+    seed time series, and the smoothed beta series is the target."""
+    seed_series = dict(zip(bseries_info['CONDITION'], bseries_info['PATH']))
+
+    def conn_for_condition(item):
+        cond, smoothed_path = item
+        seed_to_voxel_smoothed(seed_series[cond], smoothed_path, config.out_dir, config.conn_out_file_pre,
+                               config.template_path, config.fishZ, config.pcorr, token,
+                               condition=cond, logger=logger)
+
+    parallel_map(conn_for_condition, zip(smoothed_info['CONDITION'], smoothed_info['PATH']))
+
+
+def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, config: ResolvedConfig, logger, token=""):
     """Generate connectivity contrasts from condition-level connectivity outputs.
 
     For each contrast, validates that all referenced conditions have connectivity
@@ -479,6 +520,8 @@ def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, config: 
     config : ResolvedConfig
         Pipeline config (must include calc_conn, conn_out_file_pre, fishZ, pcorr, out_dir).
     logger : logging.Logger
+    token : str
+        Smoothing token, for the contrasts of smoothed seed maps.
     """
     available_conds = set(bseries_info['CONDITION'])
 
@@ -497,7 +540,7 @@ def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, config: 
                 continue
             cond_path = build_conn_output_path(
                 config.out_dir, config.conn_out_file_pre, cond,
-                config.fishZ, config.pcorr, config.calc_conn)
+                config.fishZ, config.pcorr, config.calc_conn, token)
             if not cond_path.exists():
                 missing.append(cond)
             cond_conn_paths.append(cond_path)
@@ -510,7 +553,7 @@ def gen_conn_contrasts(bseries_info, parsed_contrasts, contrast_labels, config: 
         # Build contrast output path
         contrast_conn_path = build_conn_output_path(
             config.out_dir, config.conn_out_file_pre, safe_label,
-            config.fishZ, config.pcorr, config.calc_conn)
+            config.fishZ, config.pcorr, config.calc_conn, token)
 
         if contrast_conn_path.exists():
             logger.info("Connectivity contrast '%s' already exists at %s.", label, contrast_conn_path)
@@ -604,6 +647,7 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         logger = setup_logging("task_conn_first_level")
 
     config = copy.copy(config)
+    check_inputs(config, logger, write_timing_errors=True)
     clear_warnings()
 
     logger.info("Beta series will be created for the following task conditions: %s", config.cond_beta_labels)
@@ -645,7 +689,8 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
                 raise ConfigError("extract_raw_ptseries requires a valid template_path.")
             validated_tpl = validate_template(config.scan_path, config.template_path,
                 config.out_dir, config.force_diff_atlas, conn_type="extract", logger=logger)
-            raw_df = extract_roi_stats(config.scan_path, validated_tpl, config.average_type, logger=logger)
+            raw_df = extract_roi_stats(config.scan_path, validated_tpl, config.average_type, logger=logger,
+                                       roi_zero_handling=config.roi_zero_handling)
             raw_df.to_csv(raw_out)
             if raw_out.exists():
                 logger.info("Extracted raw (pre-regression) ptseries to %s.", raw_out)
@@ -661,15 +706,18 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     gen_min_outlier_epi(config.scan_path, config.out_dir, config.out_file_pre, "", logger)
 
     # PSC scaling (after min-outlier EPI, before regression)
+    unscaled_scan = config.scan_path
+    psc_per_run = []
     if config.scale_to_psc:
         psc_path = scale_to_psc(
-            config.scan_path, config.out_dir, config.out_file_pre, "", logger)
+            config.scan_path, config.out_dir, config.out_file_pre, "", logger,
+            run_lengths=config.run_lengths, qc_records=psc_per_run)
         config.scan_path = str(psc_path)
 
     # Generate censor file from motion regressors (before prepare_motion_file overwrites path)
     config.censor_path = str(create_censor_file(
         config.motion_path, config.fd_threshold, config.censor_prev_tr,
-        config.out_dir, config.out_file_pre, "concat", logger))
+        config.out_dir, config.out_file_pre, "concat", logger, run_lengths=config.run_lengths))
 
     # Validate and prepare motion regressors
     use_cols = 12 if config.include_motion_derivs else 6
@@ -692,7 +740,8 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
             raise ConfigError("--contrast_labels must exist if --contrast_functions exist.")
 
     # Per-condition trial survival QC
-    trial_survival = check_trial_survival(stim_data, config.cond_beta_labels, config.censor_path, config.tr, logger)
+    trial_ratios = trial_energy_ratios(stim_data, config.cond_beta_labels, config.censor_path, config, logger)
+    trial_survival = check_trial_survival(trial_ratios, logger)
 
     # Emit TRIALS_FEW warning for conditions with >=2 but <5 surviving trials
     for cond, n_surviving in trial_survival.items():
@@ -764,13 +813,14 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
             n_regressors += 1
         if config.WM_path is not None:
             n_regressors += 1
-    dof = compute_dof(config.censor_path, n_regressors, logger, tr=config.tr)
+    dof = compute_dof(config.censor_path, n_regressors, logger, tr=config.tr, run_lengths=config.run_lengths)
 
     # Build QC summary data
     qc_data = {
         "analysis_type": "task_conn",
         "hrf_model": config.hrf_model if config.hrf_model != "custom" else f"custom ({config.custom_hrf})",
         "fd_threshold": config.fd_threshold,
+        "censor_metric": CENSOR_METRIC,
         "censor_prev_tr": config.censor_prev_tr,
     }
     try:
@@ -783,6 +833,9 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     qc_data["per_condition_trial_counts"] = {c: int(len(stim_data[stim_data['trial_type'] == c])) for c in config.cond_beta_labels}
     qc_data["per_condition_surviving_trials"] = trial_survival
     qc_data["dof"] = dof
+    qc_data["trials"] = trial_records(stim_data, trial_ratios, config.tr, config.run_lengths)
+    if config.scale_to_psc:
+        qc_data["psc_per_run"] = psc_per_run
 
     # Emit CENSOR_HIGH warning if censoring exceeds threshold
     pct_censored = qc_data.get("pct_censored", 0.0)
@@ -797,7 +850,7 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     gen_design_matrix(stim_data, config, logger)
 
     # Generate full task beta-series and condition-specific beta series
-    bseries_out = gen_beta_series(stim_data, config, beta_cond_order, logger)
+    bseries_out = gen_beta_series(stim_data, config, beta_cond_order, trial_ratios, logger)
 
     # Extract pbseries if user provided option
     if config.extract_pbseries:
@@ -816,6 +869,20 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
             logger.warning("Contrasts specified but calc_conn is disabled — "
                            "connectivity contrasts require connectivity to be enabled. Skipping.")
 
+    # Smoothed siblings of the voxelwise outputs; parcel-level outputs stay unsmoothed
+    smoothed_candidates = []
+    if config.smoothing_enabled:
+        token = smoothing_token(config.smoothing_fwhm)
+        smoothed_scan, qc_data["smoothing_per_run"] = smooth_task_scan(unscaled_scan, config, logger)
+        smoothed_out = gen_beta_series(stim_data, config, beta_cond_order, trial_ratios, logger,
+                                       scan_path=smoothed_scan, token=token)
+        smoothed_candidates = [smoothed_scan, with_token(Path(config.out_dir) / f"{config.out_file_pre}_concat_LSS.nii.gz", token),
+                               *smoothed_out["PATH"]]
+        if config.calc_conn == "seed_to_voxel":
+            gen_smoothed_seed_maps(bseries_out, smoothed_out, config, token, logger)
+            if config.contrast_functions is not None and config.contrast_labels is not None:
+                gen_conn_contrasts(smoothed_out, config.contrast_functions, config.contrast_labels, config, logger, token)
+
     # Write QC summary
     write_qc_summary(config.out_dir, config.out_file_pre, qc_data, logger)
 
@@ -826,7 +893,9 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         out_dir / f"{config.out_file_pre}_qc_summary.json",
         out_dir / f"{config.out_file_pre}_concat_LSS.nii.gz",
         out_dir / f"{config.out_file_pre}_concat_bseries_dmat.x1D",
+        out_dir / f"{config.out_file_pre}_concat_LSS_index.json",
         *bseries_out.get("PATH", []),
+        *smoothed_candidates,
     ]
     output_files = [str(p) for p in candidates if p.exists()]
 

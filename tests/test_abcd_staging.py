@@ -60,10 +60,18 @@ def test_no_nss_columns_means_no_trim():
 def test_motion_is_translations_first_then_derivatives():
     df = confounds(20, 0)
     m = sfl.motion_matrix(df, 0)
+    base = df[sfl.MOTION_BASE].to_numpy()
     assert m.shape == (20, 12)
-    np.testing.assert_allclose(m[:, :6], df[sfl.MOTION_BASE].to_numpy())
-    np.testing.assert_allclose(m[1:, 6:], np.diff(df[sfl.MOTION_BASE].to_numpy(), axis=0))
+    np.testing.assert_allclose(m[:, :6], base)
+    np.testing.assert_allclose(m[1:, 6:], np.diff(base, axis=0))
     assert (m[0, 6:] == 0).all()
+
+
+def test_motion_rotations_pass_through_as_degrees():
+    """ABCD's confounds already hold degrees: rot_y of 1.0 stays 1.0."""
+    df = confounds(20, 0)
+    df["rot_y"] = 1.0
+    np.testing.assert_allclose(sfl.motion_matrix(df, 0)[:, sfl.MOTION_BASE.index("rot_y")], 1.0)
 
 
 def test_motion_derivatives_come_from_the_untrimmed_series():

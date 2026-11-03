@@ -201,7 +201,7 @@ def validate_template(scan_path, template_path, out_dir, force_diff_atlas, conn_
         return template_path
 
 
-def extract_roi_stats(nifti_path, template_path, average_type, logger=None):
+def extract_roi_stats(nifti_path, template_path, average_type, logger=None, roi_zero_handling="exclude"):
     """
     Extract ROI-level statistics from a NIfTI file using a template via 3dROIstats.
 
@@ -214,6 +214,9 @@ def extract_roi_stats(nifti_path, template_path, average_type, logger=None):
     average_type : str
         "mean" or "median".
     logger : logging.Logger, optional
+    roi_zero_handling : str
+        "exclude" leaves zero-valued voxels out of each ROI's average; "include"
+        averages every ROI voxel.
 
     Returns
     -------
@@ -222,7 +225,13 @@ def extract_roi_stats(nifti_path, template_path, average_type, logger=None):
     """
     _log = logger or logging.getLogger(__name__)
 
-    extract_cmd = ["3dROIstats", f"-nz{average_type}", "-1Dformat",
+    if roi_zero_handling == "exclude":
+        stat_flags, column_stat = [f"-nz{average_type}"], "NZMed" if average_type == "median" else "NZMean"
+    elif average_type == "median":
+        stat_flags, column_stat = ["-nomeanout", "-median"], "Med"
+    else:
+        stat_flags, column_stat = [], "Mean"  # 3dROIstats' default output
+    extract_cmd = ["3dROIstats", *stat_flags, "-1Dformat",
                    "-mask", template_path, nifti_path]
     extract_out = run_afni_command(
         extract_cmd,
@@ -256,11 +265,10 @@ def extract_roi_stats(nifti_path, template_path, average_type, logger=None):
         raise GuardError(f"Could not parse 3dROIstats output for {nifti_path}: {e}") from e
 
     # Filter columns based on average type
-    ave_type_flag = "NZMed" if average_type == "median" else "NZMean"
-    cols_to_keep = [colname for colname in out_df.columns if ave_type_flag in colname]
+    cols_to_keep = [colname for colname in out_df.columns if colname.startswith(f"{column_stat}_")]
 
     if len(cols_to_keep) == 0:
-        raise GuardError(f"No columns matching '{ave_type_flag}' found in 3dROIstats output. Available columns: {list(out_df.columns)}")
+        raise GuardError(f"No columns matching '{column_stat}' found in 3dROIstats output. Available columns: {list(out_df.columns)}")
 
     new_df = out_df[cols_to_keep].rename(
         columns={oldname: "ROI_" + str(oldname).split("_")[1] for oldname in cols_to_keep},

@@ -84,6 +84,7 @@ def test_staging_commands_trim_mask_concatenate_and_average(tmp_path, monkeypatc
     paths = sess.nback_paths(nback, TR)
     assert nib.load(paths["scan_path"]).shape[3] == 2 * (N_FRAMES - N_NSS)
     assert np.loadtxt(paths["motion_path"]).shape == (2 * (N_FRAMES - N_NSS), 12)
+    assert paths["run_lengths"] == [N_FRAMES - N_NSS, N_FRAMES - N_NSS]
 
     rest, raws = sess.stage_task("rest", by_task["rest"], TR)
     rest_paths, reason = sess.rest_paths(rest, raws)

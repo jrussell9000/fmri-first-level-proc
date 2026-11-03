@@ -1,13 +1,17 @@
 """Config resolution, runtime version probing, and CLI dry-run tests."""
 
 import sys
+from pathlib import Path
 
+import numpy as np
 import pytest
 import yaml
 
 from fmri_first_level_proc import cli, runtime
 from fmri_first_level_proc.config import load_and_validate
 from fmri_first_level_proc.exceptions import ConfigError, InputError, ToolVersionError
+
+from fake_afni import FakeAfni
 
 pytestmark = pytest.mark.level1_internal_integration
 
@@ -125,12 +129,112 @@ def test_lockfile_ships_as_package_data():
     assert cli._LOCKFILE.is_file()
 
 
-def test_cli_dry_run(tmp_path, task_inputs, monkeypatch):
-    path = _write_config(tmp_path, [_task_act_block(tmp_path, task_inputs)])
+@pytest.fixture
+def dry_run_inputs(tmp_path, task_inputs):
+    """Readable motion and events for 100 volumes; the scan is only read through 3dinfo."""
+    np.savetxt(task_inputs["motion.txt"], np.zeros((100, 6)))
+    Path(task_inputs["events.tsv"]).write_text("onset\tduration\ttrial_type\n10\t2\tA\n20\t2\tB\n")
+    return task_inputs
+
+
+def _dry_run(path, monkeypatch, **fake):
+    FakeAfni(n_trs=100, tr=0.8, **fake).install(monkeypatch)
     monkeypatch.setattr(cli, "preflight_tool_environments", lambda **k: None)
     monkeypatch.setattr(cli, "probe_tool_versions", lambda *a, **k: None)
     monkeypatch.setattr(sys, "argv", ["fmri-first-level-proc", "--config", path, "--dry-run"])
     cli.main()
+
+
+def test_cli_dry_run(tmp_path, dry_run_inputs, monkeypatch):
+    path = _write_config(tmp_path, [_task_act_block(tmp_path, dry_run_inputs)])
+    _dry_run(path, monkeypatch)
+    assert list((tmp_path / "out").iterdir()) == []  # nothing written
+
+
+@pytest.mark.parametrize(
+    "file_name, content, message",
+    [("motion.txt", "\n".join(["0 0 0 0 0 0"] * 99), "99 rows"),
+     ("motion.txt", "\n".join(["0 0 0 0 0"] * 100), "5 columns"),
+     ("motion.txt", "\n".join(["nan 0 0 0 0 0"] * 100), "non-finite"),
+     ("events.tsv", "onset\tduration\ttrial_type\n10\t2\tA\n80\t2\tB\n", "outside the 80 s scan"),
+     ("events.tsv", "onset\tduration\ttrial_type\n-1\t2\tA\n20\t2\tB\n", "outside the 80 s scan"),
+     ("events.tsv", "onset\tduration\ttrial_type\n10\t2\tA\n", "not found")],
+)
+def test_cli_dry_run_checks_input_files(tmp_path, dry_run_inputs, monkeypatch, caplog, file_name, content, message):
+    Path(dry_run_inputs[file_name]).write_text(content + "\n")
+    path = _write_config(tmp_path, [_task_act_block(tmp_path, dry_run_inputs)])
+    with pytest.raises(SystemExit) as exc:
+        _dry_run(path, monkeypatch)
+    assert exc.value.code == 2
+    assert message in caplog.text
+    assert list((tmp_path / "out").iterdir()) == []  # the timing record is not written in a dry run
+
+
+def test_cli_dry_run_checks_header_tr(tmp_path, dry_run_inputs, monkeypatch, caplog):
+    path = _write_config(tmp_path, [_task_act_block(tmp_path, dry_run_inputs)], tr=2.0)
+    with pytest.raises(SystemExit) as exc:
+        _dry_run(path, monkeypatch)
+    assert exc.value.code == 2
+    assert "header TR" in caplog.text
+
+
+def test_contrast_errors_are_config_errors(tmp_path, task_inputs, logger):
+    block = _task_act_block(tmp_path, task_inputs, contrasts={"functions": ["1*A-1*C"], "labels": ["AvC"]})
+    with pytest.raises(ConfigError, match="not in --cond_labels"):
+        load_and_validate(_write_config(tmp_path, [block]), logger)
+    conn = _task_act_block(tmp_path, task_inputs, type="task_conn", cond_beta_labels=["A", "B"],
+                           connectivity={"calc_conn": None, "contrasts": {"functions": ["A-B"], "labels": ["AvB"]}})
+    with pytest.raises(ConfigError, match="missing coefficients"):
+        load_and_validate(_write_config(tmp_path, [conn]), logger)
+
+
+@pytest.mark.parametrize(
+    "second, collides",
+    [({"out_dir": "same"}, False),
+     ({"out_dir": "./same/", "out_file_pre": "sub01"}, True),
+     ({"out_dir": "same", "extraction": {"extract_out_file_pre": "sub01"}}, True),
+     ({"out_dir": "other", "out_file_pre": "sub01"}, False)],
+)
+def test_cross_block_output_collisions(tmp_path, task_inputs, logger, monkeypatch, second, collides):
+    monkeypatch.chdir(tmp_path)
+    first = _task_act_block(tmp_path, task_inputs, out_dir="same", name="first")
+    other = _task_act_block(tmp_path, task_inputs, **{"name": "second", "out_file_pre": "sub02", **second})
+    path = _write_config(tmp_path, [first, other])
+    if collides:
+        with pytest.raises(ConfigError, match="also used by"):
+            load_and_validate(path, logger)
+    else:
+        assert len(load_and_validate(path, logger)) == 2
+
+
+def test_block_reuses_one_prefix_for_its_own_outputs(tmp_path, task_inputs, logger):
+    block = _task_act_block(tmp_path, task_inputs, extraction={"extract_out_file_pre": "sub01"})
+    load_and_validate(_write_config(tmp_path, [block]), logger)
+
+
+@pytest.mark.parametrize(
+    "smoothing",
+    ["6", {"enabled": "yes", "fwhm": 6}, {"enabled": True}, {"enabled": True, "fwhm": True},
+     {"enabled": True, "fwhm": 0}, {"enabled": True, "fwhm": float("nan")}, {"enabled": True, "fwhm": 4.125}],
+)
+def test_invalid_smoothing_rejected(tmp_path, task_inputs, logger, smoothing):
+    block = _task_act_block(tmp_path, task_inputs, smoothing=smoothing)
+    with pytest.raises(ConfigError, match="smoothing"):
+        load_and_validate(_write_config(tmp_path, [block]), logger)
+
+
+def test_smoothing_and_roi_zero_handling_resolve(tmp_path, task_inputs, logger):
+    (default,) = load_and_validate(_write_config(tmp_path, [_task_act_block(tmp_path, task_inputs)]), logger)
+    assert (default.roi_zero_handling, default.smoothing_enabled, default.smoothing_fwhm) == ("exclude", False, None)
+
+    block = _task_act_block(tmp_path, task_inputs, roi_zero_handling="include",
+                            smoothing={"enabled": True, "fwhm": 4.5})
+    (cfg,) = load_and_validate(_write_config(tmp_path, [block]), logger)
+    assert (cfg.roi_zero_handling, cfg.smoothing_enabled, cfg.smoothing_fwhm) == ("include", True, 4.5)
+
+    block = _task_act_block(tmp_path, task_inputs, roi_zero_handling="drop")
+    with pytest.raises(ConfigError, match="roi_zero_handling"):
+        load_and_validate(_write_config(tmp_path, [block]), logger)
 
 
 def test_cli_config_error_exit_code(tmp_path, monkeypatch):
