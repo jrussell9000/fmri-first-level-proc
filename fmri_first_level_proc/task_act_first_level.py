@@ -139,10 +139,10 @@ def _get_stataux(bucket_path, logger=None):
 # ---------------------------------------------------------------------------
 
 def gltsym_args(kept_contrasts, contrast_labels):
-    """Build -gltsym/-glt_label arguments from the kept contrast list."""
+    """Build -num_glt/-gltsym/-glt_label arguments from the kept contrast list."""
     if not kept_contrasts or not contrast_labels:
-        return []
-    args = []
+        return ["-num_glt", "0"]
+    args = ["-num_glt", str(len(kept_contrasts))]
     for k, (contrast, label) in enumerate(zip(kept_contrasts, contrast_labels), 1):
         gltstr = "".join(
             f"{c}*{cd} " for c, cd in zip(contrast["COEFS"], contrast["CONDS"])
