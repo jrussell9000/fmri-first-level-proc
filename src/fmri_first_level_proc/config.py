@@ -49,6 +49,7 @@ errors; raises InputError for missing user-specified files.
 import dataclasses
 import logging
 import math
+import re
 from pathlib import Path
 from typing import NoReturn
 
@@ -56,6 +57,7 @@ import yaml
 
 from .bids import discover_inputs
 from .exceptions import ConfigError, InputError
+from .fileutils import sanitize_filename_label
 from .design import VALID_HRF_MODELS, valid_contrast_functions, validate_custom_hrf, needs_married_timing
 from .runtime import available_cpus
 
@@ -74,8 +76,43 @@ BOOL_KEYS = (
     "use_sequenced_bandpass",
 )
 
-# Keys always sourced from global (block values ignored)
+# Keys that are valid only in the global section
 GLOBAL_ONLY_KEYS = ("num_cores", "template_path", "force_diff_atlas", "tr")
+
+# Closed schema: a key outside these sets is a ConfigError
+_GLOBAL_KEYS = {*GLOBAL_ONLY_KEYS, "derivatives_dirs"}
+_COMMON_BLOCK_KEYS = {
+    "name", "type", "paths", "out_dir", "out_file_pre", "remove_previous", "average_type",
+    "fd_threshold", "censor_prev_tr", "scale_to_psc", "derivatives_dirs", "roi_zero_handling",
+    "smoothing", "subject", "session", "task", "use_tissue_derivs", "extraction",
+}
+_TASK_BLOCK_KEYS = {"hrf_model", "custom_hrf", "include_motion_derivs"}
+_BLOCK_KEYS = {
+    "task_act": _COMMON_BLOCK_KEYS | _TASK_BLOCK_KEYS | {"cond_labels", "contrasts"},
+    "task_conn": _COMMON_BLOCK_KEYS | _TASK_BLOCK_KEYS | {"cond_beta_labels", "connectivity"},
+    "rest_conn": _COMMON_BLOCK_KEYS | {"bandpass", "notch_filter_band", "motion_deriv_degree",
+                                       "keep_run_res_dtseries", "use_sequenced_bandpass", "connectivity"},
+}
+_TASK_PATH_KEYS = {"scan_path", "task_timing_path", "motion_path", "run_lengths", "CSF_path", "WM_path"}
+_PATH_KEYS = {
+    "task_act": _TASK_PATH_KEYS,
+    "task_conn": _TASK_PATH_KEYS,
+    "rest_conn": {"scan_paths", "motion_paths", "CSF_paths", "WM_paths", "GS_paths"},
+}
+_EXTRACTION_KEYS = {
+    "task_act": {"stat_buckets", "extract_out_file_pre", "extract_resids", "extract_raw_ptseries"},
+    "task_conn": {"extract_pbseries", "extract_out_file_pre", "extract_raw_ptseries"},
+    "rest_conn": {"extract_ptseries", "extract_out_file_pre", "extract_raw_ptseries"},
+}
+_CONNECTIVITY_KEYS = {
+    "task_conn": {"calc_conn", "conn_out_file_pre", "pcorr", "fishZ", "contrasts"},
+    "rest_conn": {"calc_conn", "conn_out_file_pre", "pcorr", "fishZ"},
+}
+_CONTRAST_KEYS = {"functions", "labels"}
+_SMOOTHING_KEYS = {"enabled", "fwhm"}
+
+# Prefixes and condition labels appear verbatim in output file names
+_FILE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +205,96 @@ class ResolvedConfig:
 # ---------------------------------------------------------------------------
 # Private error helpers
 # ---------------------------------------------------------------------------
+
+def _unknown_keys(section, allowed, where):
+    """Describe a section's keys outside `allowed`, or its not being a mapping."""
+    if section is None:
+        return []
+    if not isinstance(section, dict):
+        return [f"{where} must be a mapping."]
+    return [f"{where}.{key}: unknown key (valid: {sorted(allowed)})" for key in section if key not in allowed]
+
+
+def _schema_violations(raw_config: dict) -> list[str]:
+    """Every key in the config that the schema doesn't define, across all levels."""
+    violations = _unknown_keys(raw_config, {"global", "analyses"}, "config")
+    violations += _unknown_keys(raw_config.get("global"), _GLOBAL_KEYS, "global")
+    analyses = raw_config.get("analyses")
+    for idx, block in enumerate(analyses if isinstance(analyses, list) else []):
+        if not isinstance(block, dict):
+            violations.append(f"analyses[{idx}] must be a mapping.")
+            continue
+        where = str(block.get("name", f"analyses[{idx}]"))
+        atype = block.get("type")
+        if atype not in VALID_TYPES:
+            continue  # reported by validate_config
+        for key in block:
+            if key in GLOBAL_ONLY_KEYS:
+                violations.append(f"{where}.{key}: valid only in the global section.")
+            elif key not in _BLOCK_KEYS[atype]:
+                violations.append(f"{where}.{key}: unknown key for {atype} (valid: {sorted(_BLOCK_KEYS[atype])})")
+        violations += _unknown_keys(block.get("paths"), _PATH_KEYS[atype], f"{where}.paths")
+        violations += _unknown_keys(block.get("extraction"), _EXTRACTION_KEYS[atype], f"{where}.extraction")
+        violations += _unknown_keys(block.get("smoothing"), _SMOOTHING_KEYS, f"{where}.smoothing")
+        if atype == "task_act":
+            violations += _unknown_keys(block.get("contrasts"), _CONTRAST_KEYS, f"{where}.contrasts")
+        else:
+            connectivity = block.get("connectivity")
+            violations += _unknown_keys(connectivity, _CONNECTIVITY_KEYS[atype], f"{where}.connectivity")
+            if atype == "task_conn" and isinstance(connectivity, dict):
+                violations += _unknown_keys(connectivity.get("contrasts"), _CONTRAST_KEYS,
+                                            f"{where}.connectivity.contrasts")
+    return violations
+
+
+def _check_bool(value, where, logger) -> None:
+    """A boolean key accepts true, false or null (the default), and nothing else."""
+    if value is not None and not isinstance(value, bool):
+        _cfg_err(logger, "%s must be true, false or null, got %r.", where, value)
+
+
+def _check_number(value, where, logger) -> float:
+    """Return value as a float, refusing booleans, non-numbers, NaN and infinity."""
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        _cfg_err(logger, "%s must be a finite number, got %r.", where, value)
+    return float(value)
+
+
+def _check_file_token(value, where, logger) -> None:
+    """Prefixes and labels end up in file names, so they must be safe there."""
+    if not isinstance(value, str) or not _FILE_TOKEN.match(value):
+        _cfg_err(logger, "%s must be a file-name-safe string (letters, digits, '.', '_', '-'; "
+                         "starting with a letter or digit), got %r.", where, value)
+
+
+def _check_labels(labels, where, logger) -> None:
+    """Condition labels: a non-empty list of unique file-name-safe strings."""
+    if not isinstance(labels, list) or not labels:
+        _cfg_err(logger, "%s must be a non-empty list of strings.", where)
+    for label in labels:
+        _check_file_token(label, f"{where} entry", logger)
+    if len(set(labels)) != len(labels):
+        _cfg_err(logger, "%s must not repeat a label, got %s.", where, labels)
+
+
+def _check_contrast_labels(labels, where, logger) -> None:
+    """Contrast labels name output files, so they must stay distinct after sanitizing."""
+    sanitized = [sanitize_filename_label(str(label)) for label in labels]
+    if len(set(sanitized)) != len(sanitized):
+        _cfg_err(logger, "%s must stay unique in file names, got %s (as %s).", where, labels, sanitized)
+
+
+def _check_derivatives_dirs(value, where, logger) -> None:
+    if value is None:
+        return
+    if not isinstance(value, list) or not value or not all(isinstance(d, str) and d for d in value):
+        _cfg_err(logger, "%s must be a non-empty list of directory paths, got %r.", where, value)
+
+
+def _check_path_value(value, where, logger) -> None:
+    if not isinstance(value, str) or not value:
+        _cfg_err(logger, "%s must be a non-empty path string, got %r.", where, value)
+
 
 def _validate_smoothing(smoothing, label, logger) -> None:
     """Check a block's smoothing section: {enabled: bool, fwhm: float}."""
@@ -265,7 +392,12 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
         "rest_conn": {"scan_paths", "motion_paths", "CSF_paths", "WM_paths"},
     }
 
-    # -- Top-level structure --
+    # -- Top-level structure and closed schema --
+    if not isinstance(raw_config, dict):
+        _cfg_err(logger, "The config must be a mapping with 'global' and 'analyses' keys.")
+    violations = _schema_violations(raw_config)
+    if violations:
+        _cfg_err(logger, "%s", "Config has invalid keys:\n  " + "\n  ".join(violations))
     if "analyses" not in raw_config:
         _cfg_err(logger, "Config missing required top-level key 'analyses'.")
     if not isinstance(raw_config["analyses"], list) or len(raw_config["analyses"]) == 0:
@@ -279,13 +411,10 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
     tr_val = global_cfg.get("tr")
     if tr_val is None:
         _cfg_err(logger, "global.tr is required. Set it to the repetition time (seconds) for all scans.")
-    tr_float: float
-    try:
-        tr_float = float(tr_val)
-    except (TypeError, ValueError):
-        _cfg_err(logger, "global.tr must be a positive number.")
-    if tr_float <= 0:
+    if _check_number(tr_val, "global.tr", logger) <= 0:
         _cfg_err(logger, "global.tr must be a positive number, got %s.", tr_val)
+    _check_bool(global_cfg.get("force_diff_atlas"), "global.force_diff_atlas", logger)
+    _check_derivatives_dirs(global_cfg.get("derivatives_dirs"), "global.derivatives_dirs", logger)
 
     # -- Validate global.num_cores (positive int or 'auto'; default 1) --
     nc_val = global_cfg.get("num_cores")
@@ -317,24 +446,39 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
         check_required_top = required_top[atype]
         if discovery_active:
             check_required_top = check_required_top - {"paths"}
-        for key in check_required_top:
-            if key not in block:
+        for key in sorted(check_required_top):
+            # null means missing, except for a boolean, where it means the default
+            if key not in block or (block[key] is None and key not in BOOL_KEYS):
                 _cfg_err(logger, "[%s] Missing required key '%s' for type '%s'.", label, key, atype)
 
+        # -- Value types --
+        for key in (*BOOL_KEYS, "scale_to_psc", "keep_run_res_dtseries"):
+            _check_bool(block.get(key), f"[{label}] {key}", logger)
+        _check_derivatives_dirs(block.get("derivatives_dirs"), f"[{label}] derivatives_dirs", logger)
+        for key in ("subject", "session", "task"):
+            if block.get(key) is not None and not isinstance(block[key], str):
+                _cfg_err(logger, "[%s] %s must be a string (quote numeric labels), got %r.", label, key, block[key])
+        _check_file_token(block["out_file_pre"], f"[{label}] out_file_pre", logger)
+        if atype == "task_act":
+            _check_labels(block["cond_labels"], f"[{label}] cond_labels", logger)
+        elif atype == "task_conn":
+            _check_labels(block["cond_beta_labels"], f"[{label}] cond_beta_labels", logger)
+
         # Required path sub-keys
-        paths = block.get("paths", {})
+        paths = block.get("paths") or {}
         if not isinstance(paths, dict):
             _cfg_err(logger, "[%s] 'paths' must be a dict.", label)
         if not discovery_active:
             for pkey in required_paths[atype]:
-                if pkey not in paths:
+                if paths.get(pkey) is None:
                     _cfg_err(logger, "[%s] Missing required path key '%s' for type '%s'.", label, pkey, atype)
 
         # Validate file paths exist (only for paths that ARE explicitly provided)
         if atype in ("task_act", "task_conn"):
             for pkey in required_paths[atype]:
-                if pkey in paths:
+                if paths.get(pkey) is not None:
                     fpath = paths[pkey]
+                    _check_path_value(fpath, f"[{label}] paths.{pkey}", logger)
                     if not Path(fpath).is_file():
                         _inp_err(logger, "[%s] File does not exist: paths.%s = '%s'.", label, pkey, fpath)
             # Optional run lengths of a concatenated scan (skip if null)
@@ -347,6 +491,7 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
             # Optional tissue regressor paths (skip if null)
             for opt_pkey in ("CSF_path", "WM_path"):
                 if opt_pkey in paths and paths[opt_pkey] is not None:
+                    _check_path_value(paths[opt_pkey], f"[{label}] paths.{opt_pkey}", logger)
                     if not Path(paths[opt_pkey]).is_file():
                         _inp_err(logger, "[%s] File does not exist: paths.%s = '%s'.",
                                  label, opt_pkey, paths[opt_pkey])
@@ -361,12 +506,13 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                             "-- no tissue derivatives will be computed.", label)
         elif atype == "rest_conn":
             for pkey in required_paths[atype]:
-                if pkey not in paths:
+                if paths.get(pkey) is None:
                     continue  # absent; will be discovered or caught in resolve_config
                 plist = paths[pkey]
                 if not isinstance(plist, list) or len(plist) == 0:
                     _cfg_err(logger, "[%s] paths.%s must be a non-empty list for rest_conn.", label, pkey)
                 for fpath in plist:
+                    _check_path_value(fpath, f"[{label}] paths.{pkey} entry", logger)
                     if not Path(fpath).is_file():
                         _inp_err(logger, "[%s] File does not exist: paths.%s entry '%s'.", label, pkey, fpath)
 
@@ -376,11 +522,12 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                 if not isinstance(gs_list, list) or len(gs_list) == 0:
                     _cfg_err(logger, "[%s] paths.GS_paths must be a non-empty list for rest_conn.", label)
                 for fpath in gs_list:
+                    _check_path_value(fpath, f"[{label}] paths.GS_paths entry", logger)
                     if not Path(fpath).is_file():
                         _inp_err(logger, "[%s] File does not exist: paths.GS_paths entry '%s'.", label, fpath)
 
             # All explicitly-provided rest_conn path lists must be the same length.
-            provided_required = {pkey for pkey in required_paths[atype] if pkey in paths}
+            provided_required = {pkey for pkey in required_paths[atype] if paths.get(pkey) is not None}
             if provided_required:
                 lengths = {pkey: len(paths[pkey]) for pkey in provided_required}
                 if "GS_paths" in paths and paths["GS_paths"] is not None:
@@ -400,23 +547,13 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
             if hrf is not None and hrf not in VALID_HRF_MODELS:
                 _cfg_err(logger, "[%s] hrf_model must be one of %s, got '%s'.", label, VALID_HRF_MODELS, hrf)
 
-        # Warn if block contains global-only keys (they will be ignored)
-        for key in GLOBAL_ONLY_KEYS:
-            if key in block and logger is not None:
-                logger.warning("[%s] '%s' is a global-only setting -- block value will be ignored.", label, key)
-
         # -- rest_conn-specific parameter validation --
         if atype == "rest_conn":
             # motion_deriv_degree
             mdd = block.get("motion_deriv_degree")
             if mdd is not None:
-                mdd_int: int
-                try:
-                    mdd_int = int(mdd)
-                except (TypeError, ValueError):
-                    _cfg_err(logger, "[%s] motion_deriv_degree must be a positive integer.", label)
-                if mdd_int < 1:
-                    _cfg_err(logger, "[%s] motion_deriv_degree must be a positive integer, got %s.", label, mdd)
+                if isinstance(mdd, bool) or not isinstance(mdd, int) or mdd < 1:
+                    _cfg_err(logger, "[%s] motion_deriv_degree must be a positive integer, got %r.", label, mdd)
 
             # Bandpass -- required for rest_conn, must be [low, high] list
             bp = block.get("bandpass")
@@ -426,12 +563,8 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                 _cfg_err(logger, "[%s] bandpass must be a [low, high] list for rest_conn, not true/false.", label)
             if not (isinstance(bp, list) and len(bp) == 2):
                 _cfg_err(logger, "[%s] bandpass must be a list of 2 floats [low, high].", label)
-            bp_low: float
-            bp_high: float
-            try:
-                bp_low, bp_high = float(bp[0]), float(bp[1])
-            except (TypeError, ValueError):
-                _cfg_err(logger, "[%s] bandpass values must be numeric.", label)
+            bp_low = _check_number(bp[0], f"[{label}] bandpass lower bound", logger)
+            bp_high = _check_number(bp[1], f"[{label}] bandpass upper bound", logger)
             if bp_low < 0 or bp_high <= bp_low:
                 _cfg_err(logger, "[%s] bandpass must satisfy 0 <= low < high. Got [%s, %s].",
                          label, bp[0], bp[1])
@@ -442,27 +575,17 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                 if not (isinstance(nfb, list) and len(nfb) == 2):
                     _cfg_err(logger,
                              "[%s] notch_filter_band must be a list of 2 floats [low, high] or null.", label)
-                nfb_low: float
-                nfb_high: float
-                try:
-                    nfb_low, nfb_high = float(nfb[0]), float(nfb[1])
-                except (TypeError, ValueError):
-                    _cfg_err(logger, "[%s] notch_filter_band values must be numeric.", label)
+                nfb_low = _check_number(nfb[0], f"[{label}] notch_filter_band lower bound", logger)
+                nfb_high = _check_number(nfb[1], f"[{label}] notch_filter_band upper bound", logger)
                 if nfb_low <= 0 or nfb_high <= 0 or nfb_low >= nfb_high:
                     _cfg_err(logger,
                              "[%s] notch_filter_band must satisfy 0 < low < high. Got [%s, %s].",
                              label, nfb[0], nfb[1])
 
         # -- fd_threshold (all types) --
-        fd = block.get("fd_threshold")
-        if fd is not None:
-            fd_float: float
-            try:
-                fd_float = float(fd)
-            except (TypeError, ValueError):
-                _cfg_err(logger, "[%s] fd_threshold must be a positive number.", label)
-            if fd_float <= 0:
-                _cfg_err(logger, "[%s] fd_threshold must be a positive number, got %s.", label, fd)
+        fd = block["fd_threshold"]
+        if _check_number(fd, f"[{label}] fd_threshold", logger) <= 0:
+            _cfg_err(logger, "[%s] fd_threshold must be a positive number, got %s.", label, fd)
 
         # -- Validate out_dir can be created --
         out_dir = block["out_dir"]
@@ -479,7 +602,7 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
         _validate_smoothing(block.get("smoothing"), label, logger)
 
         # -- Contrasts validation --
-        if atype == "task_act" and "contrasts" in block:
+        if atype == "task_act" and block.get("contrasts") is not None:
             contrasts = block["contrasts"]
             funcs = contrasts.get("functions")
             clabels = contrasts.get("labels")
@@ -487,6 +610,7 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                 if len(funcs) != len(clabels):
                     _cfg_err(logger,
                              "[%s] contrasts.functions and contrasts.labels must be the same length.", label)
+                _check_contrast_labels(clabels, f"[{label}] contrasts.labels", logger)
                 valid_contrast_functions(funcs, clabels, block["cond_labels"], logger=logger)
             elif funcs is not None and clabels is None:
                 _cfg_err(logger,
@@ -495,6 +619,8 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
             tc_conn = block.get("connectivity", {}) or {}
             tc_contrasts = tc_conn.get("contrasts")
             if tc_contrasts is not None:
+                if tc_conn.get("calc_conn") is None and tc_contrasts.get("functions") is not None:
+                    _cfg_err(logger, "[%s] connectivity.contrasts need connectivity.calc_conn to be set.", label)
                 funcs = tc_contrasts.get("functions")
                 clabels = tc_contrasts.get("labels")
                 if funcs is not None and clabels is not None:
@@ -502,16 +628,12 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                         _cfg_err(logger,
                                  "[%s] connectivity.contrasts.functions and "
                                  "connectivity.contrasts.labels must be the same length.", label)
+                    _check_contrast_labels(clabels, f"[{label}] connectivity.contrasts.labels", logger)
                     valid_contrast_functions(funcs, clabels, block["cond_beta_labels"], logger=logger)
                 elif funcs is not None and clabels is None:
                     _cfg_err(logger,
                              "[%s] connectivity.contrasts.functions provided but "
                              "connectivity.contrasts.labels is missing.", label)
-        elif "contrasts" in block and atype not in ("task_act",):
-            if logger is not None:
-                logger.warning(
-                    "[%s] contrasts block at the analysis level is only supported for task_act; "
-                    "for task_conn, place contrasts under connectivity. Ignoring.", label)
 
         # -- HRF model validation (task_act and task_conn only) --
         if atype in ("task_act", "task_conn"):
@@ -543,8 +665,12 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                             label, hrf)
 
         # -- Extraction validation --
-        if "extraction" in block:
+        if block.get("extraction") is not None:
             ext = block["extraction"]
+            for key in ("extract_resids", "extract_raw_ptseries", "extract_pbseries", "extract_ptseries"):
+                _check_bool(ext.get(key), f"[{label}] extraction.{key}", logger)
+            if ext.get("extract_out_file_pre") is not None:
+                _check_file_token(ext["extract_out_file_pre"], f"[{label}] extraction.extract_out_file_pre", logger)
             if atype == "task_act":
                 stat_buckets = ext.get("stat_buckets")
                 if stat_buckets is not None:
@@ -556,29 +682,32 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
                             _cfg_err(logger,
                                      "[%s] extraction.stat_buckets contains invalid type '%s'. "
                                      "Must be one of %s.", label, sb, VALID_STAT_BUCKET_TYPES)
-                    if "extract_out_file_pre" not in ext:
+                    if ext.get("extract_out_file_pre") is None:
                         _cfg_err(logger,
                                  "[%s] extraction block missing 'extract_out_file_pre' for task_act "
                                  "when stat_buckets is set.", label)
-                if ext.get("extract_raw_ptseries", False) and "extract_out_file_pre" not in ext:
+                elif ext.get("extract_resids", False):
+                    _cfg_err(logger, "[%s] extraction.extract_resids needs extraction.stat_buckets "
+                                     "and extract_out_file_pre.", label)
+                if ext.get("extract_raw_ptseries", False) and ext.get("extract_out_file_pre") is None:
                     _cfg_err(logger,
                              "[%s] extraction block missing 'extract_out_file_pre' for task_act "
                              "when extract_raw_ptseries=true.", label)
             elif atype == "task_conn":
-                if ext.get("extract_pbseries", False) and "extract_out_file_pre" not in ext:
+                if ext.get("extract_pbseries", False) and ext.get("extract_out_file_pre") is None:
                     _cfg_err(logger,
                              "[%s] extraction block missing 'extract_out_file_pre' for task_conn "
                              "when extract_pbseries=true.", label)
-                if ext.get("extract_raw_ptseries", False) and "extract_out_file_pre" not in ext:
+                if ext.get("extract_raw_ptseries", False) and ext.get("extract_out_file_pre") is None:
                     _cfg_err(logger,
                              "[%s] extraction block missing 'extract_out_file_pre' for task_conn "
                              "when extract_raw_ptseries=true.", label)
             elif atype == "rest_conn":
-                if ext.get("extract_ptseries", False) and "extract_out_file_pre" not in ext:
+                if ext.get("extract_ptseries", False) and ext.get("extract_out_file_pre") is None:
                     _cfg_err(logger,
                              "[%s] extraction block missing 'extract_out_file_pre' for rest_conn "
                              "when extract_ptseries=true.", label)
-                if ext.get("extract_raw_ptseries", False) and "extract_out_file_pre" not in ext:
+                if ext.get("extract_raw_ptseries", False) and ext.get("extract_out_file_pre") is None:
                     _cfg_err(logger,
                              "[%s] extraction block missing 'extract_out_file_pre' for rest_conn "
                              "when extract_raw_ptseries=true.", label)
@@ -586,6 +715,12 @@ def validate_config(raw_config: dict, logger: logging.Logger | None = None) -> d
         # -- Connectivity validation --
         b_conn = block.get("connectivity", {}) or {}
         b_calc = b_conn.get("calc_conn")
+        for key in ("pcorr", "fishZ"):
+            _check_bool(b_conn.get(key), f"[{label}] connectivity.{key}", logger)
+        if b_conn.get("conn_out_file_pre") is not None:
+            _check_file_token(b_conn["conn_out_file_pre"], f"[{label}] connectivity.conn_out_file_pre", logger)
+        elif b_calc is not None:
+            _cfg_err(logger, "[%s] connectivity.conn_out_file_pre is required when calc_conn is set.", label)
         if b_calc is not None:
             if b_calc not in VALID_CONN_TYPES:
                 _cfg_err(logger, "[%s] connectivity.calc_conn must be one of %s, got '%s'.",
@@ -646,7 +781,7 @@ def resolve_config(
         Fully resolved configuration dataclass for the analysis block.
     """
     atype = validated_block["type"]
-    paths = validated_block.get("paths", {})
+    paths = validated_block.get("paths") or {}
     extraction = validated_block.get("extraction", None)
     connectivity = validated_block.get("connectivity", {}) or {}
     contrasts = validated_block.get("contrasts", None)  # task_act block-level contrasts
@@ -664,7 +799,7 @@ def resolve_config(
     tr = float(global_cfg["tr"])
 
     # BIDS discovery dirs: block-level overrides global if present
-    derivatives_dirs = validated_block.get("derivatives_dirs", global_cfg.get("derivatives_dirs", None))
+    derivatives_dirs = validated_block.get("derivatives_dirs") or global_cfg.get("derivatives_dirs")
 
     # -- Construct the base dataclass --
     cfg = ResolvedConfig(
@@ -681,7 +816,7 @@ def resolve_config(
         censor_prev_tr=bool(validated_block.get("censor_prev_tr", False)),
         template_path=template_path,
         force_diff_atlas=force_diff_atlas,
-        scale_to_psc=bool(validated_block.get("scale_to_psc", True)),
+        scale_to_psc=validated_block.get("scale_to_psc") is not False,
         derivatives_dirs=derivatives_dirs,
         roi_zero_handling=validated_block.get("roi_zero_handling", "exclude"),
     )
@@ -793,6 +928,7 @@ def resolve_config(
     # Tier 1 (explicit): already applied above via paths.get().
     # Tier 2 (discovered): fill gaps using BIDS discovery when derivatives_dirs is set.
     # Tier 3 (InputError): raise for any mandatory slot still None after both tiers.
+    block_label = validated_block.get("name", atype)
     if derivatives_dirs is not None:
         disc_subject = validated_block.get("subject")
         if disc_subject is None:
@@ -805,6 +941,9 @@ def resolve_config(
         else:
             disc_session = validated_block.get("session")
             disc_task = validated_block.get("task")
+            if disc_task is None:
+                # Without a task, discovery would combine every task's files in the directory
+                _cfg_err(logger, "[%s] BIDS discovery requires 'task'.", block_label)
 
             discovered = discover_inputs(
                 derivatives_dirs=derivatives_dirs,
@@ -841,31 +980,55 @@ def resolve_config(
             if cfg.template_path is None and discovered.template_path is not None:
                 cfg.template_path = discovered.template_path
 
-            # Tier 3: enforce mandatory slots; raise InputError if still unresolved.
-            block_label = validated_block.get("name", atype)
-            if atype in ("task_act", "task_conn"):
-                mandatory_checks = [
-                    ("scan_path", cfg.scan_path),
-                    ("motion_path", cfg.motion_path),
-                    ("task_timing_path", cfg.task_timing_path),
-                ]
-            else:  # rest_conn
-                mandatory_checks = [
-                    ("scan_paths", cfg.scan_paths),
-                    ("motion_paths", cfg.motion_paths),
-                    ("CSF_paths", cfg.CSF_paths),
-                    ("WM_paths", cfg.WM_paths),
-                ]
-            for slot_name, slot_val in mandatory_checks:
-                if slot_val is None:
-                    _inp_err(
-                        logger,
-                        "[%s] Mandatory slot '%s' not resolved from explicit config or BIDS "
-                        "discovery in: %s",
-                        block_label, slot_name, derivatives_dirs,
-                    )
+    # Tier 3: enforce mandatory slots, including when discovery was skipped for a missing subject.
+    if atype in ("task_act", "task_conn"):
+        mandatory_checks = [
+            ("scan_path", cfg.scan_path),
+            ("motion_path", cfg.motion_path),
+            ("task_timing_path", cfg.task_timing_path),
+        ]
+    else:  # rest_conn
+        mandatory_checks = [
+            ("scan_paths", cfg.scan_paths),
+            ("motion_paths", cfg.motion_paths),
+            ("CSF_paths", cfg.CSF_paths),
+            ("WM_paths", cfg.WM_paths),
+        ]
+    for slot_name, slot_val in mandatory_checks:
+        if slot_val is None:
+            _inp_err(
+                logger,
+                "[%s] Mandatory slot '%s' not resolved from explicit config or BIDS "
+                "discovery in: %s",
+                block_label, slot_name, derivatives_dirs,
+            )
+    if atype == "rest_conn":
+        _check_rest_run_alignment(cfg, block_label, logger)
 
     return cfg
+
+
+def _check_rest_run_alignment(cfg: ResolvedConfig, label, logger) -> None:
+    """Refuse rest path lists that don't describe the same runs in the same order.
+
+    Lists are paired by position. Explicit lists are the same length by validation, but
+    discovered ones can differ, and any list whose names carry BIDS run entities can
+    disagree about which run is which.
+    """
+    slots = {"scan_paths": cfg.scan_paths, "motion_paths": cfg.motion_paths, "CSF_paths": cfg.CSF_paths,
+             "WM_paths": cfg.WM_paths}
+    if cfg.GS_paths is not None:
+        slots["GS_paths"] = cfg.GS_paths
+    lengths = {slot: len(paths) for slot, paths in slots.items()}
+    if len(set(lengths.values())) > 1:
+        _inp_err(logger, "[%s] Run lists differ in length: %s", label, lengths)
+    run_labels = {}
+    for slot, paths in slots.items():
+        found = [re.search(r"(?:^|_)run-([A-Za-z0-9]+)(?:_|$)", Path(p).name) for p in paths]
+        if all(found):
+            run_labels[slot] = [m.group(1) for m in found]
+    if len({tuple(found) for found in run_labels.values()}) > 1:
+        _inp_err(logger, "[%s] Run lists name different runs: %s", label, run_labels)
 
 
 # ---------------------------------------------------------------------------

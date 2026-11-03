@@ -40,6 +40,24 @@ you pass `--force`.
 - **Output prefixes can't repeat across blocks** that share an `out_dir`, now including the
   extraction and connectivity prefixes, with directories compared after normalization.
 - **Contrast errors** are reported at config validation, so `--dry-run` catches them.
+- **Closed config schema.** Unknown keys at any level are a `ConfigError`, all reported together,
+  and so are global-only keys in an analysis block. Before, these were ignored, so a typo such as
+  `run_length` silently modelled two runs as one.
+- **Strict config values.** Required keys set to `null` count as missing. Booleans accept only
+  `true`, `false` or `null`, so a quoted `"false"` no longer means true. NaN and infinite numbers,
+  non-integer `motion_deriv_degree`, non-list `derivatives_dirs`, unsafe output prefixes and
+  condition labels, repeated condition labels, and contrast labels that collide in file names are
+  errors. `extract_resids` without a prefix used to write `None_resids.csv`.
+- **`connectivity.contrasts` with `calc_conn: null`** is a `ConfigError`; it was ignored with a warning.
+- **BIDS discovery** matches entities exactly, so `task-rest` no longer also takes `task-restpre`. It
+  requires `task`, and refuses rest run lists that differ in length or name different runs. A
+  block whose required inputs remain unresolved raises `InputError` instead of crashing later.
+- **Events:** negative or non-finite durations and duplicate trials (same condition and onset) raise
+  `InputError`. `trial_type` values are compared as strings.
+- **Tissue files** must be single-column, as documented. Each extra column used to become a
+  regressor that the DOF check didn't count.
+- **`task_conn` DOF** comes from the design matrix 3dLSS uses, so QC `dof` now accounts for the
+  whole nuisance model and the check runs after the matrix is built.
 - `3dBlurToFWHM`, `3dFWHMx`, `3dMean`, `3dBrickStat` and `3dTcorr1D` are required binaries.
 
 ### Added

@@ -33,6 +33,15 @@ Complete reference for all inputs accepted by `fmri-first-level-proc`. This docu
 
 ## YAML Config Structure
 
+The schema is closed. A key this document doesn't define is a `ConfigError` at any level, and all such keys are reported together. Other rules:
+
+- A required key set to `null` counts as missing, except a boolean, where `null` means the default. Booleans accept only `true`, `false` or `null`.
+- `tr`, `fd_threshold`, `bandpass`, `notch_filter_band` and `smoothing.fwhm` must be finite numbers. `motion_deriv_degree` must be an integer >= 1.
+- `out_file_pre`, `extract_out_file_pre`, `conn_out_file_pre` and condition labels must be file-name-safe (`^[A-Za-z0-9][A-Za-z0-9._-]*$`). Condition labels must be unique strings, so quote numeric codes.
+- Contrast labels must stay unique after file-name sanitization. `connectivity.contrasts` need `calc_conn`.
+- `extract_resids` needs `stat_buckets` and `extract_out_file_pre`. `calc_conn` needs `conn_out_file_pre`.
+- Keys valid only in `global` (`tr`, `num_cores`, `template_path`, `force_diff_atlas`) are errors in an analysis block.
+
 The config file has two top-level keys:
 
 ```yaml
@@ -401,6 +410,7 @@ Optional BIDS columns (e.g. `amplitude`) are preserved but only `onset`, `durati
 
 **Common rules:**
 - **Row ordering:** Rows are sorted by `onset` internally; input order does not matter.
+- **Durations and duplicates:** A negative or non-finite duration, or two rows with the same condition and onset, raises `InputError`. `trial_type` values are compared as strings.
 - **Onset validation:** Every row is checked, including conditions that aren't modelled. A negative or non-finite onset, or one at or after the end of the scan, raises `InputError`. A run also writes `{out_file_pre}_timing_errors.json`: `{analysis_type, tr, n_trs, run_end_s, violations: [{condition, onset_s, violation}]}`, where `violation` is `negative`, `at_or_after_run_end` or `non_finite`.
 - **Condition coverage:** Every label in `cond_labels`/`cond_beta_labels` must appear at least once. A warning is logged for conditions with fewer than 3 trials.
 - **Extra conditions:** The timing file may contain conditions not listed in `cond_labels`/`cond_beta_labels`; they are ignored.
@@ -628,6 +638,8 @@ After censoring, each trial's estimability is the share of its squared regressor
 Before running the main AFNI regression, the pipeline computes estimated degrees of freedom:
 
 `DOF = (uncensored TRs) - (number of regressors)`
+
+For `task_conn`, DOF comes from the design matrix 3dLSS uses: its uncensored rows, minus its non-beta columns, minus 2 for each fit's trial regressor and the sum of the other trials.
 
 Regressors include polynomial baselines: `-polort A` for task analyses (degree `1 + floor(longest run duration / 150 s)`, with degree + 1 regressors per run), and the simultaneous `rest_conn` backend's `-polort` per run.
 

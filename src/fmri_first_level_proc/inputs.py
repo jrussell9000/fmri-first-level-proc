@@ -22,8 +22,8 @@ def _scan_length(scan_path, tr, logger):
     return int(n_vols)
 
 
-def _check_table(path, what, n_rows, min_columns):
-    """Check that a regressor file has one finite row per volume and enough columns."""
+def _check_table(path, what, n_rows, min_columns, max_columns=None):
+    """Check that a regressor file has one finite row per volume and the right columns."""
     try:
         data = np.loadtxt(path, ndmin=2)
     except Exception as e:
@@ -32,6 +32,8 @@ def _check_table(path, what, n_rows, min_columns):
         raise InputError(f"{what} file '{path}' has {len(data)} rows, but its scan has {n_rows} volumes.")
     if data.shape[1] < min_columns:
         raise InputError(f"{what} file '{path}' has {data.shape[1]} columns, expected >= {min_columns}.")
+    if max_columns is not None and data.shape[1] > max_columns:
+        raise InputError(f"{what} file '{path}' has {data.shape[1]} columns, expected {max_columns}.")
     if not np.isfinite(data[:, :min_columns]).all():
         raise InputError(f"{what} file '{path}' has non-finite values.")
 
@@ -86,7 +88,7 @@ def check_inputs(config, logger, write_timing_errors=False):
             _check_table(config.motion_paths[i], "Motion", n_vols, min_columns)
             for paths, what in tissue:
                 if paths is not None:
-                    _check_table(paths[i], what, n_vols, 1)
+                    _check_table(paths[i], what, n_vols, 1, max_columns=1)
         _check_template(config, config.scan_paths[0], logger)
         return
 
@@ -97,7 +99,7 @@ def check_inputs(config, logger, write_timing_errors=False):
     _check_table(config.motion_path, "Motion", n_vols, 12 if config.include_motion_derivs else 6)
     for path, what in ((config.CSF_path, "CSF"), (config.WM_path, "WM")):
         if path is not None:
-            _check_table(path, what, n_vols, 1)
+            _check_table(path, what, n_vols, 1, max_columns=1)
 
     conditions = config.cond_labels if config.analysis_type == "task_act" else config.cond_beta_labels
     stim_data = read_and_validate_stim_data(config.task_timing_path, conditions, logger=logger)

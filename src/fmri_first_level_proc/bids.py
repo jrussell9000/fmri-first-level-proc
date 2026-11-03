@@ -67,10 +67,10 @@ def _glob_bids_files(
     suffix: str,
     ext: str,
 ) -> list[str]:
-    """Glob for BIDS-named files in func_dir matching the given entities.
+    """Find BIDS-named files in func_dir whose entities match exactly.
 
-    The glob pattern follows BIDS entity ordering:
-    sub-{sub}[*_task-{task}*][_desc-{desc}]_{suffix}{ext}
+    `task-rest` matches no `task-restpre` file, and `sub-01` no `sub-010` file. With
+    task None, every task's files match.
 
     Returns a sorted list of matching absolute paths, or an empty list when
     func_dir does not exist or no matches are found.
@@ -78,19 +78,15 @@ def _glob_bids_files(
     if not func_dir.is_dir():
         return []
 
+    wanted = {f"sub-{subject}"}
     if task is not None:
-        if desc is not None:
-            pattern = f"sub-{subject}*_task-{task}*_desc-{desc}_{suffix}{ext}"
-        else:
-            pattern = f"sub-{subject}*_task-{task}*_{suffix}{ext}"
-    else:
-        if desc is not None:
-            pattern = f"sub-{subject}*_desc-{desc}_{suffix}{ext}"
-        else:
-            pattern = f"sub-{subject}*_{suffix}{ext}"
+        wanted.add(f"task-{task}")
+    if desc is not None:
+        wanted.add(f"desc-{desc}")
 
     # Paths stay str: discovered values populate ResolvedConfig fields
-    return sorted(str(p) for p in func_dir.glob(pattern))
+    return sorted(str(p) for p in func_dir.glob(f"sub-{subject}_*_{suffix}{ext}")
+                  if wanted <= set(p.name.split("_")))
 
 
 # ---------------------------------------------------------------------------

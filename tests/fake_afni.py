@@ -239,8 +239,23 @@ class FakeAfni:
             if flag in command:
                 self._touch(self._opt(command, flag))
         if "-x1D" in command:
-            Path(self._opt(command, "-x1D")).write_text("# fake design matrix\n")
+            self._lss_design(command)
         Path("3dDeconvolve.err").write_text("")
+
+    def _lss_design(self, command):
+        """Write a censored design matrix: 3 polynomials, the motion columns, and each stimulus."""
+        n_rows = int(np.loadtxt(self._opt(command, "-censor")).sum())
+        labels = ["Run#1Pol#0", "Run#1Pol#1", "Run#1Pol#2"]
+        i = command.index("-ortvec")
+        labels += [f"motion#{k}" for k in range(np.loadtxt(command[i + 1], ndmin=2).shape[1])]
+        for i, flag in enumerate(command):
+            if flag.startswith("-stim_times"):
+                stim_label = command[command.index("-stim_label", i) + 2]
+                n = len(Path(command[i + 2]).read_text().split()) if flag == "-stim_times_IM" else 1
+                labels += [f"{stim_label}#{k}" for k in range(n)]
+        row = " ".join("1" for _ in labels)
+        body = "\n".join(row for _ in range(n_rows))
+        Path(self._opt(command, "-x1D")).write_text(f'# ColumnLabels = "{" ; ".join(labels)}"\n{body}\n')
 
     def _nodata_design(self, command):
         """Write an IM design: each trial is one column, a 15 s response from its onset."""

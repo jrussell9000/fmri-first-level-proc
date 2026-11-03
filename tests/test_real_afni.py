@@ -256,6 +256,8 @@ def test_task_conn_end_to_end(data, tmp_path, monkeypatch, logger):
         assert info == str(len(ONSETS[cond]))  # one beta per trial
         assert np.loadtxt(out / f"sub01_fc_{cond}_fishZ_mat.txt", delimiter="\t").shape == (3, 3)
     assert np.loadtxt(out / "sub01_fc_AvB_fishZ_mat.txt", delimiter="\t").shape == (3, 3)
+    # TRs - polort A (3) - motion (6) - CSF, WM (2) - the trial and the other trials' sum (2)
+    assert result.qc_summary["dof"] == N_TRS - 3 - 6 - 2 - 2
 
 
 @pytest.mark.parametrize("sequenced", [False, True])
