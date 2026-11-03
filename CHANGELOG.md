@@ -4,6 +4,14 @@ All notable changes to this fork of fmri-first-level-proc. Versions follow
 [Semantic Versioning](https://semver.org/). Issue numbers refer to
 `jrussell9000/fmri-first-level-proc`.
 
+## [Unreleased]
+
+### Added
+
+- **ABCD-timed test fixture** (`tests/abcd_timed.py`, `tests/test_abcd_timed.py`): production
+  blocks on real ABCD timing, motion scale and noise, with known signal. Strict xfails record
+  known defects, including rest runs dropped silently past `3dTproject`'s censoring limit. See
+  `docs/abcd_timed_fixture.md`.
 ## [5.0.0] — 2026-11-03
 
 Major because results change for every analysis type, so existing outputs need a rerun.
