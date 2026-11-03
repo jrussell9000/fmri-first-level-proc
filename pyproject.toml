@@ -26,6 +26,7 @@ abcd = ["nibabel", "scipy"]
 fmri-first-level-proc = "fmri_first_level_proc.cli:main"
 run-first-level = "fmri_first_level_proc.cli:_main_deprecated"
 fmri-first-level-abcd = "fmri_first_level_proc.abcd.staging:main"
+fmri-first-level-abcd-validity = "fmri_first_level_proc.abcd.validity:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "fmri_first_level_proc.__version__" }

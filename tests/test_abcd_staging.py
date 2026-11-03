@@ -128,24 +128,24 @@ def test_a_cue_with_no_following_trial_fails_the_run():
 
 
 def test_staged_events_drop_dummy_and_cue_and_shift_onsets():
-    ev, dropped = sfl.stage_events(nback_events(), 8, TR)
+    ev, dropped = sfl.stage_events(nback_events(), 6.4)
     assert list(ev.columns) == ["onset", "duration", "trial_type"]
     assert "dummy" not in set(ev["trial_type"]) and "cue" not in set(ev["trial_type"])
-    # 9.41 - 8 * 0.8 = 3.01 (spec: "Trimmed inputs stay aligned")
+    # 9.41 - 6.4 = 3.01 (spec: "Siemens and Philips inputs stay aligned")
     assert ev.loc[ev["trial_type"] == "0_back_posface", "onset"].iloc[0] == pytest.approx(3.01)
     # The 6.41 s cue (now "posface") lands at 0.01 s: kept.
     assert ev["onset"].iloc[0] == pytest.approx(0.01) and dropped == 0
 
 
 def test_events_shifted_before_zero_are_dropped_and_counted():
-    ev, dropped = sfl.stage_events(nback_events(), 9, TR)  # 9 * 0.8 = 7.2 s
+    ev, dropped = sfl.stage_events(nback_events(), 7.2)
     assert dropped == 1  # the 6.41 s cue
     assert (ev["onset"] >= 0).all()
 
 
 def test_concatenated_onsets_are_offset_by_earlier_runs():
-    first, _ = sfl.stage_events(nback_events(), 8, TR)
-    second, _ = sfl.stage_events(nback_events(), 8, TR)
+    first, _ = sfl.stage_events(nback_events(), 6.4)
+    second, _ = sfl.stage_events(nback_events(), 6.4)
     cat = sfl.concat_events([(first, 362), (second, 362)], TR)
     run2 = cat.iloc[len(first) :]
     # 3.01 + 362 * 0.8 = 292.61 (spec: "Second-run onsets are offset")
@@ -371,7 +371,8 @@ def test_session_failing_exit_codes(code):
 # ---------------------------------------------------------------------------
 
 
-N_FRAMES, N_NSS = 20, 4
+N_FRAMES, N_NSS = 370, 8
+NBACK_RUNS = ("task-nback_run-01", "task-nback_run-02")
 
 
 def save_nifti(path, data, affine, zooms=None):
@@ -434,12 +435,42 @@ def fake_tools(monkeypatch):
     return calls, exits
 
 
-def session(tmp_path, state="fixed") -> sfl.Session:
-    return sfl.Session(SUBJ, SES, tmp_path / "raw", state, tmp_path / "work")
+ALL_VALID = {rid: (True, "") for rid in NBACK_RUNS}
 
 
-def run(tmp_path, state="fixed") -> dict:
-    return sfl.run_session(session(tmp_path, state), template(), tmp_path / "out", ATLAS)
+def session(tmp_path, state="fixed", validity=None) -> sfl.Session:
+    return sfl.Session(
+        SUBJ, SES, tmp_path / "raw", state, tmp_path / "work", ALL_VALID if validity is None else validity
+    )
+
+
+def run(tmp_path, state="fixed", validity=None) -> dict:
+    return sfl.run_session(session(tmp_path, state, validity), template(), tmp_path / "out", ATLAS)
+
+
+def events_tsv(rows) -> str:
+    lines = ["onset\tduration\tresponse_time\ttrial_type"]
+    lines += [f'{o:.3f}\t{d:.3f}\t"n/a"\t"{label}"' for o, d, label in rows]
+    return "\n".join(lines) + "\n"
+
+
+def overwrite_events(tmp_path, rid, rows):
+    (tmp_path / "raw" / f"{SUBJ}_{SES}_{rid}_events.tsv").write_text(events_tsv(rows))
+
+
+def reseed_run(tmp_path, rid, frames, nss):
+    stem = tmp_path / "raw" / f"{SUBJ}_{SES}_{rid}"
+    save_nifti(
+        f"{stem}_space-MNI152NLin2009cAsym_bold.nii.gz",
+        np.ones((4, 4, 4, frames), np.float32),
+        REF_AFFINE,
+        (2, 2, 2, TR),
+    )
+    confounds(frames, nss).to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False)
+
+
+def staged_events(tmp_path) -> pd.DataFrame:
+    return pd.read_csv(tmp_path / "work" / "nback_concat_events.tsv", sep="\t")
 
 
 def test_a_full_session_runs_every_analysis(tmp_path, fake_tools):
@@ -518,8 +549,17 @@ def cli_args(tmp_path):
     return [
         "--subj", SUBJ, "--ses", SES, "--input-dir", str(tmp_path / "raw"), "--probseg-state", "fixed",
         "--workdir", str(tmp_path / "work"), "--out-dir", str(tmp_path / "out"), "--atlas", ATLAS,
-        "--result", str(tmp_path / "result.json"),
+        "--result", str(tmp_path / "result.json"), "--run-validity", str(validity_table(tmp_path)),
     ]  # fmt: skip
+
+
+def validity_table(tmp_path):
+    path = tmp_path / "validity.csv"
+    lines = ["subject_id,session,run,use,reason"]
+    lines += [f"{SUBJ},{SES},{rid},1," for rid in NBACK_RUNS]
+    lines += ["sub-OTHER,ses-00A,task-nback_run-01,0,no-valid-timing-runs"]
+    path.write_text("\n".join(lines) + "\n")
+    return path
 
 
 def test_the_cli_writes_the_result_outside_the_output_tree(tmp_path, fake_tools):
@@ -548,3 +588,225 @@ def test_the_core_does_not_import_the_abcd_module():
         "sys.exit(repr(bad) if bad else 0)"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+# ---------------------------------------------------------------------------
+# n-back trim, from the `dummy` row
+# ---------------------------------------------------------------------------
+
+
+def trim(dummy, nss, frames):
+    rows = [(0.0, dummy, "dummy"), (dummy + 0.5, 2.9, "cue"), (dummy + 3.5, 1.9, "2_back_place")]
+    return sfl.nback_trim(pd.read_csv(io.StringIO(events_tsv(rows)), sep="\t"), nss, frames, TR)
+
+
+@pytest.mark.parametrize(
+    "dummy, nss, frames, n_remove",
+    [
+        (6.4, 8, 370, 8),  # Siemens, Philips: dummy equals the NSS count
+        (12.0, 16, 378, 15),  # GE DV26 and later: one frame fewer than the NSS count
+        (3.2, 5, 367, 4),  # GE DV25
+        (0.0, 8, 370, 8),  # no pad: frames come from the NSS count, nothing leaves the onsets
+    ],
+)
+def test_the_dummy_row_sets_the_trim(dummy, nss, frames, n_remove):
+    assert trim(dummy, nss, frames) == (n_remove, dummy)
+
+
+@pytest.mark.parametrize(
+    "dummy, nss, frames, reason",
+    [
+        (12.8, 16, 378, "predates-ge-timing-correction"),
+        (4.0, 5, 367, "predates-ge-timing-correction"),
+        (3.2, 5, 378, "unexpected-frame-count"),  # labelled DV25, acquired like DV26
+        (12.0, 16, 367, "unexpected-frame-count"),  # labelled DV26, acquired like DV25
+        (6.4, 8, 180, "unexpected-frame-count"),  # a short run
+        (12.0, 16, 200, "unexpected-frame-count"),
+        (4.8, 8, 370, "unexpected-dummy"),  # neither 0, the NSS count, nor one below it
+        (6.5, 8, 370, "unexpected-dummy"),  # not a whole number of frames
+        (0.0, 16, 378, "unexpected-frame-count"),  # no GE run has been seen with no pad
+    ],
+)
+def test_a_run_of_any_other_shape_is_excluded(dummy, nss, frames, reason):
+    with pytest.raises(sfl.RunExcluded, match=reason):
+        trim(dummy, nss, frames)
+
+
+def test_a_run_with_no_task_events_is_excluded():
+    ev = pd.read_csv(io.StringIO(events_tsv([(0.0, 6.4, "dummy")])), sep="\t")
+    with pytest.raises(sfl.RunExcluded, match="no-task-events"):
+        sfl.nback_trim(ev, 8, 370, TR)
+
+
+def test_a_run_with_no_dummy_row_is_excluded():
+    ev = pd.read_csv(io.StringIO(events_tsv([(6.4, 2.9, "cue"), (9.4, 1.9, "2_back_place")])), sep="\t")
+    with pytest.raises(sfl.RunExcluded, match="no-dummy-row"):
+        sfl.nback_trim(ev, 8, 370, TR)
+
+
+def test_a_ge_run_keeps_its_first_cue(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw", runs=("task-nback_run-01",))
+    reseed_run(tmp_path, "task-nback_run-01", 378, 16)
+    overwrite_events(
+        tmp_path,
+        "task-nback_run-01",
+        [(0.0, 12.0, "dummy"), (12.5, 2.9, "cue"), (15.5, 1.9, "2_back_place")],
+    )
+    result = run(tmp_path)
+    record = result["runs"]["task-nback_run-01"]
+    assert (record["n_remove"], record["n_frames"], record["dropped_events"]) == (15, 363, 0)
+    ev = staged_events(tmp_path)
+    assert ev.loc[ev["trial_type"] == "instruction", "onset"].iloc[0] == pytest.approx(0.5)
+    calls, _ = fake_tools
+    assert any(c[0] == "3dcalc" and c[2].endswith("[15..$]") for c in calls)
+
+
+def test_a_zero_dummy_run_has_no_pad_to_remove(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw", runs=("task-nback_run-01",))
+    overwrite_events(
+        tmp_path,
+        "task-nback_run-01",
+        [(0.0, 0.0, "dummy"), (0.01, 2.9, "cue"), (3.01, 1.9, "0_back_place")],
+    )
+    record = run(tmp_path)["runs"]["task-nback_run-01"]
+    assert (record["n_remove"], record["n_frames"], record["dropped_events"]) == (8, 362, 0)
+    ev = staged_events(tmp_path)
+    assert ev.loc[ev["trial_type"] == "place", "onset"].iloc[0] == pytest.approx(0.01)
+
+
+def test_rest_still_counts_its_frames_from_the_confounds(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    reseed_run(tmp_path, "task-rest_run-01", 378, 16)
+    assert run(tmp_path)["runs"]["task-rest_run-01"]["n_frames"] == 362
+
+
+def test_a_short_run_cannot_spill_into_the_next(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    reseed_run(tmp_path, "task-nback_run-01", 180, N_NSS)
+    result = run(tmp_path)
+    assert result["runs"]["task-nback_run-01"] == {"excluded": "unexpected-frame-count"}
+    assert result["analyses"]["nback_act"]["status"] == "completed"
+    calls, _ = fake_tools
+    assert not any(c[0] == "3dTcat" for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Run validity
+# ---------------------------------------------------------------------------
+
+
+def test_only_runs_the_table_allows_are_used(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    validity = {"task-nback_run-01": (False, "other-run-has-valid-timing"), "task-nback_run-02": (True, "")}
+    result = run(tmp_path, validity=validity)
+    assert result["runs"]["task-nback_run-01"] == {"excluded": "other-run-has-valid-timing"}
+    assert result["runs"]["task-nback_run-02"]["n_frames"] == 362
+    calls, _ = fake_tools
+    assert not any(c[0] == "3dTcat" for c in calls)
+
+
+def test_a_run_with_no_row_is_excluded(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    result = run(tmp_path, validity={"task-nback_run-02": (True, "")})
+    assert result["runs"]["task-nback_run-01"] == {"excluded": "no-validity-row"}
+
+
+def test_a_held_out_session_still_runs_rest(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    validity = {rid: (False, "no-valid-timing-runs") for rid in NBACK_RUNS}
+    result = run(tmp_path, validity=validity)
+    assert result["runs"]["task-nback_run-01"] == {"excluded": "no-valid-timing-runs"}
+    assert result["analyses"]["nback_act"] == {"status": "skipped", "reason": "no-nback-runs"}
+    assert result["analyses"]["rest_conn"]["status"] == "completed"
+
+
+def test_an_excluded_run_leaves_the_mask_intersection(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    mask = tmp_path / "raw" / f"{SUBJ}_{SES}_task-nback_run-01_space-MNI152NLin2009cAsym_brainmask.nii.gz"
+    save_nifti(mask, np.zeros((4, 4, 4), np.uint8), REF_AFFINE)
+    validity = {"task-nback_run-01": (False, "x"), "task-nback_run-02": (True, "")}
+    run(tmp_path, validity=validity)
+    assert np.asarray(nib.load(tmp_path / "work" / "nback_mask.nii.gz").dataobj).all()
+
+
+def test_a_session_with_nothing_eligible_finishes_and_says_why(tmp_path, fake_tools):
+    runs = ("task-nback_run-01", "task-nback_run-02")
+    seed_session(tmp_path / "raw", runs=runs)
+    result = run(tmp_path, validity={rid: (False, "no-valid-timing-runs") for rid in runs})
+    assert result["analyses"]["nback_act"]["status"] == "skipped"
+    assert result["analyses"]["rest_conn"] == {"status": "skipped", "reason": "no-rest-runs"}
+    assert [p.name for p in (tmp_path / "out").iterdir()] == [f"{SUBJ}_{SES}_first_level_skipped.json"]
+    calls, _ = fake_tools
+    assert not calls
+
+
+def test_a_session_whose_runs_all_fault_still_fails(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw", runs=("task-nback_run-01",))
+    bad = tmp_path / "raw" / f"{SUBJ}_{SES}_task-nback_run-01_desc-confounds_timeseries.tsv"
+    confounds(N_FRAMES - 1, N_NSS).to_csv(bad, sep="\t", index=False)
+    with pytest.raises(sfl.SessionError, match="nothing to run"):
+        run(tmp_path)
+
+
+def test_the_validity_file_is_read_for_this_session_only(tmp_path):
+    assert sfl.load_validity(validity_table(tmp_path), SUBJ, SES) == ALL_VALID
+    assert sfl.load_validity(validity_table(tmp_path), "sub-OTHER", "ses-00A") == {
+        "task-nback_run-01": (False, "no-valid-timing-runs")
+    }
+
+
+# ---------------------------------------------------------------------------
+# Damaged event files
+# ---------------------------------------------------------------------------
+
+
+def test_an_empty_run_is_not_modelled_as_baseline(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    overwrite_events(tmp_path, "task-nback_run-02", [(0.0, 6.4, "dummy")])
+    result = run(tmp_path)
+    assert result["runs"]["task-nback_run-02"] == {"excluded": "no-task-events"}
+    assert result["analyses"]["nback_act"]["status"] == "completed"
+    calls, _ = fake_tools
+    assert not any(c[0] == "3dTcat" for c in calls), "its BOLD must not enter the concatenation"
+
+
+STRAY = [(0.0, 6.4, "dummy"), (6.41, 2.9, "cue"), (9.41, 1.9, "2_back_place"), (325.7, 2.9, "cue")]
+UNCUED = [(0.0, 6.4, "dummy"), (9.42, 1.9, "2_back_neutface"), (34.52, 2.9, "cue"), (37.52, 1.9, "0_back_place")]
+
+
+def test_a_stray_cue_returns_to_its_run(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    overwrite_events(tmp_path, "task-nback_run-01", STRAY)
+    overwrite_events(tmp_path, "task-nback_run-02", UNCUED)
+    result = run(tmp_path)
+    first, second = result["runs"]["task-nback_run-01"], result["runs"]["task-nback_run-02"]
+    assert "excluded" not in first and "excluded" not in second
+    assert first["cue_moved_to"] == "task-nback_run-02"
+    assert second["cue_moved_from"] == "task-nback_run-01"
+    ev = staged_events(tmp_path)
+    instructions = ev.loc[ev["trial_type"] == "instruction", "onset"].to_numpy()
+    # run-01's cue at 0.01 s, and the moved one: 9.42 - 3.0 - 6.4, offset by run-01's 362 frames
+    np.testing.assert_allclose(instructions, [0.01, 0.02 + 362 * TR])
+    assert ev["onset"].max() < 2 * 362 * TR, "the stray cue left no event past the scan's end"
+
+
+def test_a_stray_cue_with_nowhere_to_go_still_excludes_its_run(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    overwrite_events(tmp_path, "task-nback_run-01", STRAY)
+    result = run(tmp_path)  # run-02 has its own first cue
+    assert "no following" in result["runs"]["task-nback_run-01"]["excluded"]
+
+
+def test_a_cue_inside_the_scan_with_no_trial_is_not_moved(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    overwrite_events(tmp_path, "task-nback_run-01", [*STRAY[:3], (200.0, 2.9, "cue")])
+    overwrite_events(tmp_path, "task-nback_run-02", UNCUED)
+    result = run(tmp_path)
+    assert "no following" in result["runs"]["task-nback_run-01"]["excluded"]
+    assert "cue_moved_from" not in result["runs"]["task-nback_run-02"]
+
+
+def test_clean_runs_are_left_alone():
+    a, b = nback_events(), nback_events()
+    out_a, out_b, moved = sfl.repair_stray_cue(a, b, N_FRAMES, TR)
+    assert moved is False and out_a is a and out_b is b

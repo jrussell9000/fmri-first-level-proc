@@ -11,11 +11,12 @@ object, with these names:
   {subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{GM,WM,CSF}_probseg.nii.gz  (rest only)
   {subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-CSF_mask.nii.gz             (rest only)
 
-NSS frames are trimmed (counted from the confounds' non_steady_state_outlier_*
-columns), motion is written translations first in degrees with first derivatives,
-n-back cues are relabelled and `dummy` dropped, n-back runs are concatenated for the
-task analyses, and rest runs stay separate. These rules come from the retired
-ABCD_fmri_orchestrator_S3.
+Rest trims the frames its confounds flag as non-steady-state. n-back trims what its
+events' `dummy` row states, because ABCD's onsets count from the first non-dummy volume
+plus that row's length (see nback_trim), and uses only runs with valid E-Prime timing
+(see validity.py). Motion is written translations first in degrees with first
+derivatives, n-back cues are relabelled and `dummy` dropped, n-back runs are concatenated
+for the task analyses, and rest runs stay separate.
 
 Exit codes: 0 every analysis finished (some may be recorded `failed` with exit 5, or
 skipped) and the result JSON is written; 1 a session failure, no result written.
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import json
 import re
 import subprocess
@@ -66,6 +68,13 @@ ANALYSES = {
 
 MOTION_BASE = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z"]
 EXCLUDE_CONDITIONS = ("dummy",)
+# n-back timing. ABCD's GE discard moved from Hagler et al. 2019's 5 and 16 frames to 4 and
+# 15 (ABCD 6.0 release notes), and each event file's `dummy` row states what applies to it.
+# Only GE has an NSS count of 5 or 16. A complete run then keeps these many frames.
+GE_NSS_COUNTS = (5, 16)
+KEPT_FRAMES, KEPT_FRAMES_GE = 362, 363
+# A cue starts this long before its block's first stimulus.
+CUE_LEAD_SECONDS = 3.0
 # Rest CSF/WM masks follow fMRIPrep's `acompcor_masks` + `acc_msk_bin`
 # (nipreps/fmriprep, fmriprep/utils/confounds.py and workflows/bold/confounds.py,
 # partial-volume route): GM > 0.05 dilated by a radius-3 ball at 1 mm is removed
@@ -89,6 +98,10 @@ EXIT_OK, EXIT_HIGH_WARNINGS, EXIT_MODEL = 0, 3, 5
 
 class SessionError(RuntimeError):
     """The session cannot be staged or run; no result is written."""
+
+
+class RunExcluded(SessionError):
+    """A rule excludes this run. The message is the reason the result records."""
 
 
 def log(event: str, **fields) -> None:
@@ -179,13 +192,98 @@ def fix_nback_cue_labels(events: pd.DataFrame, column: str = "trial_type") -> pd
     return out
 
 
-def stage_events(events: pd.DataFrame, n_remove: int, tr: float) -> tuple[pd.DataFrame, int]:
+def _labels(events: pd.DataFrame) -> pd.Series:
+    return events["trial_type"].astype(str).str.strip().str.strip('"')
+
+
+def nback_trim(events: pd.DataFrame, n_nss: int, frames: int, tr: float) -> tuple[int, float]:
+    """(frames to trim, seconds to subtract from onsets) for one n-back run, or RunExcluded.
+
+    ABCD's converter writes `onset = time since the first non-dummy volume + the dummy
+    row's duration`, so subtracting that duration is right in every run, including runs
+    whose `dummy` is 0 and whose onsets carry no pad (a task-response test put those 6.4 s
+    later than normal runs). The frames follow the `dummy` row, or the NSS count when it
+    is 0. A file with any other shape has an unknown clock, so the run is excluded.
+    """
+    labels = _labels(events)
+    if labels.isin(EXCLUDE_CONDITIONS).all():
+        raise RunExcluded("no-task-events")
+    rows = events.loc[labels == "dummy", "duration"]
+    if rows.empty:
+        raise RunExcluded("no-dummy-row")
+    seconds = float(rows.iloc[0])
+    dummy_frames = round(seconds / tr)
+    if abs(seconds / tr - dummy_frames) > 1e-3:
+        raise RunExcluded("unexpected-dummy")
+    is_ge = n_nss in GE_NSS_COUNTS
+    if dummy_frames == 0:
+        n_remove = n_nss
+    elif is_ge and dummy_frames == n_nss:
+        # Every other GE run logs one frame fewer: an uncorrected file, up to 0.8 s off.
+        raise RunExcluded("predates-ge-timing-correction")
+    elif dummy_frames in (n_nss, n_nss - 1):
+        n_remove = dummy_frames
+    else:
+        raise RunExcluded("unexpected-dummy")
+    # A wrong scanner label leaves `dummy` disagreeing with the file, and a short run's
+    # events pass its end and would spill into the next run's time.
+    if frames - n_remove != (KEPT_FRAMES_GE if is_ge else KEPT_FRAMES):
+        raise RunExcluded("unexpected-frame-count")
+    return n_remove, seconds
+
+
+def repair_stray_cue(
+    first: pd.DataFrame, second: pd.DataFrame, first_frames: int, tr: float
+) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
+    """Return a next run's first cue from the end of this run, where ABCD's converter can
+    put it: it starts a moment before that run's reference time, so it counts as this run's.
+
+    Moves the cue only when this run's last cue has no following trial and starts after
+    this run's last frame, and the next run's first trial precedes its first cue. Any
+    other shape is left alone, and fix_nback_cue_labels then excludes the run.
+    """
+    labels = _labels(first)
+    cues = first.index[labels.str.lower() == "cue"]
+    if not len(cues):
+        return first, second, False
+    last = cues[-1]
+    has_trial_after = labels.loc[last:].str.match(_NBACK).any()
+    if has_trial_after or float(first.at[last, "onset"]) <= first_frames * tr:
+        return first, second, False
+    next_labels = _labels(second)
+    trials = second.loc[next_labels.str.match(_NBACK), "onset"].astype(float)
+    if trials.empty:
+        return first, second, False
+    next_cues = second.loc[next_labels.str.lower() == "cue", "onset"].astype(float)
+    if not next_cues.empty and next_cues.min() < trials.min():
+        return first, second, False
+    moved = first.loc[[last]].copy()
+    moved["onset"] = trials.min() - CUE_LEAD_SECONDS
+    second = pd.concat([second, moved], ignore_index=True)
+    second["onset"] = second["onset"].astype(float)
+    return (
+        first.drop(index=last).reset_index(drop=True),
+        second.sort_values("onset", kind="stable").reset_index(drop=True),
+        True,
+    )
+
+
+def load_validity(path: Path, subj: str, ses: str) -> dict[str, tuple[bool, str]]:
+    """{run id: (use, reason)} for one session, from the table validity.py builds."""
+    out = {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if row["subject_id"] == subj and row["session"] == ses:
+                out[row["run"]] = (row["use"] == "1", row["reason"])
+    return out
+
+
+def stage_events(events: pd.DataFrame, shift: float) -> tuple[pd.DataFrame, int]:
     """BIDS onset/duration/trial_type: cues relabelled, `dummy` dropped, onsets
-    shifted by the trimmed frames. Returns (events, events dropped for a negative
-    onset)."""
+    shifted by `shift` seconds. Returns (events, events dropped for a negative onset)."""
     ev = fix_nback_cue_labels(events)
     ev = ev[~ev["trial_type"].isin(EXCLUDE_CONDITIONS)].copy()
-    ev["onset"] = ev["onset"].astype(float) - n_remove * tr
+    ev["onset"] = ev["onset"].astype(float) - shift
     negative = ev["onset"] < 0
     ev = ev[~negative]
     ev = ev[["onset", "duration", "trial_type"]].sort_values("onset", kind="stable")
@@ -369,6 +467,9 @@ class Run:
     dropped_events: int = 0
     excluded: str | None = None
     extra: dict = field(default_factory=dict)
+    raw_events: pd.DataFrame | None = None  # n-back: as read, with any cue repair applied
+    onset_shift: float = 0.0  # n-back: seconds nback_trim says to subtract
+    failed: bool = False  # staging raised, so `excluded` may be a fault, not a rule
 
 
 def _bold_frames_and_tr(path: Path) -> tuple[int, float]:
@@ -377,9 +478,11 @@ def _bold_frames_and_tr(path: Path) -> tuple[int, float]:
 
 
 def stage_run(run: Run, raw: dict[str, Path], tr: float, mask: Path, work: Path) -> None:
-    """Trim + mask the BOLD, write motion, stage events. Mutates `run`."""
+    """Trim + mask the BOLD, write motion, stage events. Mutates `run`. An n-back run
+    arrives with n_remove set by screen_nback_runs; a rest run counts its NSS columns."""
     confounds = pd.read_csv(raw["confounds"], sep="\t")
-    run.n_remove = nss_count(confounds)
+    if run.task == "rest":
+        run.n_remove = nss_count(confounds)
     frames, bold_tr = _bold_frames_and_tr(raw["bold"])
     if abs(bold_tr - tr) > 1e-3:
         raise SessionError(f"{run.rid}: BOLD TR {bold_tr} != config TR {tr}")
@@ -387,7 +490,7 @@ def stage_run(run: Run, raw: dict[str, Path], tr: float, mask: Path, work: Path)
         raise SessionError(f"{run.rid}: {len(confounds)} confound rows, {frames} frames")
     run.n_frames = frames - run.n_remove
     if run.n_frames < 2:
-        raise SessionError(f"{run.rid}: {run.n_remove} NSS frames leave {run.n_frames}")
+        raise SessionError(f"{run.rid}: trimming {run.n_remove} frames leaves {run.n_frames}")
     run.bold = work / f"{run.rid}_bold.nii.gz"
     run_cmd(
         [
@@ -409,9 +512,8 @@ def stage_run(run: Run, raw: dict[str, Path], tr: float, mask: Path, work: Path)
     if run.task == "rest":
         run.gs = work / f"{run.rid}_gs.1D"
         np.savetxt(run.gs, global_signal(confounds, run.n_remove), fmt="%.10g")
-    if "events" in raw:
-        events = pd.read_csv(raw["events"], sep="\t")
-        run.events, run.dropped_events = stage_events(events, run.n_remove, tr)
+    if run.raw_events is not None:
+        run.events, run.dropped_events = stage_events(run.raw_events, run.onset_shift)
 
 
 def intersect_masks(paths: list[Path], dest: Path) -> Path:
@@ -436,6 +538,7 @@ class Session:
     input_dir: Path
     probseg_state: str
     work: Path
+    validity: dict[str, tuple[bool, str]] = field(default_factory=dict)
 
     def path(self, name: str) -> Path:
         path = self.input_dir / name
@@ -467,23 +570,55 @@ class Session:
             names["events"] = f"{stem}_events.tsv"
         return {k: self.path(n) for k, n in names.items()}
 
+    def screen_nback_runs(self, runs: list[Run], raws: dict, tr: float) -> None:
+        """Apply the n-back rules before any AFNI work: run validity, the cue repair, and
+        each run's trim. A run a rule excludes is marked `excluded` with its reason."""
+        frames = {}
+        for run in runs:
+            run.raw_events = pd.read_csv(raws[run.rid]["events"], sep="\t")
+            frames[run.rid] = _bold_frames_and_tr(raws[run.rid]["bold"])[0]
+        for this, following in zip(runs, runs[1:], strict=False):
+            this.raw_events, following.raw_events, moved = repair_stray_cue(
+                this.raw_events, following.raw_events, frames[this.rid], tr
+            )
+            if moved:
+                this.extra["cue_moved_to"] = following.rid
+                following.extra["cue_moved_from"] = this.rid
+                log("cue-moved", run=this.rid, to=following.rid)
+        for run in runs:
+            try:
+                use, reason = self.validity.get(run.rid, (False, "no-validity-row"))
+                if not use:
+                    raise RunExcluded(reason)
+                confounds = pd.read_csv(raws[run.rid]["confounds"], sep="\t")
+                run.n_remove, run.onset_shift = nback_trim(
+                    run.raw_events, nss_count(confounds), frames[run.rid], tr
+                )
+            except RunExcluded as exc:
+                run.excluded = str(exc)
+                log("run-excluded", run=run.rid, reason=run.excluded)
+
     def stage_task(self, task: str, rids: list[str], tr: float) -> tuple[list[Run], dict]:
         """Stage every run of `task`; returns (runs, raws). Failed runs are kept,
         marked `excluded`, so the result records them."""
         runs = [Run(rid=rid, task=task) for rid in rids]
         raws = {r.rid: self.raw_inputs(r.rid, task) for r in runs}
-        # n-back runs are concatenated, so each is masked by the runs' intersection;
+        if task == "nback":
+            self.screen_nback_runs(runs, raws, tr)
+        # n-back runs are concatenated, so each is masked by the used runs' intersection;
         # rest runs stay separate and keep their own mask.
         mask = None
-        if task == "nback" and runs:
+        used = [r for r in runs if not r.excluded]
+        if task == "nback" and used:
             mask = intersect_masks(
-                [raws[r.rid]["brainmask"] for r in runs], self.work / "nback_mask.nii.gz"
+                [raws[r.rid]["brainmask"] for r in used], self.work / "nback_mask.nii.gz"
             )
-        for run in runs:
+        for run in used:
             try:
                 stage_run(run, raws[run.rid], tr, mask or raws[run.rid]["brainmask"], self.work)
             except (SessionError, subprocess.CalledProcessError, ValueError, KeyError) as exc:
-                run.excluded = f"{type(exc).__name__}: {exc}"
+                # A cue with no following trial lands here: a shape repair_stray_cue left.
+                run.excluded, run.failed = f"{type(exc).__name__}: {exc}", True
                 log("run-excluded", run=run.rid, reason=run.excluded)
         return runs, raws
 
@@ -553,6 +688,27 @@ class Session:
         }, None
 
 
+def _result(sess: Session, analyses: dict, runs: list[Run]) -> dict:
+    return {
+        "package_version": package_version(),
+        "probseg_state": sess.probseg_state,
+        "analyses": analyses,
+        "runs": {
+            r.rid: (
+                {"excluded": r.excluded, **r.extra}
+                if r.excluded
+                else {
+                    "n_remove": r.n_remove,
+                    "n_frames": r.n_frames,
+                    "dropped_events": r.dropped_events,
+                    **r.extra,  # n-back: any cue move; rest: mask_voxels and csf_threshold
+                }
+            )
+            for r in runs
+        },
+    }
+
+
 def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> dict:
     """Stage, run and return the session's result. Raises SessionError."""
     marker = sess.read_marker()
@@ -581,7 +737,18 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
         skipped["rest_conn"] = reason
 
     if not staged:
-        raise SessionError(f"nothing to run: {skipped}")
+        # Rules excluded everything, or the session has nothing eligible: a settled answer,
+        # so it finishes and says why, and a queue need not resubmit it. A run that failed
+        # staging is different: it may be a fault.
+        failed = [r.rid for r in all_runs if r.failed]
+        if failed or not all_runs:
+            raise SessionError(f"nothing to run: {skipped}; failed runs: {failed}")
+        analyses = {name: {"status": "skipped", "reason": why} for name, why in skipped.items()}
+        result = _result(sess, analyses, all_runs)
+        out_root.mkdir(parents=True, exist_ok=True)
+        (out_root / f"{sess.subj}_{sess.ses}_first_level_skipped.json").write_text(json.dumps(result))
+        log("session-skipped", skipped=skipped)
+        return result
 
     cfg = fill_config(template, sess.subj, sess.ses, staged, out_root, atlas)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -607,24 +774,7 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
         analyses[name] = classify_exit(code)
         log("analysis-end", analysis=name, **analyses[name])
 
-    return {
-        "package_version": package_version(),
-        "probseg_state": sess.probseg_state,
-        "analyses": analyses,
-        "runs": {
-            r.rid: (
-                {"excluded": r.excluded}
-                if r.excluded
-                else {
-                    "n_remove": r.n_remove,
-                    "n_frames": r.n_frames,
-                    "dropped_events": r.dropped_events,
-                    **r.extra,  # rest: mask_voxels and csf_threshold
-                }
-            )
-            for r in all_runs
-        },
-    }
+    return _result(sess, analyses, all_runs)
 
 
 # ---------------------------------------------------------------------------
@@ -646,13 +796,20 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out-dir", type=Path, required=True, help="analysis outputs go here")
     ap.add_argument("--atlas", required=True, help="the parcellation, the config's template_path")
     ap.add_argument("--result", type=Path, required=True, help="write the result JSON here")
+    ap.add_argument(
+        "--run-validity",
+        type=Path,
+        required=True,
+        help="the per-run table `fmri-first-level-abcd-validity` builds",
+    )
     ap.add_argument("--template", type=Path, default=PROC_TEMPLATE)
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    sess = Session(args.subj, args.ses, args.input_dir, args.probseg_state, args.workdir)
+    validity = load_validity(args.run_validity, args.subj, args.ses)
+    sess = Session(args.subj, args.ses, args.input_dir, args.probseg_state, args.workdir, validity)
     template = yaml.safe_load(args.template.read_text())
     try:
         result = run_session(sess, template, args.out_dir, args.atlas)
