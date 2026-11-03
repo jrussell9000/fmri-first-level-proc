@@ -47,7 +47,7 @@ RUN set -eu; \
     ver=$(sed -n 1p /opt/afni/AFNI_version.txt); \
     if [ "${ver}" != "${AFNI_VERSION}" ]; then echo "tarball is ${ver}"; exit 1; fi
 
-RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir numpy pandas pyyaml pytest
+RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir numpy pandas pyyaml pytest nibabel scipy
 ENV PATH="/opt/afni:/opt/venv/bin:$PATH" \
     PYTHONPATH=/src/src:/src/tests \
     AFNI_NOSPLASH=YES AFNI_ENVIRON_WARNINGS=NO
