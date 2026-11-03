@@ -39,6 +39,28 @@ MIN_SURVIVING_TRIALS = {"task_act": 2, "task_conn": 3}
 # x1D parsing
 # ---------------------------------------------------------------------------
 
+def _parse_afni_int_list(val, path, key):
+    """Decode an AFNI x1D header integer list of ``A``, ``A..B`` and ``A@B`` tokens."""
+    result = []
+    for token in val.replace(",", " ").split():
+        try:
+            if "@" in token:
+                count, value = token.split("@")
+                result.extend([int(value)] * int(count))
+            elif ".." in token:
+                lo, hi = (int(x) for x in token.split(".."))
+                step = 1 if lo <= hi else -1
+                result.extend(range(lo, hi + step, step))
+            else:
+                result.append(int(token))
+        except ValueError as e:
+            raise ToolExecutionError(
+                f"Cannot parse {key} in x1D header of '{path}': "
+                f"unrecognized integer-list token '{token}' in \"{val}\"."
+            ) from e
+    return result
+
+
 def parse_x1d(path):
     """Parse an AFNI x1D design matrix file.
 
@@ -67,9 +89,9 @@ def parse_x1d(path):
                 elif key == "StimLabels":
                     header["StimLabels"] = [s.strip() for s in val.split(";")]
                 elif key == "StimBots":
-                    header["StimBots"] = [int(x) for x in val.replace(",", " ").split()]
+                    header["StimBots"] = _parse_afni_int_list(val, path, key)
                 elif key == "StimTops":
-                    header["StimTops"] = [int(x) for x in val.replace(",", " ").split()]
+                    header["StimTops"] = _parse_afni_int_list(val, path, key)
 
     try:
         matrix = np.loadtxt(path, comments="#", ndmin=2)
