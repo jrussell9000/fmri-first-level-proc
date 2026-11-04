@@ -561,8 +561,10 @@ Schema varies by analysis type:
 **rest_conn additionally includes:**
 | Key | Type | Description |
 |---|---|---|
-| `per_run_dof` | list of int | Degrees of freedom per run |
-| `per_run_censoring` | list of dict | Per-run stats: `n_trs_total`, `n_trs_censored`, `pct_censored` |
+| `per_run_dof` | list of int or null | Degrees of freedom per run; null for an excluded run |
+| `per_run_censoring` | list of dict | Per-run stats: `n_trs_total`, `n_trs_censored`, `pct_censored`, and `excluded` (its reason) for an excluded run |
+| `excluded_runs` | list of dict or absent | Runs left out of the concatenation, each with `run` and `reason`. `insufficient-dof`: the DOF check failed. `too-few-frames`: censoring left 3dTproject too few frames. `afni-failed`: AFNI failed for another reason; see the log. |
+| `n_trs_total`, `n_trs_censored`, `pct_censored` | int, int, float | Totals over the runs that were not excluded |
 
 ### Task Activation (`task_act`)
 

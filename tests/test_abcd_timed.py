@@ -198,12 +198,13 @@ def test_real_sized_drift_does_not_change_connectivity(session, tmp_path, logger
 # ---------------------------------------------------------------------------
 
 
-@known_defect("3dTproject rejects the run; rest_conn logs it and reports success")
-def test_a_run_past_afnis_censoring_limit_is_kept_or_reported(rest_high):
+def test_a_run_past_afnis_censoring_limit_is_reported(rest_high):
     out, result = rest_high
-    kept = _nv(out / "s_concat_residual_dtseries.nii.gz")
-    reported = any(w["code"] == "RUN_SKIPPED" for w in result.warnings) or result.status != "success"
-    assert kept == fx.REST_RUNS * fx.REST_FRAMES or reported
+    excluded = result.qc_summary["excluded_runs"]
+    assert excluded and {r["reason"] for r in excluded} == {"too-few-frames"}
+    assert result.status == "warning"
+    assert sum(w["code"] == "RUN_SKIPPED" for w in result.warnings) == len(excluded)
+    assert _nv(out / "s_concat_residual_dtseries.nii.gz") == (fx.REST_RUNS - len(excluded)) * fx.REST_FRAMES
 
 
 @known_defect("per_run_dof ignores the columns that the bandpass adds")
