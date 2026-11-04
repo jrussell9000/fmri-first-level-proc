@@ -51,9 +51,9 @@ def blur(input_spec, mask_path, fwhm, out_path, logger):
 def acf_fwhm(spec, mask_path, detrend, logger):
     """Estimate the ACF FWHM with 3dFWHMx: the last value of its last 4-value line.
 
-    Returns None when the ACF fit fails, which 3dFWHMx shows as NaN parameters beside a
-    fallback estimate. 3dBlurToFWHM -ACF can fail the same way and then not blur at all;
-    spatially white data does this intermittently.
+    Returns None when the ACF fit fails, which 3dFWHMx shows beside a fallback estimate as
+    NaN parameters or as b and c left at 0.01. 3dBlurToFWHM -ACF can fail the same way and
+    then not blur at all; spatially white data does this intermittently.
     """
     cmd = ["3dFWHMx", "-mask", mask_path, *(["-detrend"] if detrend else []),
            "-acf", "NULL", "-input", spec]
@@ -63,7 +63,8 @@ def acf_fwhm(spec, mask_path, detrend, logger):
     if not values:
         raise ToolExecutionError(f"Could not find the ACF estimate in 3dFWHMx output:\n{out}")
     fit = [float(value) for value in values[-1]]
-    return fit[3] if all(math.isfinite(value) for value in fit) else None
+    failed = not all(math.isfinite(value) for value in fit) or fit[1:3] == [0.01, 0.01]
+    return None if failed else fit[3]
 
 
 def qc_record(run, fwhm, fwhm_in, fwhm_out, mask_stat, logger):
