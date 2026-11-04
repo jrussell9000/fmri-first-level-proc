@@ -640,11 +640,12 @@ def test_rest_conn_smoothing(workdir, inputs, fake_afni, logger, keep_runs):
     assert result.qc_summary["psc_per_run"][1]["run"] == 2
 
 
-def test_acf_fit_failure_is_reported(monkeypatch, logger):
+@pytest.mark.parametrize("fit", ["0.5  -nan  -nan    5.28315", "0.5  0.01  0.01    0.948223"])
+def test_acf_fit_failure_is_reported(monkeypatch, logger, fit):
     from fmri_first_level_proc import smoothing
     from fmri_first_level_proc.reporting import clear_warnings, get_warnings
 
-    monkeypatch.setattr(smoothing, "run_afni_command", lambda *a, **k: " 0  0  0    0\n 0.5  -nan  -nan    5.28315\n")
+    monkeypatch.setattr(smoothing, "run_afni_command", lambda *a, **k: f" 0  0  0    0\n {fit}\n")
     assert smoothing.acf_fwhm("scan.nii.gz", "mask.nii.gz", True, logger) is None
 
     clear_warnings()

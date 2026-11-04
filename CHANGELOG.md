@@ -12,6 +12,13 @@ All notable changes to this fork of fmri-first-level-proc. Versions follow
   blocks on real ABCD timing, motion scale and noise, with known signal. Strict xfails record
   known defects, including rest runs dropped silently past `3dTproject`'s censoring limit. See
   `docs/abcd_timed_fixture.md`.
+
+### Fixed
+
+- **A second kind of failed ACF fit went unnoticed.** `3dFWHMx` can leave `b` and `c` at 0.01 and
+  report a FWHM near 0.95 mm, with no NaN. QC now records `null` and `SMOOTH_ACF_FIT_FAILED` for
+  this too, instead of a false FWHM.
+
 ## [5.0.0] — 2026-11-03
 
 Major because results change for every analysis type, so existing outputs need a rerun.
