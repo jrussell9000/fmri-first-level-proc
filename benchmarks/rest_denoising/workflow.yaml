@@ -1,0 +1,90 @@
+# One pod per session, for the rest denoising comparison. See README.md.
+#
+# A standalone Workflow, not a WorkflowTemplate: ArgoCD owns argo/workflows/ in cloudpipe,
+# and this one-off needs no permanent template. It is an index into a table in S3, so no
+# subject IDs reach pod specs, labels or logs. Outputs go to scratch, which expires in 7 days.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: rest-denoising-
+  namespace: argo-workflows
+spec:
+  serviceAccountName: argo-workflows-runner
+  entrypoint: all-sessions
+  parallelism: 25
+  podGC:
+    strategy: OnWorkflowCompletion
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+  podMetadata:
+    labels:
+      app: rest-denoising
+  arguments:
+    parameters:
+      - name: n-sessions
+      - name: tag
+      - name: arms
+        value: bandpass,sequenced,highpass,anchor_9p
+      - name: bucket
+        valueFrom:
+          configMapKeyRef: {name: cloudpipe-config, key: bucket}
+      - name: metrics-bucket
+        valueFrom:
+          configMapKeyRef: {name: cloudpipe-config, key: metrics_bucket}
+      - name: ecr-registry
+        valueFrom:
+          configMapKeyRef: {name: cloudpipe-config, key: ecr_registry}
+  volumes:
+    - name: scratch
+      emptyDir:
+        sizeLimit: 300Gi
+  templates:
+    - name: all-sessions
+      steps:
+        - - name: session
+            template: session
+            withSequence:
+              count: "{{workflow.parameters.n-sessions}}"
+            arguments:
+              parameters:
+                - name: index
+                  value: "{{item}}"
+    - name: session
+      inputs:
+        parameters:
+          - name: index
+      activeDeadlineSeconds: 21600
+      # Same retry rule as cloudpipe's first-level session: infrastructure exits only.
+      retryStrategy:
+        limit: "8"
+        retryPolicy: Always
+        expression: '(lastRetry.message matches "pod deleted|imminent node shutdown|exit code (64|75|143)" || lastRetry.exitCode in ["0", "64", "75", "143"]) && not (lastRetry.message matches "specified key does not exist|longer than the specified deadline")'
+        backoff: {duration: "1m", factor: "2", cap: "5m"}
+      nodeSelector:
+        karpenter.sh/nodepool: first-level-nodepool
+      container:
+        # The production image, so AFNI, staging and the template match production.
+        image: "{{workflow.parameters.ecr-registry}}/cloudpipe/fmri-first-level-proc@sha256:c24d2efdd9b920d562605a5bd5f78320009044a3c374e8ca645bb85c0db3d9f6"
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+          - {name: scratch, mountPath: /scratch}
+        env:
+          - name: OMP_NUM_THREADS
+            value: "2"
+        resources:
+          requests: {cpu: "2", memory: 10Gi, ephemeral-storage: 40Gi}
+          limits: {cpu: "2", memory: 10Gi}
+        command: ["bash", "-euc"]
+        args:
+          - |
+            PREFIX=scratch/rest-denoising/{{workflow.parameters.tag}}
+            python3 -c "import boto3; boto3.client('s3').download_file('{{workflow.parameters.bucket}}', '$PREFIX/code/run_session.py', '/tmp/run_session.py')"
+            exec python3 /tmp/run_session.py \
+              --bucket {{workflow.parameters.bucket}} \
+              --metrics-bucket {{workflow.parameters.metrics-bucket}} \
+              --sessions-key $PREFIX/sessions.csv \
+              --output-prefix $PREFIX \
+              --index {{inputs.parameters.index}} \
+              --arms {{workflow.parameters.arms}} \
+              --atlas /app/Schaefer2018_400Parcels_7Networks_order_Tian_Subcortex_S4_3T_MNI152NLin2009cAsym_2mm.nii.gz \
+              --workdir /scratch/rest
