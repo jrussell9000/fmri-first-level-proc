@@ -16,7 +16,7 @@ events' `dummy` row states, because ABCD's onsets count from the first non-dummy
 plus that row's length (see nback_trim), and uses only runs with valid E-Prime timing
 (see validity.py). Motion is written translations first in degrees with first
 derivatives, n-back cues are relabelled and `dummy` dropped, n-back runs are concatenated
-for the task analyses, and rest runs stay separate.
+with their lengths recorded for the task analyses, and rest runs stay separate.
 
 Exit codes: 0 every analysis finished (some may be recorded `failed` with exit 5, or
 skipped) and the result JSON is written; 1 a session failure, no result written.
@@ -142,6 +142,9 @@ def nss_count(confounds: pd.DataFrame) -> int:
 
 def motion_matrix(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
     """(T - n_remove, 12): base motion translations first, then first derivatives.
+
+    ABCD's rotations are already degrees, unlike standard fMRIPrep's radians: its n-back
+    framewise_displacement equals sum|d trans| + (pi/180)*50*sum|d rot| on these columns.
 
     Derivatives are taken on the untrimmed series (row 1 = 0) and trimmed with it,
     as the retired orchestrator did. NaN becomes 999.0 after trimming so the
@@ -646,6 +649,7 @@ class Session:
             "scan_path": str(bold),
             "task_timing_path": str(events),
             "motion_path": str(motion),
+            "run_lengths": [r.n_frames for r in ok],
             "CSF_path": None,
             "WM_path": None,
         }

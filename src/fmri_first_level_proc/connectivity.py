@@ -2,12 +2,15 @@
 
 import logging
 import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
 
 from .afni import run_afni_command
 from .exceptions import InputError, ToolExecutionError
+from .fileutils import with_token
+from .templates import extract_roi_stats
 
 
 def _conn_suffix(fishZ, pcorr, calc_conn):
@@ -21,7 +24,7 @@ def _conn_prefix(conn_out_file_pre, condition):
     return f"{conn_out_file_pre}_{condition}" if condition is not None else conn_out_file_pre
 
 
-def build_conn_output_path(out_dir, conn_out_file_pre, condition, fishZ, pcorr, calc_conn):
+def build_conn_output_path(out_dir, conn_out_file_pre, condition, fishZ, pcorr, calc_conn, token=""):
     """Construct the expected connectivity output path for a given condition.
 
     Parameters
@@ -38,6 +41,8 @@ def build_conn_output_path(out_dir, conn_out_file_pre, condition, fishZ, pcorr, 
         Whether partial correlation was used.
     calc_conn : str
         Either 'parcellated' or 'seed_to_voxel'.
+    token : str
+        Smoothing token for a smoothed sibling; see smoothing.smoothing_token.
 
     Returns
     -------
@@ -45,7 +50,7 @@ def build_conn_output_path(out_dir, conn_out_file_pre, condition, fishZ, pcorr, 
         Full path to the expected connectivity output file.
     """
     prefix = _conn_prefix(conn_out_file_pre, condition)
-    return Path(out_dir) / (prefix + _conn_suffix(fishZ, pcorr, calc_conn))
+    return with_token(Path(out_dir) / (prefix + _conn_suffix(fishZ, pcorr, calc_conn)), token)
 
 
 def compute_matrix_contrast(condition_matrix_paths, coefs, out_path, logger):
@@ -170,6 +175,44 @@ def seed_to_voxel_conn(inset_path, out_dir, conn_out_file_pre, template_path, fi
         _log.info("Seed-to-voxel functional connectivity maps created for %s with seed from template %s.", prefix, template_path)
     else:
         _log.warning("Could not move functional connectivity file for seed %s. Check permissions and rerun.", template_path)
+
+
+def seed_to_voxel_smoothed(seed_inset_path, target_path, out_dir, conn_out_file_pre, template_path,
+                           fishZ, pcorr, token, condition=None, logger=None):
+    """Write the smoothed sibling of a seed-to-voxel map.
+
+    The seed time series comes from the unsmoothed data and the target is smoothed.
+    3dNetCorr takes both from one dataset, so this uses 3dTcorr1D, with the same Fisher Z
+    cap as 3dNetCorr. With one seed, the map is the same whether or not pcorr is set.
+
+    Parameters
+    ----------
+    seed_inset_path : str or os.PathLike
+        Unsmoothed series the seed time series is averaged from.
+    target_path : str or os.PathLike
+        Smoothed series.
+    out_dir, conn_out_file_pre, template_path, fishZ, pcorr, condition
+        As for seed_to_voxel_conn.
+    token : str
+        Smoothing token for the output file name.
+    logger : logging.Logger, optional
+    """
+    out_path = build_conn_output_path(out_dir, conn_out_file_pre, condition, fishZ, pcorr,
+                                      "seed_to_voxel", token)
+    if out_path.exists():
+        return
+    seed = extract_roi_stats(seed_inset_path, template_path, "mean", logger=logger)
+    with tempfile.TemporaryDirectory(dir=out_dir) as tmp:
+        seed_path = Path(tmp) / "seed.1D"
+        np.savetxt(seed_path, seed.to_numpy()[:, 0])
+        r_path = out_path if not fishZ else Path(tmp) / "r.nii.gz"
+        run_afni_command(["3dTcorr1D", "-pearson", "-prefix", r_path, target_path, seed_path],
+                         description="3dTcorr1D smoothed seed-to-voxel", logger=logger)
+        if fishZ:
+            limit = np.tanh(_FISHER_Z_CAP)
+            run_afni_command(["3dcalc", "-a", r_path, "-expr", f"atanh(min(max(a,{-limit}),{limit}))",
+                              "-prefix", out_path],
+                             description="3dcalc Fisher Z of smoothed seed map", logger=logger)
 
 
 # 3dNetCorr's FZ section is arctanh with |z| capped at 4.0 (r = 1 -> 4.0). Partial

@@ -70,7 +70,7 @@ The primary CLI entry point is `fmri-first-level-proc` (also runnable as `python
 | Flag | Description |
 |---|---|
 | `--config` | Path to YAML config file (required) |
-| `--dry-run` | Validate config and print plan without executing |
+| `--dry-run` | Validate config and input files, and print plan, without executing |
 | `--analyses` | Run only specific block indices (0-based), e.g. `--analyses 0 2` |
 | `--log-file` | Write logs to file in addition to console |
 | `--force` | Rerun a block whose `out_dir` holds outputs from a different config, deleting that block's previous outputs |

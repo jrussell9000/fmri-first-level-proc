@@ -67,6 +67,7 @@ import argparse
 from importlib.resources import as_file, files
 
 from .config import load_and_validate
+from .inputs import check_inputs
 from .exceptions import (
     ConfigError,
     InputError,
@@ -102,7 +103,7 @@ def main(cli_name: str = 'fmri-first-level-proc') -> None:
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Validate the config and print the analysis plan without executing."
+        help="Validate the config and input files, and print the analysis plan, without executing."
     )
     parser.add_argument(
         "--analyses", type=int, nargs="+", default=None,
@@ -165,6 +166,9 @@ def main(cli_name: str = 'fmri-first-level-proc') -> None:
         logger.info("=" * 60)
 
         if args.dry_run:
+            for config in configs:
+                logger.info("Checking inputs of %s.", config.analysis_name or config.out_file_pre)
+                check_inputs(config, logger)
             logger.info("Dry run complete. No analyses were executed.")
             return
 

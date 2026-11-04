@@ -45,6 +45,7 @@ analyses:
       scan_path: "/path/to/subj001_nback_concat.nii.gz"
       task_timing_path: "/path/to/subj001_nback_timing.csv"
       motion_path: "/path/to/subj001_nback_motion.txt"
+      run_lengths: null          # TRs per concatenated run, e.g. [370, 370]; null = the scan is one run
       CSF_path: null             # mean CSF BOLD signal per TR, or null
       WM_path: null              # mean WM BOLD signal per TR, or null
 
@@ -65,6 +66,8 @@ analyses:
     include_motion_derivs: false # true = use first 12 columns (base + derivs); false = use first 6 columns only
     use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM) as additional regressors
     scale_to_psc: true           # true = scale BOLD to percent signal change before regression (recommended)
+    roi_zero_handling: "exclude" # "exclude" = leave zero voxels out of ROI averages; "include" = average every ROI voxel
+    smoothing: {enabled: false, fwhm: 6}  # true = also write smoothed (_s6mm) siblings of voxelwise outputs
 
     # -- Contrasts --
     # functions: null = disabled; list of equations = enabled
@@ -95,6 +98,7 @@ analyses:
       scan_path: "/path/to/subj001_nback_concat.nii.gz"
       task_timing_path: "/path/to/subj001_nback_timing.csv"
       motion_path: "/path/to/subj001_nback_motion.txt"
+      run_lengths: null          # TRs per concatenated run, e.g. [370, 370]; null = the scan is one run
       CSF_path: null            # mean CSF BOLD signal per TR, or null
       WM_path: null             # mean WM BOLD signal per TR, or null
 
@@ -115,6 +119,8 @@ analyses:
     include_motion_derivs: false # true = use first 12 columns (base + derivs); false = use first 6 columns only
     use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM) as additional regressors
     scale_to_psc: true           # true = scale BOLD to percent signal change before regression (recommended)
+    roi_zero_handling: "exclude" # "exclude" = leave zero voxels out of ROI averages; "include" = average every ROI voxel
+    smoothing: {enabled: false, fwhm: 6}  # true = also write smoothed (_s6mm) siblings of voxelwise outputs
 
     # -- Extraction --
     extraction:
@@ -181,6 +187,8 @@ analyses:
     use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM/GS) as additional regressors
     use_sequenced_bandpass: false  # true = use sequenced denoising path (Ciric-inspired): NTRP-interpolate -> 3dBandpass -> regress (no -bandpass at regression). Opt in for high-motion data where bandpass-implied DOF cost is excessive.
     scale_to_psc: true           # true = scale BOLD to percent signal change before regression (recommended)
+    roi_zero_handling: "exclude" # "exclude" = leave zero voxels out of ROI averages; "include" = average every ROI voxel
+    smoothing: {enabled: false, fwhm: 6}  # true = also write smoothed (_s6mm) siblings of voxelwise outputs
 
     # -- Extraction --
     extraction:

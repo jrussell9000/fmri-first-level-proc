@@ -12,6 +12,7 @@ Complete reference for all inputs accepted by `fmri-first-level-proc`. This docu
 - [Analysis Block: task\_act](#analysis-block-task_act)
 - [Analysis Block: task\_conn](#analysis-block-task_conn)
 - [Analysis Block: rest\_conn](#analysis-block-rest_conn)
+- [Spatial Smoothing](#spatial-smoothing)
 - [Input File Formats](#input-file-formats)
   - [Scan File](#scan-file)
   - [Task Timing File](#task-timing-file)
@@ -76,10 +77,34 @@ Every analysis block must contain these fields:
 | `out_file_pre` | str | Yes | Output filename prefix for all generated files. |
 | `remove_previous` | bool | No | `true` = delete all files in `out_dir` before running. Default: `false`. |
 | `average_type` | str | Yes | `"mean"` or `"median"`. Controls parcel-level averaging during extraction. |
-| `fd_threshold` | float | Yes | Framewise displacement threshold in mm for motion censoring. TRs with FD above this value are censored. |
+| `fd_threshold` | float | Yes | Power et al. (2012) framewise displacement threshold in mm for motion censoring. TRs with FD above this value are censored. See [Censor File](#censor-file-generated-internally). |
 | `censor_prev_tr` | bool | No | `true` = also censor the TR immediately before each high-motion TR. Default: `false`. |
 | `scale_to_psc` | bool | No | `true` = scale BOLD to percent signal change before regression. Default: `true`. PSC scaling computes voxelwise temporal mean, divides each time series by its mean, and multiplies by 100 (with a 200% ceiling and zero-guard). Available for all three analysis types. |
 | `derivatives_dirs` | list of str or null | No | Per-block override for BIDS derivatives directories. |
+| `roi_zero_handling` | str | No | `"exclude"` = leave zero-valued voxels out of within-ROI averages (`3dROIstats -nzmean`/`-nzmedian`). `"include"` = average every ROI voxel. Default: `"exclude"`. Seed time series for smoothed seed maps always exclude zeros. |
+| `smoothing` | dict or null | No | `{enabled: bool, fwhm: float}`. Writes smoothed siblings of the voxelwise outputs. See [Spatial Smoothing](#spatial-smoothing). Default: disabled. |
+
+Two blocks may share an `out_dir` only when none of their output prefixes (`out_file_pre`, `extract_out_file_pre`, `conn_out_file_pre`) coincide. Directories are compared after normalization, so `out`, `./out` and its absolute path are one directory. A collision is a `ConfigError`. One block may reuse a prefix for its own outputs.
+
+---
+
+## Spatial Smoothing
+
+Applies to all three analysis types.
+
+```yaml
+smoothing:
+  enabled: true
+  fwhm: 6          # mm; > 0, finite, at most two decimal places
+```
+
+- Smoothing uses `3dBlurToFWHM -ACF -FWHM fwhm` within a data-derived mask, `{out_file_pre}_smoothing_mask.nii.gz`: the intersection of each run's non-constant voxels. Automask is never used.
+- **`task_act`, `task_conn`:** each run of the unscaled scan is blurred, PSC-scaled by its own mean when `scale_to_psc` is true, and concatenated. This input feeds a second model: a GLM with the same contrasts, or 3dLSS with the same design matrix. Input and output ACF FWHM are measured with `3dFWHMx -detrend`.
+- **`rest_conn`:** each run's residuals are blurred and re-concatenated. ACF FWHM is measured without detrending. Smoothed per-run residuals are kept when `keep_run_res_dtseries` is true.
+- **Never smoothed:** every parcel-level output (parcellated stat CSVs, residual and raw ptseries, pbseries, parcellated connectivity). Their unsmoothed versions are still written.
+- **Seed-to-voxel:** the smoothed sibling uses the unsmoothed seed time series and the smoothed target, through `3dTcorr1D`, because `3dNetCorr` takes both from one dataset. With an unsmoothed target the two programs agree to within 0.001. Partial correlation does not change a single seed's map.
+- **File names:** smoothed outputs insert `_s{N}mm` before the extension, with `.` in the FWHM written as `p`: `6` gives `_s6mm`, `4.5` gives `_s4p5mm`.
+- **QC:** `smoothing_per_run` records, and medium-severity warnings `SMOOTH_FWHM_OFF_TARGET` (achieved FWHM more than 10% from target), `SMOOTH_INPUT_ABOVE_TARGET` (input FWHM already above target) and `SMOOTH_ACF_FIT_FAILED` (`3dFWHMx` could not fit the ACF, so the FWHM values are null). On spatially white data, `3dBlurToFWHM -ACF` can fail the same way and leave a run unsmoothed.
 
 ---
 
@@ -104,6 +129,8 @@ First-level GLM via AFNI `3dDeconvolve`.
 | `paths.motion_path` | str | Path to motion regressor file. See [Motion Regressor File](#motion-regressor-file). |
 
 All required paths may be omitted when BIDS discovery is active (`derivatives_dirs` is set); see [BIDS Input Discovery](#bids-input-discovery).
+
+Give `paths.run_lengths` for any scan that concatenates more than one run. See [Scan File](#scan-file).
 
 ### Optional Paths
 
@@ -303,7 +330,7 @@ All required paths may be omitted when BIDS discovery is active.
 | `notch_filter_band` | list of 2 floats or null | `null` | Respiration artifact notch filter Hz band: `[low, high]`. Must satisfy `0 < low < high`. Applied to motion regressors before censor file generation. Set to `null` to disable. |
 | `keep_run_res_dtseries` | bool | `true` | `true` = retain per-run residual dtseries files. `false` = delete after concatenation. |
 | `use_tissue_derivs` | bool | `false` | `true` = include first temporal derivatives of tissue signals (CSF, WM, and GS when enabled) as additional nuisance regressors. |
-| `use_sequenced_bandpass` | bool | `false` | `true` = use the sequenced denoising path (Ciric et al. 2017): BOLD and nuisance regressors are NTRP-interpolated at censored TRs and bandpass-filtered separately before final nuisance regression. Eliminates the DOF cost of bandpass-implied regressors in the regression model. Requires `bandpass` to be set; ignored if `bandpass` is null. Intermediate files are written to `{out_dir}/_sequenced_intermediates/run{N}/`; removed after each run unless `keep_run_res_dtseries: true` or on failure. |
+| `use_sequenced_bandpass` | bool | `false` | `true` = use the sequenced denoising path (Ciric et al. 2017): BOLD and nuisance regressors are NTRP-interpolated at censored TRs and bandpass-filtered separately before final nuisance regression. Eliminates the DOF cost of bandpass-implied regressors in the regression model. 3dBandpass detrends (quadratic) BOLD and regressors alike; the simultaneous path uses `3dTproject -polort` instead (2 when `bandpass[0] > 0`, else `1 + floor(run duration / 150 s)`). Requires `bandpass` to be set; ignored if `bandpass` is null. Intermediate files are written to `{out_dir}/_sequenced_intermediates/run{N}/`; removed after each run unless `keep_run_res_dtseries: true` or on failure. |
 | `extraction` | dict or null | `null` | Parcel time series extraction. See below. |
 | `connectivity` | dict or null | `null` | Functional connectivity computation. See below. |
 
@@ -339,7 +366,12 @@ connectivity:
 - **Format:** NIfTI (`.nii` or `.nii.gz`)
 - **Content:** Preprocessed BOLD fMRI data (4D: x, y, z, time)
 - **Space:** Must be in a standard atlas space (e.g. MNI). AFNI `3dinfo` is used to check space, orientation, and grid spacing against the ROI template.
-- **Task analyses (`task_act`, `task_conn`):** A single file containing all runs concatenated along the time dimension.
+- **Task analyses (`task_act`, `task_conn`):** A single file containing all runs concatenated along the time dimension. Set `paths.run_lengths` to the TRs per run, in order (for example `[370, 370]`). Without it the scan is modelled as **one run**. With it:
+  - each run gets its own polynomial baseline (`3dDeconvolve -concat`, `-polort A`);
+  - each run is PSC-scaled by its own mean;
+  - FD and tissue derivatives are 0 at each run's first TR.
+
+  `run_lengths` must sum to the number of motion rows (`InputError` otherwise). Onsets stay relative to the start of the concatenated scan (`-global_times`).
 - **Resting-state (`rest_conn`):** One file per run (not concatenated; the pipeline concatenates residuals internally).
 
 ### Task Timing File
@@ -369,6 +401,7 @@ Optional BIDS columns (e.g. `amplitude`) are preserved but only `onset`, `durati
 
 **Common rules:**
 - **Row ordering:** Rows are sorted by `onset` internally; input order does not matter.
+- **Onset validation:** Every row is checked, including conditions that aren't modelled. A negative or non-finite onset, or one at or after the end of the scan, raises `InputError`. A run also writes `{out_file_pre}_timing_errors.json`: `{analysis_type, tr, n_trs, run_end_s, violations: [{condition, onset_s, violation}]}`, where `violation` is `negative`, `at_or_after_run_end` or `non_finite`.
 - **Condition coverage:** Every label in `cond_labels`/`cond_beta_labels` must appear at least once. A warning is logged for conditions with fewer than 3 trials.
 - **Extra conditions:** The timing file may contain conditions not listed in `cond_labels`/`cond_beta_labels`; they are ignored.
 
@@ -379,7 +412,8 @@ Optional BIDS columns (e.g. `amplitude`) are preserved but only `onset`, `durati
 - **Rows:** One row per TR (timepoint). Must match the scan length (enforced by AFNI).
 - **Columns:** 6 base motion parameters (3 translation + 3 rotation), optionally followed by temporal derivatives.
   - **Column order (required):** `[tx, ty, tz, rx, ry, rz, ...]` -- translations first (columns 1-3), rotations second (columns 4-6). This is the only supported column order. When derivatives are appended, they follow the same `[trans, rot]` pattern (e.g., columns 7-12 are the first temporal derivatives of columns 1-6).
-  - **Units (required):** Translations in **millimeters (mm)**, rotations in **degrees**. The pipeline passes motion values through to AFNI without any unit conversion. Rotations **must** be in degrees -- passing radians will cause AFNI's `1d_tool.py` FD computation to underweight the rotational contribution by approximately 57x (since 1 degree ~ 1 mm of arc at the standard ~57.3 mm head radius, which is AFNI's intended convention).
+  - **Units (required):** Translations in **millimeters (mm)**, rotations in **degrees**. The pipeline does no unit conversion. Rotations **must** be in degrees -- passing radians underweights the rotational contribution to FD by approximately 57x. Standard fMRIPrep output is radians, so check your `rot_*` columns: a correct file's `framewise_displacement` equals the sum of absolute translation differences plus `(pi/180) * 50` times the sum of absolute rotation differences. ABCD's confounds already hold degrees.
+  - **Non-finite values** in the first 6 columns raise `InputError`.
   - `task_act` / `task_conn` with `include_motion_derivs: false` -> minimum 6 columns used
   - `task_act` / `task_conn` with `include_motion_derivs: true` -> minimum 12 columns used
   - `rest_conn` with `motion_deriv_degree: N` -> minimum `6 * N` columns used
@@ -388,11 +422,12 @@ Optional BIDS columns (e.g. `amplitude`) are preserved but only `onset`, `durati
 
 ### Censor File (Generated Internally)
 
-Censor files are **not** user-provided inputs. They are generated automatically by the pipeline from the motion regressor file using `fd_threshold` and `censor_prev_tr`. The pipeline computes framewise displacement (FD) via AFNI's `1d_tool.py` and writes a binary censor file to `out_dir`.
+Censor files are **not** user-provided inputs. They are generated automatically by the pipeline from the motion regressor file using `fd_threshold` and `censor_prev_tr`. The pipeline computes Power et al. (2012) framewise displacement (FD), and censors a TR when FD > `fd_threshold`. FD sums the absolute backward differences of the first 6 motion columns, with rotations converted to arc length on a 50 mm sphere. It is not interchangeable with AFNI's enorm (`1d_tool.py -censor_motion`): 0.873 x enorm <= FD <= 2.30 x enorm.
 
 - **Naming:** `{out_file_pre}_concat_censor.1D` (task_act, task_conn) or `{out_file_pre}_run{N}_censor.1D` (rest_conn, one per run).
 - **Format:** Plain text, single column of binary values (`1` = include, `0` = censor). One row per TR.
 - **Usage:** Passed directly to AFNI (`3dDeconvolve -censor` or `3dTproject -censor`).
+- **FD series:** Written beside the censor file as `{out_file_pre}_concat_fd.1D` or `{out_file_pre}_run{N}_fd.1D`.
 
 ### Tissue Regressor Files (CSF, WM, GS)
 
@@ -495,16 +530,20 @@ Schema varies by analysis type:
 |---|---|---|
 | `analysis_type` | str | `"task_act"`, `"task_conn"`, or `"rest_conn"` |
 | `fd_threshold` | float | FD threshold used for censoring |
+| `censor_metric` | str | `"power_fd"` |
 | `censor_prev_tr` | bool | Whether previous-TR censoring was enabled |
 | `n_trs_total` | int | Total number of TRs |
 | `n_trs_censored` | int | Number of censored TRs |
 | `pct_censored` | float | Percentage of TRs censored |
+| `psc_per_run` | list of dict | When `scale_to_psc` is true, per run: `run`, `n_mask_voxels`, and the count and percentage of guarded voxels (minimum or mean <= 0), capped voxels (maximum above twice the mean) and non-positive-mean voxels |
+| `smoothing_per_run` | list of dict | With smoothing, per run: `run`, `fwhm_target_mm`, `acf_fwhm_input_mm`, `acf_fwhm_output_mm`, `mask_n_voxels`, `mask_fov_fraction` |
 
 **task_act and task_conn additionally include:**
 | Key | Type | Description |
 |---|---|---|
 | `hrf_model` | str | HRF model used (or `"custom (MODEL)"` if custom) |
 | `dof` | int or null | Estimated degrees of freedom |
+| `trials` | list of dict | One record per measured trial: `run`, `condition`, `onset`, `duration`, `estimability`, `survived` |
 | `per_condition_trial_counts` | dict | Total trial count per condition |
 | `per_condition_surviving_trials` | dict | Trials surviving censoring per condition |
 | `contrast_labels` | list of str or absent | (task_conn only) Labels of connectivity contrasts computed, if any |
@@ -519,7 +558,7 @@ Schema varies by analysis type:
 
 - `{out_file_pre}_min_outlier_epi.nii.gz` -- single-volume EPI frame with the lowest voxelwise outlier fraction (mandatory)
 - `{out_file_pre}_psc.nii.gz` -- PSC-scaled 4D scan (when `scale_to_psc: true`)
-- `{out_file_pre}_mean.nii.gz` -- voxelwise temporal mean (when `scale_to_psc: true`)
+- `{out_file_pre}_mean.nii.gz` -- voxelwise temporal mean (when `scale_to_psc: true`); `{out_file_pre}_run{N}_mean.nii.gz` per run with multi-run `run_lengths`
 - `{out_file_pre}_concat_bucket_stats.nii.gz` -- AFNI bucket dataset with condition betas, t-stats, and contrasts
 - `{out_file_pre}_concat_bucket_stats_index.json` -- JSON mapping every sub-brick label to its 0-based index
 - `{out_file_pre}_concat_censor.1D` -- generated censor file
@@ -535,8 +574,10 @@ Schema varies by analysis type:
 
 - `{out_file_pre}_min_outlier_epi.nii.gz` -- single-volume EPI frame with the lowest voxelwise outlier fraction (mandatory)
 - `{out_file_pre}_psc.nii.gz` -- PSC-scaled 4D scan (when `scale_to_psc: true`)
-- `{out_file_pre}_mean.nii.gz` -- voxelwise temporal mean (when `scale_to_psc: true`)
+- `{out_file_pre}_mean.nii.gz` -- voxelwise temporal mean (when `scale_to_psc: true`); `{out_file_pre}_run{N}_mean.nii.gz` per run with multi-run `run_lengths`
 - `{out_file_pre}_concat_bseries_{condition}.nii.gz` -- per-condition trial-level beta series from 3dLSS
+- `{out_file_pre}_concat_LSS_index.json` -- one record per 3dLSS sub-brick, in order: `{lss_index, beta_series_position, run, onset, condition, survived}`
+- `{out_file_pre}_concat_bseries_{condition}_index.json` -- one record per beta-series sub-brick, surviving trials only: `{lss_index, beta_series_position, run, onset}`
 - `{out_file_pre}_concat_censor.1D` -- generated censor file
 - `{out_file_pre}_concat_motion_prepared.1D` -- validated/truncated motion regressors
 - `{out_file_pre}_qc_summary.json` -- QC summary
@@ -566,6 +607,10 @@ Schema varies by analysis type:
 
 The pipeline performs automatic QC checks during execution. All checks are logged and key metrics are recorded in the QC summary JSON.
 
+### PSC Input Check
+
+PSC divides by each voxel's temporal mean, so scaled series sit near 100. A run in which 25% or more of non-constant voxels have a temporal mean <= 0 looks demeaned, and raises `InputError`. Use `scale_to_psc: false` for such data.
+
 ### Censor Warnings
 
 - **>= 30% TRs censored:** A warning is logged indicating substantial motion artifact.
@@ -573,7 +618,7 @@ The pipeline performs automatic QC checks during execution. All checks are logge
 
 ### Trial Survival (`task_act`, `task_conn`)
 
-After censoring, the pipeline checks how many trials per condition still have uncensored onsets:
+After censoring, each trial's estimability is the share of its squared regressor on uncensored TRs, pooled over basis columns, from an uncensored `3dDeconvolve -nodata -stim_times_IM` design. A trial survives when this is above 0, so it is lost only when censoring removes its whole response. No higher minimum applies: a surviving trial with little of its response left stays in the analysis, and its beta is noisier by roughly 1 / estimability. In `task_conn`, a trial that doesn't survive stays in the 3dLSS model but leaves the beta series, and the LSS index records `survived: false` and `beta_series_position: null`.
 
 - **< 2 surviving trials:** The condition is automatically dropped from the analysis with a warning. The pipeline continues with the remaining conditions. Any contrasts or extractions that depend on the dropped condition will also be skipped.
 - **Exactly 2 surviving trials:** A warning is logged. The estimate for this condition will have very low power, but the analysis proceeds.
@@ -583,6 +628,8 @@ After censoring, the pipeline checks how many trials per condition still have un
 Before running the main AFNI regression, the pipeline computes estimated degrees of freedom:
 
 `DOF = (uncensored TRs) - (number of regressors)`
+
+Regressors include polynomial baselines: `-polort A` for task analyses (degree `1 + floor(longest run duration / 150 s)`, with degree + 1 regressors per run), and the simultaneous `rest_conn` backend's `-polort` per run.
 
 - **DOF < 1:** The analysis aborts with a `ModelError` (exit code 5). This prevents AFNI from producing statistically invalid output. Consider relaxing the FD threshold or reducing model complexity.
 
@@ -594,9 +641,9 @@ The pipeline performs two validation checks at startup, before any analysis bloc
 
 ### 1. AFNI Binary Preflight
 
-All 15 required AFNI binaries are checked for reachability. Discovery order for the AFNI home directory: (1) explicit `afni_home` parameter (programmatic API only), (2) parent directory of `shutil.which('afni')`, (3) `~/abin`. Unreachable binaries are accumulated and a single `ToolUnavailableError` (exit code 4) is raised listing all missing tools.
+All 19 required AFNI binaries are checked for reachability. Discovery order for the AFNI home directory: (1) explicit `afni_home` parameter (programmatic API only), (2) parent directory of `shutil.which('afni')`, (3) `~/abin`. Unreachable binaries are accumulated and a single `ToolUnavailableError` (exit code 4) is raised listing all missing tools.
 
-Required binaries: `3dDeconvolve`, `3dTproject`, `3dTstat`, `3dBandpass`, `3dROIstats`, `3dNetCorr`, `3dresample`, `3dinfo`, `3dToutcount`, `3dbucket`, `3dcalc`, `3dLSS`, `3dTcat`, `1d_tool.py`, `1dtranspose`.
+Required binaries: `3dDeconvolve`, `3dTproject`, `3dTstat`, `3dBandpass`, `3dROIstats`, `3dNetCorr`, `3dresample`, `3dinfo`, `3dToutcount`, `3dbucket`, `3dcalc`, `3dLSS`, `3dTcat`, `1dtranspose`, `3dBlurToFWHM`, `3dFWHMx`, `3dMean`, `3dBrickStat`, `3dTcorr1D`.
 
 ### 2. Version Lock Validation
 
@@ -630,7 +677,7 @@ fmri-first-level-proc --config <path> [options]
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--config` | str | (required) | Path to the YAML config file. |
-| `--dry-run` | flag | off | Validate the config and print the analysis plan without executing any analyses. |
+| `--dry-run` | flag | off | Validate the config and input files, and print the analysis plan, without executing any analyses. Checks each scan's volume count and header TR, motion and tissue rows, columns and values, `run_lengths`, contrast grammar and condition references, timing-file conditions and onsets, and the template's atlas space. Writes no timing-error file. A run applies the same checks before its first step. |
 | `--analyses` | list of int | all | Run only specific analysis block indices (0-based). E.g. `--analyses 0 2` runs the first and third blocks. |
 | `--log-file` | str | none | Path to a log file. When set, logs are written to both console and file. |
 | `--force` | flag | off | If a block's `out_dir` holds outputs from a different configuration (see [Run Manifest](#run-manifest)), delete that block's previous outputs and rerun instead of failing with a `ConfigError`. |

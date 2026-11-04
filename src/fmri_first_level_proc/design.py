@@ -1,5 +1,7 @@
 """HRF models, stimulus timing I/O, trial survival, contrast parsing, DOF, and 3dDeconvolve base command."""
 
+import itertools
+import json
 import logging
 import re
 import subprocess
@@ -9,7 +11,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .exceptions import ConfigError, InputError, ModelError
+from .afni import run_afni_command
+from .exceptions import ConfigError, GuardError, InputError, ModelError, ToolExecutionError
 from .reporting import graded_warning
 
 
@@ -262,22 +265,151 @@ def write_onset_file(condition_df, filepath, hrf_model, custom_hrf=None, logger=
     return True
 
 
-def check_trial_survival(stim_df, cond_labels, censor_path, tr, logger):
-    """Check how many trials per condition survive motion censoring.
-
-    For each condition, count how many trials have their onset TR uncensored.
-    Warns if any condition has few surviving trials. Returns a dict of counts.
+def check_onsets(stim_df, n_trs, tr, analysis_type, errors_path=None):
+    """Refuse onsets outside the scan, or non-finite ones, for every row of a timing file.
 
     Parameters
     ----------
     stim_df : pd.DataFrame
-        Timing data with trial_type and onset columns (BIDS column names).
-    cond_labels : list of str
-        Condition labels to check.
-    censor_path : str
-        Path to the censor file (binary 1D).
+        Timing data with trial_type and onset columns, including conditions not modelled.
+    n_trs : int
+        Volumes in the scan.
     tr : float
         Repetition time in seconds.
+    analysis_type : str
+        Recorded in the error file.
+    errors_path : str or pathlib.Path or None
+        Where to write the violations as JSON, if any are found.
+
+    Raises
+    ------
+    InputError
+        If any onset is negative, at or after the end of the scan, or not finite.
+    """
+    run_end = n_trs * tr
+    violations = []
+    for row in stim_df.itertuples():
+        kind = ("non_finite" if not np.isfinite(row.onset)
+                else "negative" if row.onset < 0
+                else "at_or_after_run_end" if row.onset >= run_end
+                else None)
+        if kind:
+            violations.append({"condition": str(row.trial_type), "onset_s": float(row.onset), "violation": kind})
+    if not violations:
+        return
+    message = (f"{len(violations)} onset(s) outside the {run_end:g} s scan, for example "
+               f"{violations[0]['condition']} at {violations[0]['onset_s']:g} s.")
+    if errors_path is not None:
+        record = {"analysis_type": analysis_type, "tr": tr, "n_trs": n_trs, "run_end_s": run_end,
+                  "violations": violations}
+        Path(errors_path).write_text(json.dumps(record, indent=2))
+        message += f" See {errors_path}."
+    raise InputError(message)
+
+
+def onset_run(onset, tr, run_lengths=None):
+    """1-based run containing an onset given in seconds from the start of the scan."""
+    if not run_lengths:
+        return 1
+    run_ends = np.cumsum(run_lengths) * tr
+    return int(np.searchsorted(run_ends, onset, side="right")) + 1
+
+
+def parse_x1d(path):
+    """Read an AFNI x1D design matrix: (rows x columns array, {stim label: column indices}).
+
+    Columns come from ColumnLabels ("label#k"), because AFNI run-length encodes StimBots
+    and StimTops (for example "0..4") when conditions have equal trial counts.
+    """
+    match = re.search(r'#\s*ColumnLabels\s*=\s*"(.*?)"', Path(path).read_text())
+    if match is None:
+        raise ToolExecutionError(f"x1D file '{path}' has no ColumnLabels header.")
+    columns = {}
+    for i, label in enumerate(match.group(1).split(";")):
+        columns.setdefault(label.strip().split("#")[0], []).append(i)
+    return np.loadtxt(path, comments="#", ndmin=2), columns
+
+
+def trial_energy_ratios(stim_df, cond_labels, censor_path, config, logger):
+    """Share of each trial's squared regressor that falls on uncensored TRs.
+
+    Builds an uncensored -stim_times_IM design without data, so each trial has its own
+    columns. A trial's ratio is pooled over its columns for multi-basis HRFs. It is 0
+    when censoring removes the trial's whole response.
+
+    Parameters
+    ----------
+    stim_df : pd.DataFrame
+        Timing data with trial_type, onset and duration columns, sorted by onset.
+    cond_labels : list of str
+        Conditions to measure.
+    censor_path : str
+        Path to the censor file (binary 1D).
+    config : ResolvedConfig
+        Must include: tr, hrf_model, custom_hrf, run_lengths, out_dir.
+    logger : logging.Logger
+
+    Returns
+    -------
+    dict
+        {condition: [ratio per trial, in onset order]}.
+
+    Raises
+    ------
+    GuardError
+        If the design's columns can't be divided evenly among a condition's trials.
+    """
+    keep = np.loadtxt(censor_path) == 1
+    cmd = ["3dDeconvolve", "-nodata", str(len(keep)), str(config.tr), "-polort", "-1"]
+    if config.run_lengths and len(config.run_lengths) > 1:
+        run_starts = [0, *itertools.accumulate(config.run_lengths[:-1])]
+        cmd.extend(["-concat", "1D: " + " ".join(map(str, run_starts)), "-global_times"])
+    cmd.extend(["-num_stimts", str(len(cond_labels))])
+
+    with tempfile.TemporaryDirectory(dir=config.out_dir) as tmp:
+        tmp = Path(tmp)
+        for k, cond in enumerate(cond_labels, 1):
+            cond_df = stim_df[stim_df['trial_type'] == cond]
+            onset_path = tmp / f"stim{k}.txt"
+            write_onset_file(cond_df, onset_path, config.hrf_model, config.custom_hrf, logger=logger)
+            hrf = build_hrf_string(config.hrf_model, mean_dur=np.mean(cond_df['duration']), custom_hrf=config.custom_hrf)
+            cmd.extend(["-stim_times_IM", str(k), onset_path, hrf, "-stim_label", str(k), f"stim{k}"])
+        matrix_path = tmp / "estimability.x1D"
+        cmd.extend(["-x1D", matrix_path, "-x1D_stop", "-nobucket"])
+        run_afni_command(cmd, description="3dDeconvolve trial estimability", logger=logger)
+        matrix, columns = parse_x1d(matrix_path)
+
+    ratios = {}
+    for k, cond in enumerate(cond_labels, 1):
+        cols = columns[f"stim{k}"]
+        n_trials = int((stim_df['trial_type'] == cond).sum())
+        if n_trials == 0 or len(cols) % n_trials != 0:
+            raise GuardError(f"Condition '{cond}': the IM design has {len(cols)} column(s) for {n_trials} trial(s).")
+        per_trial = len(cols) // n_trials
+        energy = [matrix[:, cols[j * per_trial:(j + 1) * per_trial]] ** 2 for j in range(n_trials)]
+        ratios[cond] = [float(block[keep].sum() / block.sum()) if block.sum() > 0 else 0.0 for block in energy]
+    return ratios
+
+
+def trial_records(stim_df, ratios, tr, run_lengths=None):
+    """One QC record per measured trial, in onset order within each condition."""
+    records = []
+    for cond, cond_ratios in ratios.items():
+        cond_df = stim_df[stim_df['trial_type'] == cond]
+        for row, ratio in zip(cond_df.itertuples(), cond_ratios, strict=True):
+            records.append({"run": onset_run(row.onset, tr, run_lengths), "condition": str(cond),
+                            "onset": float(row.onset), "duration": float(row.duration),
+                            "estimability": round(ratio, 6), "survived": ratio > 0})
+    return records
+
+
+def check_trial_survival(ratios, logger):
+    """Count each condition's surviving trials, those with a ratio above 0, and warn if few.
+
+    Parameters
+    ----------
+    ratios : dict
+        From trial_energy_ratios.
     logger : logging.Logger
 
     Returns
@@ -285,21 +417,10 @@ def check_trial_survival(stim_df, cond_labels, censor_path, tr, logger):
     dict
         {condition: n_surviving_trials} for each condition.
     """
-    try:
-        censor_data = np.loadtxt(censor_path)
-    except Exception:
-        logger.warning("Could not read censor file for trial survival check.")
-        return {}
-
     survival = {}
-    for cond in cond_labels:
-        cond_df = stim_df[stim_df['trial_type'] == cond]
-        n_total = len(cond_df)
-        n_surviving = 0
-        for onset in cond_df['onset']:
-            tr_idx = int(round(onset / tr))
-            if 0 <= tr_idx < len(censor_data) and censor_data[tr_idx] == 1:
-                n_surviving += 1
+    for cond, cond_ratios in ratios.items():
+        n_total = len(cond_ratios)
+        n_surviving = sum(ratio > 0 for ratio in cond_ratios)
         survival[cond] = n_surviving
         if n_surviving < 2:
             logger.warning("Condition '%s': only %d of %d trials survive censoring. "
@@ -317,7 +438,7 @@ def check_trial_survival(stim_df, cond_labels, censor_path, tr, logger):
     return survival
 
 
-def build_decon_base_command(scan_path, censor_path, motion_path, CSF_path=None, WM_path=None, CSF_deriv_path=None, WM_deriv_path=None, tr=None):
+def build_decon_base_command(scan_path, censor_path, motion_path, CSF_path=None, WM_path=None, CSF_deriv_path=None, WM_deriv_path=None, tr=None, run_lengths=None):
     """Build base 3dDeconvolve command with standard nuisance regressors.
 
     Constructs the invariant portion of the 3dDeconvolve command shared by both
@@ -342,18 +463,29 @@ def build_decon_base_command(scan_path, censor_path, motion_path, CSF_path=None,
         Path to the first temporal derivative of WM signal.
     tr : float or None, optional
         Repetition time in seconds; adds -TR_times if provided.
+    run_lengths : list of int or None, optional
+        TRs per concatenated run. With more than one run, adds -concat so each run
+        gets its own polynomial baseline, and -global_times because onsets count from
+        the start of the concatenated scan.
 
     Returns
     -------
     list of str
-        Partial 3dDeconvolve command: [-quiet, -input, -polort A, -censor,
-        motion -ortvec, optional tissue -ortvec flags, optional -TR_times].
+        Partial 3dDeconvolve command: [-quiet, -input, optional -concat, -polort A,
+        -censor, motion -ortvec, optional tissue -ortvec flags, optional -TR_times,
+        optional -global_times].
     """
     cmd = ["3dDeconvolve", "-quiet",
-           "-input", scan_path,
-           "-polort", "A",
-           "-censor", censor_path,
-           "-ortvec", motion_path, "motion_regressors"]
+           "-input", scan_path]
+    multi_run = run_lengths is not None and len(run_lengths) > 1
+    if multi_run:
+        run_starts = [0, *itertools.accumulate(run_lengths[:-1])]
+        cmd.extend(["-concat", "1D: " + " ".join(map(str, run_starts))])
+    cmd.extend(["-polort", "A",
+                "-censor", censor_path,
+                "-ortvec", motion_path, "motion_regressors"])
+    if multi_run:
+        cmd.append("-global_times")
     if tr is not None:
         cmd.extend(["-TR_times", str(tr)])
     if CSF_path is not None:
@@ -386,7 +518,17 @@ def log_nuisance_model(CSF_path, WM_path, logger, use_tissue_derivs=False):
     logger.info("Nuisance regressors: %s", ", ".join(nuisance_parts))
 
 
-def compute_dof(censor_path, n_regressors, logger, tr=None):
+def polort_a_regressors(run_lengths, tr):
+    """Polynomial regressors 3dDeconvolve adds for -polort A.
+
+    Every run gets degree + 1 regressors, where the degree is
+    1 + floor(longest run duration / 150 s).
+    """
+    degree = 1 + int(max(run_lengths) * tr / 150.0)
+    return (degree + 1) * len(run_lengths)
+
+
+def compute_dof(censor_path, n_regressors, logger, tr=None, run_lengths=None):
     """Compute degrees of freedom from censor file and regressor count.
 
     Parameters
@@ -398,9 +540,10 @@ def compute_dof(censor_path, n_regressors, logger, tr=None):
     logger : logging.Logger
     tr : float or None, optional
         Repetition time in seconds. When provided, the AFNI polort A
-        polynomial regressor count (1 + floor(duration / 150)) is computed
-        from the censor file length and added to n_regressors before the
-        DOF check. When None (default), no polort adjustment is applied.
+        polynomial regressors are added to n_regressors before the DOF check.
+        When None (default), no polort adjustment is applied.
+    run_lengths : list of int or None, optional
+        TRs per concatenated run. The censor file is one run when None.
 
     Returns
     -------
@@ -418,8 +561,8 @@ def compute_dof(censor_path, n_regressors, logger, tr=None):
         censor_data = np.loadtxt(censor_path)
         n_uncensored = int(np.sum(censor_data == 1))
         if tr is not None:
-            n_poly = 1 + int((len(censor_data) * tr) / 150.0)
-            n_regressors = n_regressors + n_poly
+            lengths = run_lengths or [len(censor_data)]
+            n_regressors = n_regressors + polort_a_regressors(lengths, tr)
     except Exception:
         logger.warning("Could not read censor file for DOF check.")
         return None
@@ -455,6 +598,7 @@ def valid_contrast_functions(contrast_list, contrast_labs_list, cond_list, logge
     # Regex that matches the entire valid contrast string (one or more terms)
     _FULL_RE = re.compile(r'^([+-]?\d*\.?\d+\*\w+)([+-]\d*\.?\d+\*\w+)*$')
 
+    _log = logger or logging.getLogger(__name__)
     out = []
     for contrast in contrast_list:
         raw = contrast
@@ -506,7 +650,7 @@ def valid_contrast_functions(contrast_list, contrast_labs_list, cond_list, logge
         # Warn about zero coefficients (technically valid but likely a mistake)
         for coef, cond in zip(coefs, conds):
             if float(coef) == 0.0:
-                logger.warning("Contrast '%s': coefficient for '%s' is 0 — "
+                _log.warning("Contrast '%s': coefficient for '%s' is 0 — "
                                "this condition will have no effect.", raw, cond)
 
         out.append({'COEFS': coefs, 'CONDS': conds})

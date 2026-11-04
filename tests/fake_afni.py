@@ -17,7 +17,10 @@ from fmri_first_level_proc.exceptions import ToolExecutionError
 # Modules that bind run_afni_command at import time and must all be patched.
 PATCH_TARGETS = (
     "fmri_first_level_proc.afni",
+    "fmri_first_level_proc.design",
     "fmri_first_level_proc.preprocessing",
+    "fmri_first_level_proc.inputs",
+    "fmri_first_level_proc.smoothing",
     "fmri_first_level_proc.templates",
     "fmri_first_level_proc.connectivity",
     "fmri_first_level_proc.pipelines.task_act",
@@ -43,20 +46,24 @@ class FakeAfni:
     Parameters
     ----------
     n_trs : int
-        Length of generated censor files and 3dToutcount output.
-    censored_trs : iterable of int
-        TR indices that 1d_tool.py marks as censored (0).
+        Length of 3dToutcount output.
     n_rois : int
         ROI count reported by 3dROIstats and 3dinfo -dmax for parcellations.
     bucket_labels : list of str
         Sub-brick labels of the 3dDeconvolve bucket dataset.
+    tr : float
+        Header TR reported by 3dinfo -tr.
+    nonzero_counts : dict of str to int
+        3dBrickStat -count result by substring of the dataset name, added to
+        the defaults: 0 voxels for the PSC QC masks, 1000 for anything else.
     fail_on : set of str
         Program names that raise ToolExecutionError instead of running.
     """
 
-    def __init__(self, n_trs=100, censored_trs=(), n_rois=3, bucket_labels=None, fail_on=()):
+    def __init__(self, n_trs=100, n_rois=3, bucket_labels=None, fail_on=(), tr=2.0, nonzero_counts=None):
+        self.tr = tr
+        self.nonzero_counts = {"guarded": 0, "capped": 0, "nonpositive": 0, **(nonzero_counts or {})}
         self.n_trs = n_trs
-        self.censored_trs = set(censored_trs)
         self.n_rois = n_rois
         self.bucket_labels = list(bucket_labels or DEFAULT_BUCKET_LABELS)
         self.fail_on = set(fail_on)
@@ -94,6 +101,11 @@ class FakeAfni:
             "3dbucket": self._prefix_producer,
             "3dcalc": self._prefix_producer,
             "3dTstat": self._prefix_producer,
+            "3dMean": self._prefix_producer,
+            "3dBlurToFWHM": self._prefix_producer,
+            "3dTcorr1D": self._prefix_producer,
+            "3dFWHMx": self._fwhmx,
+            "3dBrickStat": self._brickstat,
             "3dresample": self._prefix_producer,
             "3dTcat": self._prefix_producer,
             "3dLSS": self._prefix_producer,
@@ -101,7 +113,6 @@ class FakeAfni:
             "3dBandpass": self._bandpass,
             "3dDeconvolve": self._deconvolve,
             "3dNetCorr": self._netcorr,
-            "1d_tool.py": self._censor_tool,
             "1dtranspose": self._transpose,
         }
         if program not in handlers:
@@ -153,6 +164,12 @@ class FakeAfni:
             return "1\n" if "seed" in Path(target).name else f"{self.n_rois}\n"
         if flag == "-label":
             return "|".join(self.bucket_labels) + "\n"
+        if flag == "-nt":
+            return f"{self.n_trs}\n"
+        if flag == "-tr":
+            return f"{self.tr:.6f}\n"
+        if flag == "-nijk":
+            return "5000\n"
         if flag == "-subbrick_info":
             # Real format: labels are single-quoted; stat sub-bricks get a statcode line
             lines = ["++ 3dinfo: AFNI version=AFNI_26.3.07 (Oct 31 2026) [64-bit]"]
@@ -164,6 +181,15 @@ class FakeAfni:
             return "\n".join(lines) + "\n"
         raise NotImplementedError(f"3dinfo flag {flag}")
 
+    def _fwhmx(self, command):
+        # Real output: a line of classic FWHMs, then the ACF parameters and estimate
+        return " 0  0  0    0\n 0.5  2.5  10    6.0\n"
+
+    def _brickstat(self, command):
+        name = Path(command[-1]).name
+        count = next((n for key, n in self.nonzero_counts.items() if key in name), 1000)
+        return f"{count}          \n"
+
     def _toutcount(self, command):
         fractions = np.linspace(0.2, 0.01, self.n_trs)
         return " ".join(f"{v:.4f}" for v in fractions) + "\n"
@@ -171,7 +197,13 @@ class FakeAfni:
     def _roistats(self, command):
         # Real -1Dformat: a Mean_i column precedes each NZMean_i / NZMed_i column
         n = 1 if "seed" in Path(self._opt(command, "-mask")).name else self.n_rois
-        stat = "NZMed" if "-nzmedian" in command else "NZMean"
+        stat = "NZMed" if "-nzmedian" in command else "NZMean" if "-nzmean" in command else None
+        if stat is None:
+            # Without a non-zero statistic, one column per ROI: -median after -nomeanout, else the mean
+            stat = "Med" if "-median" in command else "Mean"
+            header = "\t\t#\t" + "\t".join(f"{stat}_{i + 1}  " for i in range(n))
+            row = "\t\t\t" + "\t".join(f"{0.1 * (i + 1):.6f}" for i in range(n))
+            return f"#File\tSub-brick\n{header}\n#{command[-1]}\t0[?]\n{row}\n"
         header = "\t\t#\t" + "\t".join(f"Mean_{i + 1}  \t{stat}_{i + 1}" for i in range(n))
         row = "\t\t\t" + "\t".join(f"{0.2 * (i + 1):.6f}\t{0.1 * (i + 1):.6f}" for i in range(n))
         return f"#File\tSub-brick\n{header}\n#{command[-1]}\t0[?]\n{row}\n"
@@ -200,12 +232,31 @@ class FakeAfni:
             self._touch(prefix)
 
     def _deconvolve(self, command):
+        if "-nodata" in command:
+            self._nodata_design(command)
+            return
         for flag in ("-bucket", "-errts"):
             if flag in command:
                 self._touch(self._opt(command, flag))
         if "-x1D" in command:
             Path(self._opt(command, "-x1D")).write_text("# fake design matrix\n")
         Path("3dDeconvolve.err").write_text("")
+
+    def _nodata_design(self, command):
+        """Write an IM design: each trial is one column, a 15 s response from its onset."""
+        n_rows, tr = int(self._opt(command, "-nodata")), float(command[command.index("-nodata") + 2])
+        columns, labels = [], []
+        positions = [i for i, flag in enumerate(command) if flag == "-stim_times_IM"]
+        for i in positions:
+            onsets = [float(tok.split("*")[0]) for tok in Path(command[i + 2]).read_text().split()]
+            stim_label = command[command.index("-stim_label", i) + 2]
+            for j, onset in enumerate(onsets):
+                t = np.arange(n_rows) * tr - onset
+                columns.append(((t > 0) & (t <= 15)).astype(float))
+                labels.append(f"{stim_label}#{j}")
+        header = f'# ColumnLabels = "{" ; ".join(labels)}"\n'
+        body = "\n".join(" ".join(f"{v:g}" for v in row) for row in np.column_stack(columns))
+        Path(self._opt(command, "-x1D")).write_text(header + body + "\n")
 
     def _netcorr(self, command):
         prefix = self._opt(command, "-prefix")
@@ -229,15 +280,6 @@ class FakeAfni:
                 self._touch(indiv / "WB_Z_ROI_001.nii.gz")
 
     # -- 1D tools ------------------------------------------------------------
-
-    def _censor_tool(self, command):
-        n = len(np.loadtxt(self._opt(command, "-infile"), ndmin=2))
-        censor = np.ones(n)
-        for idx in self.censored_trs:
-            if idx < n:
-                censor[idx] = 0
-        prefix = command[command.index("-censor_motion") + 2]
-        np.savetxt(f"{prefix}_censor.1D", censor, fmt="%d")
 
     def _transpose(self, command):
         np.savetxt(command[2], np.loadtxt(command[1], ndmin=2).T, fmt="%.6f")

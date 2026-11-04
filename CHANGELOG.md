@@ -4,6 +4,69 @@ All notable changes to this fork of fmri-first-level-proc. Versions follow
 [Semantic Versioning](https://semver.org/). Issue numbers refer to
 `jrussell9000/fmri-first-level-proc`.
 
+## [5.0.0] — 2026-11-03
+
+Major because results change for every analysis type, so existing outputs need a rerun.
+Ported by hand from upstream's v4.0.0 rewrite (`tjkeding/fmri-first-level-proc@77221b2`): its
+engine, schema, connectivity backend and module layout are not. New `ResolvedConfig` fields change
+each block's config hash, so a rerun into an `out_dir` written by 4.x fails with `ConfigError` until
+you pass `--force`.
+
+### Breaking
+
+- **Censoring uses Power et al. (2012) framewise displacement**, on a 50 mm sphere, instead of
+  AFNI enorm through `1d_tool.py -censor_motion`. The metrics are not interchangeable
+  (0.873 x enorm <= FD <= 2.30 x enorm), so the same `fd_threshold` censors differently. If you
+  chose a threshold against enorm, choose it again. The FD series is written to
+  `{pre}_{label}_fd.1D`, and QC records `censor_metric`. `1d_tool.py` is no longer required.
+- **`rest_conn` detrends.** The simultaneous backend uses `3dTproject -polort 2` when
+  `bandpass[0] > 0`, else `1 + floor(run duration / 150 s)`, instead of `-polort -1`. The
+  sequenced backend drops `3dBandpass -nodetrend`, so BOLD and regressors get its quadratic
+  detrend. Sinusoids don't span quadratic trends, so these stayed in the residuals.
+
+- **Trial survival uses regressor energy, not the onset TR.** A trial survives when any of its
+  squared regressor falls on uncensored TRs, pooled over basis columns. Before, censoring only the
+  near-silent onset TR lost a trial, and censoring the whole response after it kept one. In
+  `task_conn`, a trial that doesn't survive now leaves the beta series; before, it stayed as an
+  all-zero map. There is no higher minimum, so low-energy trials stay and are noisier.
+- **Runs validate their input files first**, and `--dry-run` applies the same checks: each scan's
+  volume count and header TR, motion and tissue rows, columns and values, `run_lengths`, conditions,
+  onsets and the template's atlas space. Inputs that used to reach AFNI, or a wrong TR that went
+  unnoticed, are now `InputError` (exit 2).
+- **Onsets outside the scan** raise `InputError`, for every row of the timing file, and a run
+  writes `{pre}_timing_errors.json`.
+- **PSC refuses demeaned input**: `InputError` when 25% or more of non-constant voxels have a
+  temporal mean <= 0.
+- **Output prefixes can't repeat across blocks** that share an `out_dir`, now including the
+  extraction and connectivity prefixes, with directories compared after normalization.
+- **Contrast errors** are reported at config validation, so `--dry-run` catches them.
+- `3dBlurToFWHM`, `3dFWHMx`, `3dMean`, `3dBrickStat` and `3dTcorr1D` are required binaries.
+
+### Added
+
+- **Voxelwise smoothing** (`smoothing: {enabled, fwhm}`) for all analysis types, off by default:
+  `3dBlurToFWHM -ACF` in a data-derived mask, writing `_s{N}mm` siblings, including a second
+  `task_act` GLM and `task_conn` 3dLSS. Parcel-level outputs are never smoothed. Smoothed seed maps
+  use the unsmoothed seed series, through `3dTcorr1D`.
+- **`roi_zero_handling`** (`exclude`, the existing behaviour, or `include`).
+- **QC:** `trials`, `psc_per_run` and `smoothing_per_run`.
+- **Beta-series indexes:** `{pre}_concat_LSS_index.json` and `{pre}_concat_bseries_{cond}_index.json`
+  map each sub-brick to its trial.
+- **`paths.run_lengths`** for `task_act` and `task_conn`: the TRs per run of a concatenated scan.
+  Each run gets its own `-polort A` baseline (`3dDeconvolve -concat`) and PSC mean, written to
+  `{pre}_run{N}_mean.nii.gz`. FD and tissue derivatives are 0 at each run's first TR, and
+  onsets stay global (`-global_times`). Without the key a scan is still one run.
+
+### Fixed
+
+- **Concatenated n-back was modelled as one run.** ABCD staging now passes `run_lengths`. Before,
+  one polynomial spanned both runs, the step between their baselines went unmodelled, one PSC
+  mean covered both, and the jump between runs could censor run 2's first TR.
+- **The DOF pre-flight check undercounted polynomials.** `-polort A` adds degree + 1 regressors
+  per run, with the degree taken from the longest run. It counted one fewer, for one run.
+- **Non-finite motion values** now raise `InputError`. NaN compares False against the threshold,
+  so those TRs would not be censored.
+
 ## [4.2.0] — 2026-11-03
 
 ABCD staging only: these change n-back results on GE sessions and on any session a rule

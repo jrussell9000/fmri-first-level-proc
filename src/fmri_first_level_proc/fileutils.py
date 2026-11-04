@@ -29,6 +29,14 @@ def remove_files_from_dir(dir_string, logger=None):
             _log.error("Error deleting '%s': %s", item, e)
 
 
+def with_token(path, token):
+    """Insert a token before a file name's extension, treating .nii.gz as one extension."""
+    path = Path(path)
+    if path.name.endswith(".nii.gz"):
+        return path.with_name(f"{path.name[:-len('.nii.gz')]}{token}.nii.gz")
+    return path.with_name(f"{path.stem}{token}{path.suffix}")
+
+
 def sanitize_filename_label(label):
     """Replace filesystem-unsafe characters with underscores.
 
