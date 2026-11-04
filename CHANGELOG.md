@@ -13,6 +13,20 @@ All notable changes to this fork of fmri-first-level-proc. Versions follow
   known defects, including rest runs dropped silently past `3dTproject`'s censoring limit. See
   `docs/abcd_timed_fixture.md`.
 
+### Changed
+
+- **`rest_conn` reports the runs it loses.** With `-bandpass`, `3dTproject` rejects a run once
+  censoring leaves too few frames: on 375 TRs with 18 nuisance columns, at 32 censored frames.
+  That run used to leave the concatenation with exit 0, and QC still showed a positive DOF for it.
+  It now gets a high `RUN_SKIPPED` warning, so the CLI exits 3, and QC gains `excluded_runs` and
+  keeps the run out of its totals. The DOF check still doesn't count the bandpass, and the limit
+  itself stays.
+- **A `rest_conn` block whose data leave no run exits 5, not 4.** ABCD staging then records
+  `rest_conn` as `failed` and keeps the session's other analyses. If any run failed in AFNI for
+  another reason, the exit stays 4, because a retry could help.
+- **ABCD staging's result** marks a rest run that `rest_conn` left out with
+  `excluded_by_analysis`.
+
 ### Fixed
 
 - **A second kind of failed ACF fit went unnoticed.** `3dFWHMx` can leave `b` and `c` at 0.01 and

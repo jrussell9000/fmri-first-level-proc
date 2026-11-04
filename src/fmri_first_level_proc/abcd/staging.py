@@ -713,6 +713,14 @@ def _result(sess: Session, analyses: dict, runs: list[Run]) -> dict:
     }
 
 
+def note_runs_excluded_by_analysis(block: dict, runs: list[Run]) -> None:
+    """Record on each rest run whether rest_conn's QC says it left the analysis."""
+    qc = Path(block["out_dir"]) / f"{block['out_file_pre']}_qc_summary.json"
+    staged = [r for r in runs if not r.excluded]  # the order rest_paths passed them in
+    for record in json.loads(qc.read_text()).get("excluded_runs", []):
+        staged[record["run"] - 1].extra["excluded_by_analysis"] = record["reason"]
+
+
 def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> dict:
     """Stage, run and return the session's result. Raises SessionError."""
     marker = sess.read_marker()
@@ -777,6 +785,8 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
         code = run_cli(cmd, cwd=block["out_dir"])
         analyses[name] = classify_exit(code)
         log("analysis-end", analysis=name, **analyses[name])
+        if name == "rest_conn" and analyses[name]["status"] == "completed":
+            note_runs_excluded_by_analysis(block, rest_runs)
 
     return _result(sess, analyses, all_runs)
 

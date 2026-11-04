@@ -9,6 +9,7 @@ import yaml
 
 from fmri_first_level_proc import DISPATCH
 from fmri_first_level_proc.config import load_and_validate
+from fmri_first_level_proc.exceptions import ModelError, ToolExecutionError
 
 from fake_afni import FakeAfni
 
@@ -282,18 +283,27 @@ def test_rest_conn_seed_to_voxel(workdir, inputs, fake_afni, logger, sequenced):
         assert all(c[c.index("-polort") + 1] == "2" for c in fake_afni.calls_to("3dTproject"))
 
 
-def test_rest_conn_failed_run_is_skipped(workdir, inputs, monkeypatch, logger):
+TOO_FEW_FRAMES = "** ERROR: total number of fixed regressors (343) is too many for 343 retained time points!"
+
+
+def _fail_tproject(monkeypatch, *runs_and_errors):
+    """FakeAfni whose 3dTproject raises the given message for each (run, message)."""
     fake = FakeAfni(n_trs=N_TRS).install(monkeypatch)
     real_tproject = fake._tproject
+    errors = dict(runs_and_errors)
 
-    def fail_run2(command):
-        if "run2" in command[command.index("-input") + 1]:
-            from fmri_first_level_proc.exceptions import ToolExecutionError
-            raise ToolExecutionError("boom")
+    def fail(command):
+        for run, message in errors.items():
+            if run in command[command.index("-input") + 1]:
+                raise ToolExecutionError(message)
         return real_tproject(command)
 
-    monkeypatch.setattr(fake, "_tproject", fail_run2)
-    block = {
+    monkeypatch.setattr(fake, "_tproject", fail)
+    return fake
+
+
+def _rest_two_runs(workdir, inputs):
+    return {
         "name": "rest", "type": "rest_conn",
         "paths": {"scan_paths": [inputs["run1.nii.gz"], inputs["run2.nii.gz"]],
                   "motion_paths": [inputs["motion_run1.txt"], inputs["motion_run2.txt"]],
@@ -302,10 +312,39 @@ def test_rest_conn_failed_run_is_skipped(workdir, inputs, monkeypatch, logger):
         "out_dir": str(workdir / "out_rest"), "out_file_pre": "sub01",
         "average_type": "mean", "bandpass": [0.01, 0.1], "motion_deriv_degree": 1, "fd_threshold": 0.9,
     }
-    config = _resolve(workdir, block, None)
-    DISPATCH["rest_conn"](config, logger)
+
+
+@pytest.mark.parametrize("message,reason", [("boom", "afni-failed"), (TOO_FEW_FRAMES, "too-few-frames")])
+def test_rest_conn_failed_run_is_excluded_and_reported(workdir, inputs, monkeypatch, logger, message, reason):
+    fake = _fail_tproject(monkeypatch, ("run2", message))
+    config = _resolve(workdir, _rest_two_runs(workdir, inputs), None)
+    result = DISPATCH["rest_conn"](config, logger)
     tcat = fake.calls_to("3dTcat")[0]
     assert [Path(p).name for p in tcat[5:]] == ["sub01_run1_residual_dtseries.nii.gz"]
+    assert result.status == "warning"
+    [warning] = [w for w in result.warnings if w["code"] == "RUN_SKIPPED"]
+    assert warning["severity"] == "high" and "Run 2" in warning["message"]
+    qc = result.qc_summary
+    assert qc["excluded_runs"] == [{"run": 2, "reason": reason}]
+    assert qc["per_run_dof"][0] is not None and qc["per_run_dof"][1] is None
+    assert qc["per_run_censoring"][1]["excluded"] == reason
+    assert "excluded" not in qc["per_run_censoring"][0]
+    assert qc["n_trs_total"] == N_TRS  # the excluded run isn't in the totals
+
+
+def test_rest_conn_with_no_run_left_by_the_data_is_a_model_error(workdir, inputs, monkeypatch, logger):
+    _fail_tproject(monkeypatch, ("run1", TOO_FEW_FRAMES), ("run2", TOO_FEW_FRAMES))
+    config = _resolve(workdir, _rest_two_runs(workdir, inputs), None)
+    with pytest.raises(ModelError, match="too-few-frames"):
+        DISPATCH["rest_conn"](config, logger)
+
+
+def test_rest_conn_with_no_run_left_after_any_tool_failure_is_a_tool_error(workdir, inputs, monkeypatch, logger):
+    # A retry could help a run that AFNI failed for another reason, so this must not read as settled.
+    _fail_tproject(monkeypatch, ("run1", TOO_FEW_FRAMES), ("run2", "boom"))
+    config = _resolve(workdir, _rest_two_runs(workdir, inputs), None)
+    with pytest.raises(ToolExecutionError, match="afni-failed"):
+        DISPATCH["rest_conn"](config, logger)
 
 
 # ---------------------------------------------------------------------------

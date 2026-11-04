@@ -73,6 +73,7 @@ OUTPUTS:
 # Imports
 import copy
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -122,6 +123,20 @@ def _concat_residual_path(config) -> Path:
     return Path(config.out_dir) / f"{config.out_file_pre}_concat_residual_dtseries.nii.gz"
 
 
+# 3dTproject's words for a run with too little data left. Rerunning can't help, unlike any
+# other AFNI failure, so only these make a run's loss the data's fault.
+_TOO_FEW_FRAMES = re.compile(
+    r"fixed regressors \(\d+\) is too many for \d+ retained time points"
+    r"|only \d+ points left after censoring"
+)
+
+
+def _raise_if_too_few_frames(error):
+    match = _TOO_FEW_FRAMES.search(str(error))
+    if match:
+        raise ModelError(f"3dTproject: {match.group()}") from error
+
+
 def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared_motion, config, logger):
     """Generate per-run residual via simultaneous 3dTproject (regression + bandpass + censoring).
 
@@ -150,6 +165,11 @@ def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared
     -------
     pathlib.Path or None
         Path to the run's residual dtseries, or None on 3dTproject failure.
+
+    Raises
+    ------
+    ModelError
+        If censoring left 3dTproject too few frames.
     """
     run_out = _run_residual_path(config, run_idx)
 
@@ -182,6 +202,7 @@ def _generate_run_residual_simultaneous(run_idx, run_scan, censor_path, prepared
     try:
         run_afni_command(tproj_command, description=f"3dTproject run{run_idx+1}", logger=logger)
     except ToolExecutionError as e:
+        _raise_if_too_few_frames(e)
         logger.error("3dTproject failed for run %d: %s", run_idx+1, e)
         return None
 
@@ -247,6 +268,11 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
     -------
     pathlib.Path or None
         Path to the run's residual dtseries, or None on failure.
+
+    Raises
+    ------
+    ModelError
+        If censoring left 3dTproject too few frames.
     """
     run_out = _run_residual_path(config, run_idx)
 
@@ -349,6 +375,7 @@ def _generate_run_residual_sequenced(run_idx, run_scan, censor_path, prepared_mo
         return run_out
 
     except (ToolExecutionError, OSError) as e:
+        _raise_if_too_few_frames(e)
         logger.error("Sequenced denoising failed for run %d: %s", run_idx+1, e)
         return None
 
@@ -370,9 +397,9 @@ def gen_residual_ts(config, logger, unscaled_scans=None):
     """Generate per-run residual dense time series and concatenate across runs.
 
     For each run: optionally notch-filters motion parameters, generates an FD-based
-    censor file, runs a DOF check (emits RUN_SKIPPED graded_warning and skips runs
-    where compute_dof raises ModelError), then calls 3dTproject to regress out
-    motion, tissue signals, and optional bandpass filtering. Surviving runs are
+    censor file, runs a DOF check, then calls 3dTproject to regress out motion, tissue
+    signals, and optional bandpass filtering. A run that fails the check or that AFNI
+    can't process is excluded, with a RUN_SKIPPED graded_warning. Surviving runs are
     concatenated via 3dTcat.
 
     The per-run residual generation dispatches to one of two backends based on
@@ -395,20 +422,24 @@ def gen_residual_ts(config, logger, unscaled_scans=None):
 
     Returns
     -------
-    (list[int | None], list[dict])
-        Per-run DOF estimates (None for runs where DOF could not be computed
-        or where ModelError was raised), and smoothing_per_run records (empty
-        without smoothing). Warnings are accumulated via the module-level
-        warning accumulator (get_warnings).
+    (list[int | None], list[dict], list[dict])
+        Per-run DOF estimates (None for excluded runs), excluded_runs records
+        (`run`, `reason`), and smoothing_per_run records (empty without
+        smoothing). Warnings are accumulated via the module-level warning
+        accumulator (get_warnings).
 
     Raises
     ------
+    ModelError
+        If the data left no run to process.
     ToolExecutionError
-        If no runs were successfully processed, or if 3dTcat concatenation fails.
+        If no runs were processed and at least one failed for another reason, or if
+        3dTcat concatenation fails.
     """
     # Check if concatenated residual dtseries exists
     concat_path = _concat_residual_path(config)
     per_run_dof = []
+    excluded_runs = []
     smoothing_records = []
     if not concat_path.exists():
 
@@ -460,22 +491,40 @@ def gen_residual_ts(config, logger, unscaled_scans=None):
         backend = (_generate_run_residual_sequenced if config.use_sequenced_bandpass
                    else _generate_run_residual_simultaneous)
 
+        too_few_frames = {}
+
         def residual_for_run(i):
             if skip_run[i]:
                 return None
-            return backend(i, config.scan_paths[i], censor_paths[i], prepared_motion[i], config, logger)
+            try:
+                return backend(i, config.scan_paths[i], censor_paths[i], prepared_motion[i], config, logger)
+            except ModelError as e:
+                too_few_frames[i] = e
+                return None
 
         # Runs are independent; process them concurrently within the num_cores budget.
-        # A None result means the backend logged a failure and the run is skipped.
+        # A None result means the run is excluded, recorded below.
         # parallel_map keeps run order, which 3dTcat relies on.
         residuals = parallel_map(residual_for_run, range(len(config.scan_paths)))
         completed_runs = [r for r in residuals if r is not None]
 
+        for i, residual in enumerate(residuals):
+            if residual is not None:
+                continue
+            per_run_dof[i] = None
+            if skip_run[i]:
+                reason = "insufficient-dof"  # warned above
+            else:
+                reason = "too-few-frames" if i in too_few_frames else "afni-failed"
+                detail = too_few_frames.get(i, "AFNI failed; see the log")
+                graded_warning(logger, 'high', 'RUN_SKIPPED', f"Run {i+1}: {detail}", user_facing=True)
+            excluded_runs.append({"run": i + 1, "reason": reason})
+
         if not completed_runs:
-            raise ToolExecutionError(
-                f"No runs were successfully processed for {config.out_file_pre}. "
-                "All runs either failed AFNI processing or were skipped due to insufficient DOF."
-            )
+            message = f"No runs were successfully processed for {config.out_file_pre}: {excluded_runs}"
+            if any(record["reason"] == "afni-failed" for record in excluded_runs):
+                raise ToolExecutionError(message)
+            raise ModelError(message)
 
         # Concatenate residual time series runs
         cat_command = ["3dTcat", "-TR", str(config.tr), "-prefix", concat_path] + completed_runs
@@ -506,7 +555,7 @@ def gen_residual_ts(config, logger, unscaled_scans=None):
     else:
         logger.info("%s already exists.", concat_path)
 
-    return per_run_dof, smoothing_records
+    return per_run_dof, excluded_runs, smoothing_records
 
 def gen_ptseries(config, logger):
     """Extract ROI-level residual parcel time series from the concatenated dtseries.
@@ -605,8 +654,8 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     6. Optionally extract pre-regression parcellated time series per run (extract_raw_ptseries).
     7. Generate per-run residual dense time series via 3dTproject (gen_residual_ts),
        which internally: optionally notch-filters motion, generates per-run censor
-       files, runs per-run DOF checks (emits RUN_SKIPPED graded_warning and skips
-       runs where ModelError is raised), and concatenates surviving runs via 3dTcat.
+       files, runs per-run DOF checks, emits RUN_SKIPPED graded_warning for any run
+       it excludes, and concatenates surviving runs via 3dTcat.
     8. Collect per-run censoring statistics for QC; emit CENSOR_HIGH graded_warning
        if aggregate censoring exceeds 50%.
     9. Optionally extract parcel time series from the concatenated residuals (gen_ptseries).
@@ -637,6 +686,8 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         For invalid option combinations or path list length mismatches.
     InputError
         For missing required input files.
+    ModelError
+        If the data left no run to process.
     ToolExecutionError
         For AFNI command failures or missing expected output files.
     """
@@ -749,9 +800,12 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     }
 
     # Generate residual dense time series (regression for denoising, censoring, and temporal filtering)
-    per_run_dof, smoothing_records = gen_residual_ts(config, logger, unscaled_scans)
+    per_run_dof, excluded_runs, smoothing_records = gen_residual_ts(config, logger, unscaled_scans)
     if per_run_dof:
         qc_data["per_run_dof"] = per_run_dof
+    if excluded_runs:
+        qc_data["excluded_runs"] = excluded_runs
+    excluded = {record["run"]: record["reason"] for record in excluded_runs}
     if config.scale_to_psc:
         qc_data["psc_per_run"] = sorted(psc_per_run, key=lambda record: record["run"])
     if smoothing_records:
@@ -770,11 +824,14 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
                         i + 1, run_stats["n_trs_censored"], run_stats["n_trs_total"], run_stats["pct_censored"])
         except Exception:
             pass
+        if i + 1 in excluded:
+            run_stats["excluded"] = excluded[i + 1]
         qc_data["per_run_censoring"].append(run_stats)
 
-    # Aggregate totals
-    total_trs = sum(r.get("n_trs_total", 0) for r in qc_data["per_run_censoring"])
-    total_censored = sum(r.get("n_trs_censored", 0) for r in qc_data["per_run_censoring"])
+    # Aggregate totals, over the runs that reached the concatenation
+    kept_runs = [r for r in qc_data["per_run_censoring"] if "excluded" not in r]
+    total_trs = sum(r.get("n_trs_total", 0) for r in kept_runs)
+    total_censored = sum(r.get("n_trs_censored", 0) for r in kept_runs)
     qc_data["n_trs_total"] = total_trs
     qc_data["n_trs_censored"] = total_censored
     qc_data["pct_censored"] = round(100.0 * total_censored / total_trs, 2) if total_trs > 0 else 0.0

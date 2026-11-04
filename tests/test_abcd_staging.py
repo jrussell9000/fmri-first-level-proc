@@ -416,9 +416,15 @@ def seed_session(root, runs=("task-nback_run-01", "task-nback_run-02", "task-res
 
 
 @pytest.fixture
-def fake_tools(monkeypatch):
+def analysis_qc() -> dict[str, dict]:
+    """The QC summary a test wants an analysis to write, by analysis."""
+    return {}
+
+
+@pytest.fixture
+def fake_tools(monkeypatch, analysis_qc):
     """AFNI writes its -prefix output; 3dmaskave prints one value per frame; the CLI
-    returns the exit code a test asks for, per analysis."""
+    writes a QC summary and returns the exit code a test asks for, per analysis."""
     calls: list[list[str]] = []
     exits: dict[str, int] = {}
 
@@ -435,6 +441,8 @@ def fake_tools(monkeypatch):
         cfg = yaml.safe_load(Path(cmd[cmd.index("--config") + 1]).read_text())
         name = cfg["analyses"][int(cmd[cmd.index("--analyses") + 1])]["name"]
         (Path(cwd) / f"{name}_out.txt").write_text("result")
+        block = cfg["analyses"][int(cmd[cmd.index("--analyses") + 1])]
+        (Path(cwd) / f"{block['out_file_pre']}_qc_summary.json").write_text(json.dumps(analysis_qc.get(name, {})))
         return exits.get(name, 0)
 
     monkeypatch.setattr(sfl, "run_cmd", run_cmd)
@@ -510,6 +518,14 @@ def test_stale_probseg_skips_rest_not_the_session(tmp_path, fake_tools):
     assert result["analyses"]["nback_act"]["status"] == "completed"
     calls, _ = fake_tools
     assert not any(c[0] == "3dmaskave" for c in calls)
+
+
+def test_a_run_the_analysis_excluded_is_recorded_on_that_run(tmp_path, fake_tools, analysis_qc):
+    analysis_qc["rest_conn"] = {"excluded_runs": [{"run": 1, "reason": "too-few-frames"}]}
+    seed_session(tmp_path / "raw")
+    result = run(tmp_path)
+    assert result["runs"]["task-rest_run-01"]["excluded_by_analysis"] == "too-few-frames"
+    assert "excluded_by_analysis" not in result["runs"]["task-nback_run-01"]
 
 
 def test_a_model_failure_fails_only_its_analysis(tmp_path, fake_tools):
