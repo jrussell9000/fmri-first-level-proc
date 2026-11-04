@@ -11,6 +11,7 @@ from fmri_first_level_proc.design import (
     build_decon_base_command,
     build_hrf_string,
     check_trial_survival,
+    lss_dof,
     trial_energy_ratios,
     trial_records,
     compute_dof,
@@ -179,3 +180,20 @@ def test_build_decon_base_command():
         "-censor", "c.1D", "-ortvec", "m.1D", "motion_regressors",
         "-TR_times", "0.8", "-ortvec", "csf.txt", "CSF_regressor",
     ]
+
+
+def test_lss_dof(tmp_path):
+    matrix = tmp_path / "x.1D"
+    # 20 uncensored TRs; 3 polynomials + 6 motion + 1 nuisance stimulus; 8 trials
+    labels = [*(f"Run#1Pol#{k}" for k in range(3)), *(f"motion#{k}" for k in range(6)), "instruction#0",
+              *(f"beta_stims#{k}" for k in range(8))]
+    with open(matrix, "w") as f:
+        f.write(f'# ColumnLabels = "{" ; ".join(labels)}"\n')
+        np.savetxt(f, np.ones((20, len(labels))))
+    assert lss_dof(matrix) == 20 - 10 - 2
+
+    with open(matrix, "w") as f:
+        f.write(f'# ColumnLabels = "{" ; ".join(labels)}"\n')
+        np.savetxt(f, np.ones((12, len(labels))))
+    with pytest.raises(ModelError, match="3dLSS"):
+        lss_dof(matrix)

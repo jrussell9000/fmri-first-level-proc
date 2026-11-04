@@ -201,6 +201,21 @@ def read_and_validate_stim_data(timing_path, cond_labels, logger=None):
             "(CONDITION, ONSET, DURATION). Found: " + str(list(header_df.columns))
         )
 
+    # Numeric codes in the file match quoted condition labels in the config
+    stim_df['trial_type'] = stim_df['trial_type'].astype(str)
+    stim_df['onset'] = pd.to_numeric(stim_df['onset'], errors='coerce')
+    stim_df['duration'] = pd.to_numeric(stim_df['duration'], errors='coerce')
+
+    bad_durations = stim_df[~np.isfinite(stim_df['duration']) | (stim_df['duration'] < 0)]
+    if not bad_durations.empty:
+        raise InputError(f"Timing file '{timing_path}' has {len(bad_durations)} negative or non-finite duration(s), "
+                         f"for example {bad_durations['trial_type'].iloc[0]} at onset {bad_durations['onset'].iloc[0]}.")
+    duplicates = stim_df[stim_df.duplicated(['trial_type', 'onset'])]
+    if not duplicates.empty:
+        examples = [(row.trial_type, row.onset) for row in duplicates.head(10).itertuples()]
+        raise InputError(f"Timing file '{timing_path}' repeats {len(duplicates)} trial(s) with the same "
+                         f"condition and onset: {examples}")
+
     sorted_df = stim_df.sort_values(by='onset', ascending=True)
 
     # Check conditions exist in the timing file
@@ -328,6 +343,27 @@ def parse_x1d(path):
     for i, label in enumerate(match.group(1).split(";")):
         columns.setdefault(label.strip().split("#")[0], []).append(i)
     return np.loadtxt(path, comments="#", ndmin=2), columns
+
+
+def lss_dof(matrix_path):
+    """Degrees of freedom for each 3dLSS trial's fit, from its censored design matrix.
+
+    Each fit has the matrix's non-beta columns, the trial's own regressor, and one
+    regressor summing the other trials, on the matrix's uncensored rows.
+
+    Raises
+    ------
+    ModelError
+        If DOF < 1.
+    """
+    matrix, columns = parse_x1d(matrix_path)
+    n_nuisance = matrix.shape[1] - len(columns["beta_stims"])
+    dof = matrix.shape[0] - n_nuisance - 2
+    if dof < 1:
+        raise ModelError(f"Insufficient degrees of freedom for 3dLSS (DOF={dof}): {matrix.shape[0]} uncensored "
+                         f"TRs and {n_nuisance} non-beta regressors. Consider relaxing the FD threshold "
+                         "or reducing the model complexity.")
+    return dof
 
 
 def trial_energy_ratios(stim_df, cond_labels, censor_path, config, logger):

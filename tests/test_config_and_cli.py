@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from fmri_first_level_proc import cli, runtime
-from fmri_first_level_proc.config import load_and_validate
+from fmri_first_level_proc.config import _schema_violations, load_and_validate
 from fmri_first_level_proc.exceptions import ConfigError, InputError, ToolVersionError
 
 from fake_afni import FakeAfni
@@ -182,8 +182,9 @@ def test_contrast_errors_are_config_errors(tmp_path, task_inputs, logger):
     block = _task_act_block(tmp_path, task_inputs, contrasts={"functions": ["1*A-1*C"], "labels": ["AvC"]})
     with pytest.raises(ConfigError, match="not in --cond_labels"):
         load_and_validate(_write_config(tmp_path, [block]), logger)
-    conn = _task_act_block(tmp_path, task_inputs, type="task_conn", cond_beta_labels=["A", "B"],
-                           connectivity={"calc_conn": None, "contrasts": {"functions": ["A-B"], "labels": ["AvB"]}})
+    conn = _conn_block(tmp_path, task_inputs,
+                       connectivity={"calc_conn": "parcellated", "conn_out_file_pre": "sub01_fc",
+                                     "contrasts": {"functions": ["A-B"], "labels": ["AvB"]}})
     with pytest.raises(ConfigError, match="missing coefficients"):
         load_and_validate(_write_config(tmp_path, [conn]), logger)
 
@@ -244,3 +245,258 @@ def test_cli_config_error_exit_code(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# Closed schema and strict values
+# ---------------------------------------------------------------------------
+
+def _conn_block(tmp_path, files, **extra):
+    block = _task_act_block(tmp_path, files, type="task_conn", cond_beta_labels=["A", "B"], **extra)
+    del block["cond_labels"]
+    return block
+
+
+def _rest_block(tmp_path, **extra):
+    files = {}
+    for name in ("scan", "motion", "csf", "wm"):
+        path = tmp_path / f"{name}.txt"
+        path.write_text("x")
+        files[name] = [str(path)]
+    block = {"name": "rest", "type": "rest_conn",
+             "paths": {"scan_paths": files["scan"], "motion_paths": files["motion"],
+                       "CSF_paths": files["csf"], "WM_paths": files["wm"]},
+             "out_dir": str(tmp_path / "out"), "out_file_pre": "sub01", "average_type": "mean",
+             "bandpass": [0.01, 0.1], "motion_deriv_degree": 1, "fd_threshold": 0.4}
+    block.update(extra)
+    return block
+
+
+def test_unknown_keys_are_all_reported_together(tmp_path, task_inputs, logger):
+    block = _task_act_block(tmp_path, task_inputs, censor_prev_TR=True, tr=2.0,
+                            connectivity={"calc_conn": None},
+                            contrasts={"function": []},
+                            extraction={"extract_ptseries": True},
+                            smoothing={"enabled": False, "kernel": 6})
+    block["paths"]["run_length"] = [100]
+    path = _write_config(tmp_path, [block], template="x")
+    with pytest.raises(ConfigError) as exc:
+        load_and_validate(path, logger)
+    message = str(exc.value)
+    for fragment in ("global.template", "act.censor_prev_TR", "act.tr: valid only in the global section",
+                     "act.connectivity", "act.contrasts.function", "act.extraction.extract_ptseries",
+                     "act.smoothing.kernel", "act.paths.run_length"):
+        assert fragment in message, fragment
+
+
+def test_shipped_configs_fit_the_schema():
+    for path in (Path(__file__).parents[1] / "examples" / "config.yaml",
+                 Path(cli.__file__).parent / "abcd" / "data" / "proc_config_final.yaml"):
+        assert _schema_violations(yaml.safe_load(path.read_text())) == [], path
+
+
+@pytest.mark.parametrize("root", [["a"], "text"])
+def test_config_root_must_be_a_mapping(tmp_path, root):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(root))
+    with pytest.raises(ConfigError, match="mapping"):
+        load_and_validate(str(path))
+
+
+def test_analysis_entry_must_be_a_mapping(tmp_path):
+    with pytest.raises(ConfigError, match=r"analyses\[0\] must be a mapping"):
+        load_and_validate(_write_config(tmp_path, ["not a block"]))
+
+
+@pytest.mark.parametrize(
+    "key, value, message",
+    [("fd_threshold", None, "Missing required key 'fd_threshold'"),
+     ("hrf_model", None, "Missing required key 'hrf_model'"),
+     ("out_dir", None, "Missing required key 'out_dir'"),
+     ("fd_threshold", float("nan"), "finite"),
+     ("fd_threshold", float("inf"), "finite"),
+     ("fd_threshold", True, "finite"),
+     ("censor_prev_tr", "false", "true, false or null"),
+     ("include_motion_derivs", 1, "true, false or null"),
+     ("scale_to_psc", "no", "true, false or null"),
+     ("out_file_pre", "sub/01", "file-name-safe"),
+     ("out_file_pre", 1, "file-name-safe"),
+     ("cond_labels", "AB", "non-empty list"),
+     ("cond_labels", [1, 2], "file-name-safe"),
+     ("cond_labels", ["A", "A"], "must not repeat"),
+     ("derivatives_dirs", "/deriv", "list of directory paths"),
+     ("subject", 1, "must be a string")],
+)
+def test_invalid_block_values(tmp_path, task_inputs, logger, key, value, message):
+    block = _task_act_block(tmp_path, task_inputs, **{key: value})
+    with pytest.raises(ConfigError, match=message):
+        load_and_validate(_write_config(tmp_path, [block]), logger)
+
+
+def test_boolean_null_means_the_default(tmp_path, task_inputs, logger):
+    block = _task_act_block(tmp_path, task_inputs, include_motion_derivs=None, scale_to_psc=None)
+    (cfg,) = load_and_validate(_write_config(tmp_path, [block]), logger)
+    assert cfg.include_motion_derivs is False and cfg.scale_to_psc is True
+
+
+@pytest.mark.parametrize("tr", [float("nan"), float("inf"), True, "2"])
+def test_invalid_tr(tmp_path, task_inputs, logger, tr):
+    with pytest.raises(ConfigError, match="global.tr"):
+        load_and_validate(_write_config(tmp_path, [_task_act_block(tmp_path, task_inputs)], tr=tr), logger)
+
+
+def test_invalid_force_diff_atlas(tmp_path, task_inputs, logger):
+    path = _write_config(tmp_path, [_task_act_block(tmp_path, task_inputs)], force_diff_atlas="yes")
+    with pytest.raises(ConfigError, match="force_diff_atlas"):
+        load_and_validate(path, logger)
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [({"bandpass": [0.01, float("nan")]}, "finite"),
+     ({"bandpass": [True, 0.1]}, "finite"),
+     ({"notch_filter_band": [float("inf"), 0.4]}, "finite"),
+     ({"motion_deriv_degree": 2.9}, "positive integer"),
+     ({"motion_deriv_degree": True}, "positive integer"),
+     ({"keep_run_res_dtseries": "no"}, "true, false or null"),
+     ({"connectivity": {"calc_conn": "parcellated"}}, "conn_out_file_pre"),
+     ({"connectivity": {"calc_conn": "parcellated", "conn_out_file_pre": "a b"}}, "file-name-safe"),
+     ({"connectivity": {"calc_conn": "parcellated", "conn_out_file_pre": "fc", "fishZ": "true"}}, "true, false or null"),
+     ({"extraction": {"extract_ptseries": True, "extract_out_file_pre": None}}, "extract_out_file_pre")],
+)
+def test_invalid_rest_values(tmp_path, logger, extra, message):
+    with pytest.raises(ConfigError, match=message):
+        load_and_validate(_write_config(tmp_path, [_rest_block(tmp_path, **extra)]), logger)
+
+
+@pytest.mark.parametrize(
+    "extraction, message",
+    [({"extract_resids": True}, "extract_resids needs"),
+     ({"extract_resids": "false", "stat_buckets": ["Coef"], "extract_out_file_pre": "x"}, "true, false or null"),
+     ({"stat_buckets": ["Coef"], "extract_out_file_pre": None}, "extract_out_file_pre"),
+     ({"stat_buckets": ["Coef"], "extract_out_file_pre": "../x"}, "file-name-safe"),
+     ({"extract_raw_ptseries": True, "extract_out_file_pre": None}, "extract_out_file_pre")],
+)
+def test_invalid_task_act_extraction(tmp_path, task_inputs, logger, extraction, message):
+    block = _task_act_block(tmp_path, task_inputs, extraction=extraction)
+    with pytest.raises(ConfigError, match=message):
+        load_and_validate(_write_config(tmp_path, [block]), logger)
+
+
+def test_null_sections_are_allowed(tmp_path, task_inputs, logger):
+    block = _task_act_block(tmp_path, task_inputs, extraction=None, contrasts=None, smoothing=None)
+    assert load_and_validate(_write_config(tmp_path, [block]), logger)
+
+
+@pytest.mark.parametrize("labels", [["AvB", "AvB"], ["A/B", "A_B"]])
+def test_contrast_labels_stay_unique_in_file_names(tmp_path, task_inputs, logger, labels):
+    block = _task_act_block(tmp_path, task_inputs, contrasts={"functions": ["1*A-1*B", "1*B-1*A"], "labels": labels})
+    with pytest.raises(ConfigError, match="unique in file names"):
+        load_and_validate(_write_config(tmp_path, [block]), logger)
+
+
+def test_task_conn_contrasts_need_calc_conn(tmp_path, task_inputs, logger):
+    block = _conn_block(tmp_path, task_inputs,
+                        connectivity={"calc_conn": None, "contrasts": {"functions": ["1*A-1*B"], "labels": ["AvB"]}})
+    with pytest.raises(ConfigError, match="need connectivity.calc_conn"):
+        load_and_validate(_write_config(tmp_path, [block]), logger)
+
+
+# ---------------------------------------------------------------------------
+# BIDS discovery
+# ---------------------------------------------------------------------------
+
+def _touch_rest_files(func, runs_by_suffix, task="rest"):
+    func.mkdir(parents=True, exist_ok=True)
+    for name, runs in runs_by_suffix.items():
+        for run in runs:
+            (func / f"sub-01_task-{task}_run-{run}_{name}").write_text("x")
+
+
+REST_NAMES = {"scan": "desc-preproc_bold.nii.gz", "motion": "desc-confounds_regressors.tsv",
+              "csf": "desc-CSF_timeseries.1D", "wm": "desc-WM_timeseries.1D"}
+
+
+def _discovery_block(tmp_path, **extra):
+    block = {"name": "rest", "type": "rest_conn", "derivatives_dirs": [str(tmp_path / "deriv")],
+             "subject": "01", "task": "rest", "out_dir": str(tmp_path / "out"), "out_file_pre": "sub01",
+             "average_type": "mean", "bandpass": [0.01, 0.1], "motion_deriv_degree": 1, "fd_threshold": 0.4}
+    block.update(extra)
+    return block
+
+
+def test_discovery_matches_task_exactly(tmp_path, logger):
+    func = tmp_path / "deriv" / "sub-01" / "func"
+    _touch_rest_files(func, {name: [1] for name in REST_NAMES.values()})
+    _touch_rest_files(func, {name: [2] for name in REST_NAMES.values()}, task="restpre")
+    (cfg,) = load_and_validate(_write_config(tmp_path, [_discovery_block(tmp_path)]), logger)
+    assert [Path(p).name for p in cfg.scan_paths] == ["sub-01_task-rest_run-1_desc-preproc_bold.nii.gz"]
+
+
+def test_discovery_requires_task(tmp_path, logger):
+    block = _discovery_block(tmp_path)
+    del block["task"]
+    with pytest.raises(ConfigError, match="requires 'task'"):
+        load_and_validate(_write_config(tmp_path, [block]), logger)
+
+
+def test_discovery_without_subject_is_an_input_error(tmp_path, logger):
+    block = _discovery_block(tmp_path)
+    del block["subject"]
+    with pytest.raises(InputError, match="Mandatory slot"):
+        load_and_validate(_write_config(tmp_path, [block]), logger)
+
+
+def test_discovery_refuses_misaligned_runs(tmp_path, logger):
+    func = tmp_path / "deriv" / "sub-01" / "func"
+    runs = {name: [1, 2] for name in REST_NAMES.values()}
+    runs[REST_NAMES["motion"]] = [1, 3]
+    _touch_rest_files(func, runs)
+    with pytest.raises(InputError, match="name different runs"):
+        load_and_validate(_write_config(tmp_path, [_discovery_block(tmp_path)]), logger)
+
+
+def test_discovery_refuses_uneven_run_lists(tmp_path, logger):
+    func = tmp_path / "deriv" / "sub-01" / "func"
+    runs = {name: [1, 2] for name in REST_NAMES.values()}
+    runs[REST_NAMES["wm"]] = [1]
+    _touch_rest_files(func, runs)
+    with pytest.raises(InputError, match="differ in length"):
+        load_and_validate(_write_config(tmp_path, [_discovery_block(tmp_path)]), logger)
+
+
+# ---------------------------------------------------------------------------
+# Events and tissue files
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "rows, message",
+    [(["10\t-2\tA", "20\t2\tB"], "negative or non-finite duration"),
+     (["10\tn/a\tA", "20\t2\tB"], "negative or non-finite duration"),
+     (["10\t2\tA", "10\t2\tA", "20\t2\tB"], "repeats 1 trial"),
+     (["n/a\t2\tA", "20\t2\tB"], "outside the 80 s scan")],
+)
+def test_cli_dry_run_refuses_bad_events(tmp_path, dry_run_inputs, monkeypatch, caplog, rows, message):
+    Path(dry_run_inputs["events.tsv"]).write_text("\n".join(["onset\tduration\ttrial_type", *rows]) + "\n")
+    path = _write_config(tmp_path, [_task_act_block(tmp_path, dry_run_inputs)])
+    with pytest.raises(SystemExit) as exc:
+        _dry_run(path, monkeypatch)
+    assert exc.value.code == 2
+    assert message in caplog.text
+
+
+def test_numeric_trial_types_match_quoted_labels(tmp_path, dry_run_inputs, monkeypatch):
+    Path(dry_run_inputs["events.tsv"]).write_text("onset\tduration\ttrial_type\n10\t2\t1\n20\t2\t2\n")
+    block = _task_act_block(tmp_path, dry_run_inputs, cond_labels=["1", "2"])
+    _dry_run(_write_config(tmp_path, [block]), monkeypatch)
+
+
+def test_tissue_file_must_be_single_column(tmp_path, dry_run_inputs, monkeypatch, caplog):
+    csf = tmp_path / "csf.txt"
+    np.savetxt(csf, np.zeros((100, 2)))
+    block = _task_act_block(tmp_path, dry_run_inputs)
+    block["paths"]["CSF_path"] = str(csf)
+    with pytest.raises(SystemExit) as exc:
+        _dry_run(_write_config(tmp_path, [block]), monkeypatch)
+    assert exc.value.code == 2
+    assert "2 columns, expected 1" in caplog.text

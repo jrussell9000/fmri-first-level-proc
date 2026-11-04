@@ -97,7 +97,7 @@ from ..design import (
     build_decon_base_command,
     build_hrf_string,
     check_trial_survival,
-    compute_dof,
+    lss_dof,
     log_hrf_model,
     log_nuisance_model,
     needs_married_timing,
@@ -802,19 +802,6 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
     # are accumulated into beta_onsets.txt in first-appearance order.
     beta_cond_order = write_stim_onset_files(stim_data, config, logger)
 
-    # Pre-flight DOF check (conservative lower bound — actual per-trial regressors are higher)
-    n_regressors = use_cols + len(config.cond_beta_labels)
-    if config.CSF_path is not None:
-        n_regressors += 1
-    if config.WM_path is not None:
-        n_regressors += 1
-    if config.use_tissue_derivs:
-        if config.CSF_path is not None:
-            n_regressors += 1
-        if config.WM_path is not None:
-            n_regressors += 1
-    dof = compute_dof(config.censor_path, n_regressors, logger, tr=config.tr, run_lengths=config.run_lengths)
-
     # Build QC summary data
     qc_data = {
         "analysis_type": "task_conn",
@@ -832,7 +819,6 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
         pass
     qc_data["per_condition_trial_counts"] = {c: int(len(stim_data[stim_data['trial_type'] == c])) for c in config.cond_beta_labels}
     qc_data["per_condition_surviving_trials"] = trial_survival
-    qc_data["dof"] = dof
     qc_data["trials"] = trial_records(stim_data, trial_ratios, config.tr, config.run_lengths)
     if config.scale_to_psc:
         qc_data["psc_per_run"] = psc_per_run
@@ -848,6 +834,9 @@ def run(config: ResolvedConfig, logger: logging.Logger | None = None) -> FirstLe
 
     # Generate task design matrix, including regressors for denoising, censoring, and stimulus timing
     gen_design_matrix(stim_data, config, logger)
+
+    # DOF check, from the design matrix 3dLSS will use
+    qc_data["dof"] = lss_dof(Path(config.out_dir) / f"{config.out_file_pre}_concat_bseries_dmat.x1D")
 
     # Generate full task beta-series and condition-specific beta series
     bseries_out = gen_beta_series(stim_data, config, beta_cond_order, trial_ratios, logger)
