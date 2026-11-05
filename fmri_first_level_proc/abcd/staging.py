@@ -212,9 +212,9 @@ _NBACK = re.compile(r"^(\d+)_back_(.+)$")
 
 
 def fix_nback_cue_labels(events: pd.DataFrame, column: str = "trial_type") -> pd.DataFrame:
-    """Relabel `cue` rows from the block that follows: 0-back -> the bare condition
-    (`posface`), any other level -> `instruction`. Ported from the retired
-    orchestrator's fix_nback_cue_labels, behaviour unchanged."""
+    """Relabel `cue` rows from the block that follows: 0-back -> `target_0back`, pooled
+    across stimuli, any other level -> `instruction`. As ABCD_fmri_orchestrator_S3's
+    fix_nback_cue_labels (v4.0.0)."""
     out = events.copy()
     labels = [str(v).strip().strip('"') for v in out[column]]
     for i, label in enumerate(labels):
@@ -223,8 +223,7 @@ def fix_nback_cue_labels(events: pd.DataFrame, column: str = "trial_type") -> pd
         match = next((m for m in map(_NBACK.match, labels[i + 1 :]) if m), None)
         if match is None:
             raise SessionError(f"cue at row {i} has no following n-back trial")
-        level, condition = match.groups()
-        labels[i] = condition if level == "0" else "instruction"
+        labels[i] = "target_0back" if match.group(1) == "0" else "instruction"
     out[column] = labels
     return out
 

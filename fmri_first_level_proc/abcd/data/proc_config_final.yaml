@@ -58,7 +58,8 @@ analyses:
     out_file_pre: "subj001_nback_baseline"
 
     # -- Condition labels (must match CONDITION column in timing CSV) --
-    cond_labels: ["negface", "posface", "neutface", "place","0_back_negface","0_back_posface","0_back_neutface","0_back_place","2_back_negface","2_back_posface","2_back_neutface","2_back_place","instruction"]
+    # target_0back pools the 0-back cues across stimuli; a session has 2 per stimulus.
+    cond_labels: ["0_back_negface","0_back_posface","0_back_neutface","0_back_place","2_back_negface","2_back_posface","2_back_neutface","2_back_place","target_0back","instruction"]
 
     # -- Block settings --
     remove_previous: false       # true = delete all files in out_dir before running
@@ -73,18 +74,18 @@ analyses:
     # functions: null = disabled; list of equations = enabled
     contrasts:
       functions:
-        - "0.333333*negface+0.333333*0_back_negface+0.333333*2_back_negface"
-        - "0.333333*posface+0.333333*0_back_posface+0.333333*2_back_posface"
-        - "0.333333*neutface+0.333333*0_back_neutface+0.333333*2_back_neutface"
-        - "0.333333*place+0.333333*0_back_place+0.333333*2_back_place"
+        - "0.5*0_back_negface+0.5*2_back_negface"
+        - "0.5*0_back_posface+0.5*2_back_posface"
+        - "0.5*0_back_neutface+0.5*2_back_neutface"
+        - "0.5*0_back_place+0.5*2_back_place"
         - "0.25*0_back_negface+0.25*0_back_posface+0.25*0_back_neutface+0.25*0_back_place"
         - "0.25*2_back_negface+0.25*2_back_posface+0.25*2_back_neutface+0.25*2_back_place"
-        - "0.333333*negface+0.333333*0_back_negface+0.333333*2_back_negface-0.333333*posface-0.333333*0_back_posface-0.333333*2_back_posface"
-        - "0.333333*negface+0.333333*0_back_negface+0.333333*2_back_negface-0.333333*neutface-0.333333*0_back_neutface-0.333333*2_back_neutface"
-        - "0.333333*negface+0.333333*0_back_negface+0.333333*2_back_negface-0.333333*place-0.333333*0_back_place-0.333333*2_back_place"
-        - "0.333333*posface+0.333333*0_back_posface+0.333333*2_back_posface-0.333333*neutface-0.333333*0_back_neutface-0.333333*2_back_neutface"
-        - "0.333333*posface+0.333333*0_back_posface+0.333333*2_back_posface-0.333333*place-0.333333*0_back_place-0.333333*2_back_place"
-        - "0.333333*neutface+0.333333*0_back_neutface+0.333333*2_back_neutface-0.333333*place-0.333333*0_back_place-0.333333*2_back_place"
+        - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_posface-0.5*2_back_posface"
+        - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_neutface-0.5*2_back_neutface"
+        - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_place-0.5*2_back_place"
+        - "0.5*0_back_posface+0.5*2_back_posface-0.5*0_back_neutface-0.5*2_back_neutface"
+        - "0.5*0_back_posface+0.5*2_back_posface-0.5*0_back_place-0.5*2_back_place"
+        - "0.5*0_back_neutface+0.5*2_back_neutface-0.5*0_back_place-0.5*2_back_place"
         - "0.25*2_back_negface+0.25*2_back_posface+0.25*2_back_neutface+0.25*2_back_place-0.25*0_back_negface-0.25*0_back_posface-0.25*0_back_neutface-0.25*0_back_place"
         - "1*2_back_negface-1*0_back_negface"
         - "1*2_back_posface-1*0_back_posface"
@@ -172,8 +173,9 @@ analyses:
     out_file_pre: "subj001_nback_baseline"
 
     # -- Condition beta labels --
-    # Conditions for which trial-level beta series will be estimated.
-    cond_beta_labels: ["negface", "posface", "neutface", "place","0_back_negface","0_back_posface","0_back_neutface","0_back_place","2_back_negface","2_back_posface","2_back_neutface","2_back_place","instruction"]
+    # Conditions for which trial-level beta series will be estimated. target_0back is
+    # modelled as a nuisance regressor, because it is absent from this list.
+    cond_beta_labels: ["0_back_negface","0_back_posface","0_back_neutface","0_back_place","2_back_negface","2_back_posface","2_back_neutface","2_back_place","instruction"]
 
     # -- Block settings --
     remove_previous: false       # true = delete all files in out_dir before running
@@ -201,13 +203,13 @@ analyses:
       # functions: null = disabled; list of equations = enabled
       contrasts:
         functions:
-          - "0.333333*negface+0.333333*0_back_negface+0.333333*2_back_negface"
-          - "0.333333*posface+0.333333*0_back_posface+0.333333*2_back_posface"
-          - "0.333333*negface+0.333333*0_back_negface+0.333333*2_back_negface-0.333333*posface-0.333333*0_back_posface-0.333333*2_back_posface"
-          - "0.333333*negface+0.333333*0_back_negface+0.333333*2_back_negface-0.333333*neutface-0.333333*0_back_neutface-0.333333*2_back_neutface"
-          - "0.333333*negface+0.333333*0_back_negface+0.333333*2_back_negface-0.333333*place-0.333333*0_back_place-0.333333*2_back_place"
-          - "0.333333*posface+0.333333*0_back_posface+0.333333*2_back_posface-0.333333*neutface-0.333333*0_back_neutface-0.333333*2_back_neutface"
-          - "0.333333*posface+0.333333*0_back_posface+0.333333*2_back_posface-0.333333*place-0.333333*0_back_place-0.333333*2_back_place"
+          - "0.5*0_back_negface+0.5*2_back_negface"
+          - "0.5*0_back_posface+0.5*2_back_posface"
+          - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_posface-0.5*2_back_posface"
+          - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_neutface-0.5*2_back_neutface"
+          - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_place-0.5*2_back_place"
+          - "0.5*0_back_posface+0.5*2_back_posface-0.5*0_back_neutface-0.5*2_back_neutface"
+          - "0.5*0_back_posface+0.5*2_back_posface-0.5*0_back_place-0.5*2_back_place"
           - "1*0_back_negface-1*0_back_posface"
           - "1*0_back_negface-1*0_back_neutface"
           - "1*0_back_negface-1*0_back_place"

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -121,7 +122,7 @@ def test_cue_relabel_matches_the_orchestrator():
     ev = sfl.fix_nback_cue_labels(nback_events())
     assert list(ev["trial_type"]) == [
         "dummy",
-        "posface",
+        "target_0back",
         "0_back_posface",
         "0_back_posface",
         "instruction",
@@ -141,7 +142,7 @@ def test_staged_events_drop_dummy_and_cue_and_shift_onsets():
     assert "dummy" not in set(ev["trial_type"]) and "cue" not in set(ev["trial_type"])
     # 9.41 - 6.4 = 3.01 (spec: "Siemens and Philips inputs stay aligned")
     assert ev.loc[ev["trial_type"] == "0_back_posface", "onset"].iloc[0] == pytest.approx(3.01)
-    # The 6.41 s cue (now "posface") lands at 0.01 s: kept.
+    # The 6.41 s cue (now "target_0back") lands at 0.01 s: kept.
     assert ev["onset"].iloc[0] == pytest.approx(0.01) and dropped == 0
 
 
@@ -368,6 +369,21 @@ def test_run_label_is_the_run_number():
     assert sfl.run_label("task-nback_run-02") == 2
     with pytest.raises(sfl.SessionError, match="no run number"):
         sfl.run_label("task-nback")
+
+
+def test_template_models_the_pooled_cue_and_no_contrast_uses_a_cue():
+    blocks = {b["name"]: b for b in template()["analyses"]}
+    assert "target_0back" in blocks["nback_act"]["cond_labels"]
+    assert "target_0back" not in blocks["nback_conn"]["cond_beta_labels"]
+    labels = set(blocks["nback_act"]["cond_labels"])
+    assert not labels & {"negface", "posface", "neutface", "place"}
+    contrasts = [
+        *blocks["nback_act"]["contrasts"]["functions"],
+        *blocks["nback_conn"]["connectivity"]["contrasts"]["functions"],
+    ]
+    for contrast in contrasts:
+        used = re.findall(r"[A-Za-z0-9_]+back_[a-z]+|\b(?:negface|posface|neutface|place)\b", contrast)
+        assert used and set(used) <= labels - {"target_0back", "instruction"}, contrast
 
 
 def test_every_template_analysis_has_a_prefix_rule():
@@ -729,7 +745,7 @@ def test_a_zero_dummy_run_has_no_pad_to_remove(tmp_path, fake_tools):
     record = run(tmp_path)["runs"]["task-nback_run-01"]
     assert (record["n_remove"], record["n_frames"], record["dropped_events"]) == (8, 362, 0)
     ev = staged_events(tmp_path)
-    assert ev.loc[ev["trial_type"] == "place", "onset"].iloc[0] == pytest.approx(0.01)
+    assert ev.loc[ev["trial_type"] == "target_0back", "onset"].iloc[0] == pytest.approx(0.01)
 
 
 def test_rest_still_counts_its_frames_from_the_confounds(tmp_path, fake_tools):

@@ -65,8 +65,10 @@ the reason; the two tissue rows above are needed only for `fixed`.
 - **Motion:** translations first, in degrees, with first derivatives taken before
   trimming. ABCD's confounds already hold degrees, so rotations pass through unconverted. An
   isolated NaN becomes 999 so that FD censoring removes that TR.
-- **n-back events:** a 0-back cue takes its block's condition and a 2-back cue becomes
-  `instruction`. `dummy` rows are dropped.
+- **n-back events:** a 0-back cue becomes `target_0back`, pooled across stimuli, and a
+  2-back cue becomes `instruction`. `dummy` rows are dropped. A session has only 2 cues per
+  stimulus, too few to model or correlate alone. In `nback_conn`, `target_0back` is a
+  nuisance regressor, and the `ave_*` contrasts average 0-back and 2-back only.
 - **n-back runs** stay separate files, each with its own run-local events and motion and
   its `run_labels` entry (the framework's Mode A), so each run gets its own baseline and PSC
   mean. All are masked by the intersection of their brain masks, because they enter one
