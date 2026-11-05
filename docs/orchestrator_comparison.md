@@ -51,13 +51,12 @@ gh api repos/tjkeding/ABCD_fmri_orchestrator_S3/compare/5855f3f...main \
 
 Only settings that differ are listed. Each comes from `abcd/data/proc_config_final.yaml` and
 the orchestrator's `example_proc_config.yaml`. `nback_act` `hrf_model` (`GAM`), `rest_conn`
-`censor_prev_tr` (`true`) and `nback_conn` `cond_beta_labels` (no `instruction`) were adopted
-from the orchestrator, so they no longer differ.
+`censor_prev_tr` (`true`), `nback_conn` `cond_beta_labels` (no `instruction`) and its 29
+connectivity contrasts were adopted from the orchestrator, so they no longer differ.
 
 | Setting | Orchestrator | `abcd/` | Status |
 |---|---|---|---|
 | `rest_conn` `keep_run_res_dtseries` | `true` | `false` | Differs, unreviewed |
-| `nback_conn` connectivity contrasts | 29 | 17, all among the 29 | Differs, unreviewed |
 | `remove_previous` | `true` | `false` | Differs, by design: each session runs in an empty directory |
 | `global.num_cores` | `1` | `auto`, from the pod's CPU request | Differs, by design |
 

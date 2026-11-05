@@ -386,6 +386,12 @@ def test_template_models_the_pooled_cue_and_no_contrast_uses_a_cue():
         assert used and set(used) <= labels - {"target_0back", "instruction"}, contrast
 
 
+def test_nback_conn_has_the_same_29_contrasts_as_nback_act():
+    blocks = {b["name"]: b for b in template()["analyses"]}
+    assert blocks["nback_conn"]["connectivity"]["contrasts"] == blocks["nback_act"]["contrasts"]
+    assert len(blocks["nback_act"]["contrasts"]["labels"]) == 29
+
+
 def test_every_template_analysis_has_a_prefix_rule():
     assert {b["name"] for b in template()["analyses"]} <= set(sfl.ANALYSES)
 
