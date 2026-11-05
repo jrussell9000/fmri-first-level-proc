@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ledger:
+    name: differences from upstream are declared
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the check diffs against the upstream base
+
+      - name: Check FORK.md's ledger
+        run: python3 .github/scripts/check_fork_ledger.py
+
+  test:
+    name: lint + tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 = requires-python floor; 3.14 = the minor validated in tools.lock.yaml
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+
+      # setup-uv publishes no moving major tag (only vX.Y.Z), so pin the release commit
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+          activate-environment: true
+
+      - name: Install
+        run: uv pip install -e ".[dev,abcd]" ruff
+
+      # The fork's code only: upstream's modules stay as upstream wrote them.
+      - name: Ruff
+        run: ruff check --isolated --select F --line-length 120 fmri_first_level_proc/abcd tests .github/scripts
+
+      - name: Tests (real-AFNI tests skip without AFNI)
+        run: pytest tests -p no:cacheprovider
+
+  afni:
+    name: real-AFNI tests (AFNI 26.3.07, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          # cloudpipe's first-level pods run the arm64 AFNI build on Graviton
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # The AFNI tarball layer is large; the GitHub Actions cache keeps rebuilds to
+      # the cheap layers unless tests/docker/Dockerfile changes.
+      - name: Build test image
+        uses: docker/build-push-action@v7
+        with:
+          context: tests/docker
+          tags: fflp-afni:ci
+          load: true
+          cache-from: type=gha,scope=fflp-afni-${{ matrix.arch }}
+          cache-to: type=gha,scope=fflp-afni-${{ matrix.arch }},mode=max
+
+      - name: Real-AFNI tests
+        run: >
+          docker run --rm -v "$PWD":/src:ro -w /tmp fflp-afni:ci
+          pytest /src/tests -c /src/pyproject.toml --rootdir=/src -p no:cacheprovider
