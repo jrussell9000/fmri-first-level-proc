@@ -42,3 +42,13 @@
 !AID_LOG.md
 !.aid/
 !.aid/**
+
+# Fork additions (see FORK.md)
+!FORK.md
+!fmri_first_level_proc/abcd/
+!fmri_first_level_proc/abcd/**
+!docs/
+!docs/**
+!tests/
+!tests/**
+__pycache__/

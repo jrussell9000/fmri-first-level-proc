@@ -21,15 +21,19 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+abcd = ["nibabel", "scipy"]
 
 [project.scripts]
 fmri-first-level-proc = "fmri_first_level_proc.run_first_level:main"
+fmri-first-level-abcd = "fmri_first_level_proc.abcd.staging:main"
+fmri-first-level-abcd-validity = "fmri_first_level_proc.abcd.validity:main"
 
 [tool.setuptools.packages.find]
 include = ["fmri_first_level_proc*"]
 
 [tool.setuptools.package-data]
 fmri_first_level_proc = ["tools.lock.yaml"]
+"fmri_first_level_proc.abcd" = ["data/*.yaml"]
 
 [tool.pytest.ini_options]
 markers = [
@@ -41,4 +45,5 @@ markers = [
     "level5_adversarial: Edge cases, malformed input, boundary conditions",
     "level6_cross_stage: Multi-stage integration",
     "level7_pipeline: Full pipeline end-to-end",
+    "afni: Requires a real AFNI installation (skipped without one)",
 ]
