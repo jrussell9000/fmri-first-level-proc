@@ -15,8 +15,8 @@ Rest trims the frames its confounds flag as non-steady-state. n-back trims what 
 events' `dummy` row states, because ABCD's onsets count from the first non-dummy volume
 plus that row's length (see nback_trim), and uses only runs with valid E-Prime timing
 (see validity.py). Motion is written translations first in degrees with first
-derivatives, n-back cues are relabelled and `dummy` dropped, n-back runs are concatenated
-with their lengths recorded for the task analyses, and rest runs stay separate.
+derivatives, n-back cues are relabelled and `dummy` dropped, and every run stays a
+separate file with its run-local events.
 
 Exit codes: 0 every analysis finished (some may be recorded `failed` with exit 5, or
 skipped) and the result JSON is written; 1 a session failure, no result written.
@@ -327,18 +327,6 @@ def stage_events(events: pd.DataFrame, shift: float) -> tuple[pd.DataFrame, int]
     return ev.reset_index(drop=True), int(negative.sum())
 
 
-def concat_events(runs: list[tuple[pd.DataFrame, int]], tr: float) -> pd.DataFrame:
-    """Concatenate per-run events, offsetting each by the earlier runs' trimmed
-    length. `runs` is [(events, n_frames_after_trim), ...] in run order."""
-    parts, offset = [], 0.0
-    for ev, n_frames in runs:
-        shifted = ev.copy()
-        shifted["onset"] = shifted["onset"] + offset
-        parts.append(shifted)
-        offset += n_frames * tr
-    return pd.concat(parts, ignore_index=True)
-
-
 def block_mean_to_grid(prob: nib.Nifti1Image, ref: nib.Nifti1Image) -> np.ndarray:
     """Each `ref` voxel's mean over the 2x2x2 `prob` voxels it covers exactly.
 
@@ -467,9 +455,8 @@ def fill_config(
             continue
         pre = analysis_prefixes(subj, ses, name)
         paths = dict(staged[name])  # the n-back analyses share one staged dict
-        for key in ("run_lengths", "run_labels"):  # block-level keys, not paths
-            if key in paths:
-                block[key] = paths.pop(key)
+        if "run_labels" in paths:  # a block-level key
+            block["run_labels"] = paths.pop("run_labels")
         block["paths"] = paths
         block["out_dir"] = str(out_root / name)
         block["out_file_pre"] = pre["out_file_pre"]
@@ -648,8 +635,8 @@ class Session:
         raws = {r.rid: self.raw_inputs(r.rid, task) for r in runs}
         if task == "nback":
             self.screen_nback_runs(runs, raws, tr)
-        # n-back runs are concatenated, so each is masked by the used runs' intersection;
-        # rest runs stay separate and keep their own mask.
+        # n-back runs enter one model, so each is masked by the used runs' intersection;
+        # each rest run is denoised alone and keeps its own mask.
         mask = None
         used = [r for r in runs if not r.excluded]
         if task == "nback" and used:
@@ -665,34 +652,22 @@ class Session:
                 log("run-excluded", run=run.rid, reason=run.excluded)
         return runs, raws
 
-    def nback_paths(self, runs: list[Run], tr: float) -> dict | None:
+    def nback_paths(self, runs: list[Run]) -> dict | None:
         ok = [r for r in runs if not r.excluded]
         if not ok:
             return None
-        bold = self.work / "nback_concat_bold.nii.gz"
-        if len(ok) == 1:
-            bold = ok[0].bold
-        else:
-            run_cmd(["3dTcat", "-prefix", str(bold), *[str(r.bold) for r in ok]])
-        motion = self.work / "nback_concat_motion.1D"
-        np.savetxt(
-            motion,
-            np.vstack([np.loadtxt(r.motion, ndmin=2) for r in ok]),
-            fmt="%.10g",
-            delimiter="\t",
-        )
-        events = self.work / "nback_concat_events.tsv"
-        concat_events([(r.events, r.n_frames) for r in ok], tr).to_csv(
-            events, sep="\t", index=False
-        )
+        timings = []
+        for run in ok:
+            timing = self.work / f"{run.rid}_events.tsv"
+            run.events.to_csv(timing, sep="\t", index=False)
+            timings.append(str(timing))
         return {
-            "scan_path": str(bold),
-            "task_timing_path": str(events),
-            "motion_path": str(motion),
-            "run_lengths": [r.n_frames for r in ok],
+            "scan_paths": [str(r.bold) for r in ok],
+            "task_timing_paths": timings,
+            "motion_paths": [str(r.motion) for r in ok],
             "run_labels": [run_label(r.rid) for r in ok],
-            "CSF_path": None,
-            "WM_path": None,
+            "CSF_paths": None,
+            "WM_paths": None,
         }
 
     def rest_paths(self, runs: list[Run], raws: dict) -> tuple[dict | None, str | None]:
@@ -775,7 +750,7 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
 
     nback_runs, _ = sess.stage_task("nback", by_task.get("nback", []), tr)
     all_runs += nback_runs
-    nback = sess.nback_paths(nback_runs, tr)
+    nback = sess.nback_paths(nback_runs)
     for name in ("nback_act", "nback_conn"):
         if nback:
             staged[name] = nback

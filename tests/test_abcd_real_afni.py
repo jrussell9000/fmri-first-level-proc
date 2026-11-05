@@ -63,7 +63,7 @@ def _seed(root, rng):
     return runs
 
 
-def test_staging_commands_trim_mask_concatenate_and_average(tmp_path, monkeypatch):
+def test_staging_commands_trim_mask_and_average(tmp_path, monkeypatch):
     monkeypatch.setattr(staging, "CSF_MIN_VOXELS", 1)  # the 4^3 test grid holds only 64
     raw = tmp_path / "raw"
     _seed(raw, np.random.default_rng(0))
@@ -81,10 +81,11 @@ def test_staging_commands_trim_mask_concatenate_and_average(tmp_path, monkeypatc
     # 3dcalc's [n..$] kept the right frames: index n is the first one left.
     assert np.asarray(first.dataobj)[0, 0, 0, 0] == pytest.approx(N_NSS + 1)
 
-    paths = sess.nback_paths(nback, TR)
-    assert nib.load(paths["scan_path"]).shape[3] == 2 * (N_FRAMES - N_NSS)
-    assert np.loadtxt(paths["motion_path"]).shape == (2 * (N_FRAMES - N_NSS), 12)
-    assert paths["run_lengths"] == [N_FRAMES - N_NSS, N_FRAMES - N_NSS]
+    paths = sess.nback_paths(nback)
+    assert paths["run_labels"] == [1, 2]
+    for scan, motion in zip(paths["scan_paths"], paths["motion_paths"], strict=True):
+        assert nib.load(scan).shape[3] == N_FRAMES - N_NSS
+        assert np.loadtxt(motion).shape == (N_FRAMES - N_NSS, 12)
 
     rest, raws = sess.stage_task("rest", by_task["rest"], TR)
     rest_paths, reason = sess.rest_paths(rest, raws)

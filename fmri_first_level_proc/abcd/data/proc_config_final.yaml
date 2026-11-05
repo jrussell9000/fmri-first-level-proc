@@ -42,13 +42,16 @@ analyses:
     fd_threshold: 0.9            # Framewise displacement threshold (mm) for censoring
     censor_prev_tr: false        # true = also censor the TR before a high-motion TR
 
-    # -- Per-participant input file paths --
+    # -- Per-participant input file paths (one entry per run; the stager also sets run_labels) --
     paths:
-      scan_path: "/path/to/subj001_nback_concat.nii.gz"
-      task_timing_path: "/path/to/subj001_nback_timing.csv"
-      motion_path: "/path/to/subj001_nback_motion.txt"
-      CSF_path: null             # mean CSF BOLD signal per TR, or null
-      WM_path: null              # mean WM BOLD signal per TR, or null
+      scan_paths:
+        - "/path/to/subj001_nback_run1.nii.gz"
+      task_timing_paths:
+        - "/path/to/subj001_nback_run1_events.tsv"
+      motion_paths:
+        - "/path/to/subj001_nback_run1_motion.txt"
+      CSF_paths: null            # mean CSF BOLD signal per TR, or null
+      WM_paths: null             # mean WM BOLD signal per TR, or null
 
     # -- Output settings --
     out_dir: "/path/to/output/subj001/nback_act"
@@ -156,11 +159,14 @@ analyses:
     censor_prev_tr: false        # true = also censor the TR before a high-motion TR
 
     paths:
-      scan_path: "/path/to/subj001_nback_concat.nii.gz"
-      task_timing_path: "/path/to/subj001_nback_timing.csv"
-      motion_path: "/path/to/subj001_nback_motion.txt"
-      CSF_path: null            # mean CSF BOLD signal per TR, or null
-      WM_path: null             # mean WM BOLD signal per TR, or null
+      scan_paths:
+        - "/path/to/subj001_nback_run1.nii.gz"
+      task_timing_paths:
+        - "/path/to/subj001_nback_run1_events.tsv"
+      motion_paths:
+        - "/path/to/subj001_nback_run1_motion.txt"
+      CSF_paths: null            # mean CSF BOLD signal per TR, or null
+      WM_paths: null             # mean WM BOLD signal per TR, or null
 
     out_dir: "/path/to/output/subj001/nback_conn"
     out_file_pre: "subj001_nback_baseline"

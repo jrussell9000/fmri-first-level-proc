@@ -151,16 +151,6 @@ def test_events_shifted_before_zero_are_dropped_and_counted():
     assert (ev["onset"] >= 0).all()
 
 
-def test_concatenated_onsets_are_offset_by_earlier_runs():
-    first, _ = sfl.stage_events(nback_events(), 6.4)
-    second, _ = sfl.stage_events(nback_events(), 6.4)
-    cat = sfl.concat_events([(first, 362), (second, 362)], TR)
-    run2 = cat.iloc[len(first) :]
-    # 3.01 + 362 * 0.8 = 292.61 (spec: "Second-run onsets are offset")
-    trial = run2.loc[run2["trial_type"] == "0_back_posface", "onset"].iloc[0]
-    assert trial == pytest.approx(292.61)
-
-
 # ---------------------------------------------------------------------------
 # Tissue masks
 # ---------------------------------------------------------------------------
@@ -509,8 +499,29 @@ def reseed_run(tmp_path, rid, frames, nss):
     confounds(frames, nss).to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False)
 
 
-def staged_events(tmp_path) -> pd.DataFrame:
-    return pd.read_csv(tmp_path / "work" / "nback_concat_events.tsv", sep="\t")
+def staged_events(tmp_path, rid="task-nback_run-01") -> pd.DataFrame:
+    return pd.read_csv(tmp_path / "work" / f"{rid}_events.tsv", sep="\t")
+
+
+def nback_block(tmp_path) -> dict:
+    config = yaml.safe_load((tmp_path / "out" / f"{SUBJ}_{SES}_first_level_config.yaml").read_text())
+    return next(b for b in config["analyses"] if b["name"] == "nback_act")
+
+
+def test_each_nback_run_stays_separate_with_its_own_label_and_local_events(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    run(tmp_path)
+    block = nback_block(tmp_path)
+    assert block["run_labels"] == [1, 2]
+    assert "run_lengths" not in block and "run_labels" not in block["paths"]
+    for key in ("scan_paths", "task_timing_paths", "motion_paths"):
+        first, second = block["paths"][key]
+        assert "run-01" in Path(first).name and "run-02" in Path(second).name
+    assert block["paths"]["CSF_paths"] is None and block["paths"]["WM_paths"] is None
+    # Run 2's onsets count from run 2's own first frame, not the session's.
+    assert staged_events(tmp_path, "task-nback_run-02")["onset"].max() < 362 * TR
+    calls, _ = fake_tools
+    assert not any(c[0] == "3dTcat" for c in calls)
 
 
 def test_a_full_session_runs_every_analysis(tmp_path, fake_tools):
@@ -576,8 +587,7 @@ def test_one_bad_run_does_not_fail_the_session(tmp_path, fake_tools):
     result = run(tmp_path)
     assert "excluded" in result["runs"]["task-nback_run-02"]
     assert result["analyses"]["nback_act"]["status"] == "completed"
-    calls, _ = fake_tools
-    assert not any(c[0] == "3dTcat" for c in calls)  # one surviving run: no concat
+    assert nback_block(tmp_path)["run_labels"] == [1]
 
 
 def test_a_session_without_a_marker_is_refused(tmp_path, fake_tools):
@@ -734,8 +744,7 @@ def test_a_short_run_cannot_spill_into_the_next(tmp_path, fake_tools):
     result = run(tmp_path)
     assert result["runs"]["task-nback_run-01"] == {"excluded": "unexpected-frame-count"}
     assert result["analyses"]["nback_act"]["status"] == "completed"
-    calls, _ = fake_tools
-    assert not any(c[0] == "3dTcat" for c in calls)
+    assert nback_block(tmp_path)["run_labels"] == [2]
 
 
 # ---------------------------------------------------------------------------
@@ -749,8 +758,7 @@ def test_only_runs_the_table_allows_are_used(tmp_path, fake_tools):
     result = run(tmp_path, validity=validity)
     assert result["runs"]["task-nback_run-01"] == {"excluded": "other-run-has-valid-timing"}
     assert result["runs"]["task-nback_run-02"]["n_frames"] == 362
-    calls, _ = fake_tools
-    assert not any(c[0] == "3dTcat" for c in calls)
+    assert nback_block(tmp_path)["run_labels"] == [2]
 
 
 def test_a_run_with_no_row_is_excluded(tmp_path, fake_tools):
@@ -814,8 +822,7 @@ def test_an_empty_run_is_not_modelled_as_baseline(tmp_path, fake_tools):
     result = run(tmp_path)
     assert result["runs"]["task-nback_run-02"] == {"excluded": "no-task-events"}
     assert result["analyses"]["nback_act"]["status"] == "completed"
-    calls, _ = fake_tools
-    assert not any(c[0] == "3dTcat" for c in calls), "its BOLD must not enter the concatenation"
+    assert nback_block(tmp_path)["run_labels"] == [1], "its BOLD must not enter the model"
 
 
 STRAY = [(0.0, 6.4, "dummy"), (6.41, 2.9, "cue"), (9.41, 1.9, "2_back_place"), (325.7, 2.9, "cue")]
@@ -831,11 +838,11 @@ def test_a_stray_cue_returns_to_its_run(tmp_path, fake_tools):
     assert "excluded" not in first and "excluded" not in second
     assert first["cue_moved_to"] == "task-nback_run-02"
     assert second["cue_moved_from"] == "task-nback_run-01"
-    ev = staged_events(tmp_path)
-    instructions = ev.loc[ev["trial_type"] == "instruction", "onset"].to_numpy()
-    # run-01's cue at 0.01 s, and the moved one: 9.42 - 3.0 - 6.4, offset by run-01's 362 frames
-    np.testing.assert_allclose(instructions, [0.01, 0.02 + 362 * TR])
-    assert ev["onset"].max() < 2 * 362 * TR, "the stray cue left no event past the scan's end"
+    ev1, ev2 = staged_events(tmp_path), staged_events(tmp_path, "task-nback_run-02")
+    # run-01's cue at 0.01 s, and the moved one in run-02 at 9.42 - 3.0 - 6.4
+    np.testing.assert_allclose(ev1.loc[ev1["trial_type"] == "instruction", "onset"], [0.01])
+    np.testing.assert_allclose(ev2.loc[ev2["trial_type"] == "instruction", "onset"].iloc[:1], [0.02])
+    assert ev1["onset"].max() < 362 * TR, "the stray cue left no event past the run's end"
 
 
 def test_a_stray_cue_with_nowhere_to_go_still_excludes_its_run(tmp_path, fake_tools):
