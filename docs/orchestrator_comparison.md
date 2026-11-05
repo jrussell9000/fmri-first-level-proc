@@ -40,9 +40,9 @@ gh api repos/tjkeding/ABCD_fmri_orchestrator_S3/compare/5855f3f...main \
 | A run with no task events | Excluded as `unexpected_error`, so the session exits 1 and is retried | Excluded, `no-task-events`, and the session finishes | Differs, measured: a settled answer needs no retry |
 | A run with the wrong frame count for its scanner | Not found in the code by search | Excluded, `unexpected-frame-count` | Differs, measured |
 | Masking the BOLD | None; uses it as shipped | Each rest run by its brain mask; n-back runs by the intersection of theirs | Differs, unreviewed. The shipped BOLD is already zero outside each run's own mask (6 of 6 runs checked), so only the n-back intersection changes any voxel |
-| WM regressor | FastSurfer `label-WM_mask`, nearest-neighbour to the BOLD grid | WM probseg with dilated GM removed, block mean to the BOLD grid, above 0.99 | Differs, unreviewed |
-| CSF regressor | FastSurfer `label-CSF_mask`, nearest-neighbour to the BOLD grid | CSF probseg within that mask, block mean, first of 0.99, 0.9, 0.5 leaving 100 voxels | Differs, unreviewed |
-| Global signal | Mean within the run's brain mask, computed from the BOLD | The confounds file's `global_signal` | Differs, unreviewed |
+| WM regressor | FastSurfer `label-WM_mask`, nearest-neighbour to the BOLD grid | WM probseg with dilated GM removed, block mean to the BOLD grid, above 0.99 | Differs, unreviewed. On one session: about 87,000 voxels against 12,200, and correlation with the global signal 0.85-0.94 against 0.36-0.58 |
+| CSF regressor | FastSurfer `label-CSF_mask`, nearest-neighbour to the BOLD grid | CSF probseg within that mask, block mean, first of 0.99, 0.9, 0.5 leaving 100 voxels | Differs, unreviewed. On one session: 2,626 voxels against 896, all inside the orchestrator's, signal correlation 0.93-0.98. Together, the WM and CSF choices give a final rest matrix correlation of 0.97 |
+| Global signal | Mean within the run's brain mask, computed from the BOLD | The confounds file's `global_signal` | Differs, unreviewed. On one session the two correlate at 0.997 or better |
 | Non-finite motion | Excludes the run, `motion_non_finite` | Same | Adopted |
 | Rotation-unit check | Recomputes FD and compares it with the file's | None | Differs, unreviewed |
 | Pre-analysis QC | tSNR and carpet plots | None | Differs, unreviewed |
