@@ -302,6 +302,7 @@ analyses:
     remove_previous: false       # true = delete all files in out_dir before running
     average_type: "mean"         # "mean" or "median" for parcel averaging
     bandpass: [0.01, 0.1]        # Required: [low, high] Hz
+    use_sequenced_bandpass: false  # Filter and regress together in 3dTproject, which fails a run past about 31 censored TRs
     notch_filter_band: [0.31, 0.43]  # Respiration notch filter Hz band (null = disabled)
     motion_deriv_degree: 2       # Required: number of derivative orders (total motion cols = 6 * degree); e.g. 2 = base + 1st derivs = 12 cols
     keep_run_res_dtseries: false  # true = keep all run-specific dtseries (false to save space)

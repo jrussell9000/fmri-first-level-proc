@@ -64,9 +64,7 @@ the reason; the two tissue rows above are needed only for `fixed`.
   precedes its first cue, the cue moves back to 3.0 s before that trial.
 - **Motion:** translations first, in degrees, with first derivatives taken before
   trimming. ABCD's confounds already hold degrees, so rotations pass through unconverted. An
-  isolated NaN becomes 999, so that on n-back FD censoring removes that TR. A rest run with
-  one is excluded as `motion_non_finite`, because the notch filter would spread the 999 over
-  the whole run.
+  non-finite value left after trimming excludes the run as `motion_non_finite`.
 - **n-back events:** a 0-back cue becomes `target_0back`, pooled across stimuli, and a
   2-back cue becomes `instruction`. `dummy` rows are dropped. A session has only 2 cues per
   stimulus, too few to model or correlate alone. In `nback_conn`, `target_0back` and

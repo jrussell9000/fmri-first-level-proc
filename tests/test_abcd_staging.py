@@ -84,19 +84,25 @@ def test_motion_derivatives_come_from_the_untrimmed_series():
     np.testing.assert_allclose(m[0, 6:], base[8] - base[7])
 
 
-def test_an_isolated_nan_is_set_to_999():
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_non_finite_motion_excludes_the_run(bad):
     df = confounds(20, 0)
-    df.loc[5, "trans_x"] = np.nan
-    m = sfl.motion_matrix(df, 0)
-    assert m[5, 0] == 999.0
-    assert m[5, 6] == 999.0 and m[6, 6] == 999.0  # both derivative rows touching it
-
-
-def test_an_all_nan_motion_column_fails():
-    df = confounds(20, 0)
-    df["rot_y"] = np.nan
-    with pytest.raises(sfl.SessionError, match="rot_y"):
+    df.loc[5, "trans_x"] = bad
+    with pytest.raises(sfl.RunExcluded, match="motion_non_finite"):
         sfl.motion_matrix(df, 0)
+
+
+def test_a_nan_trimmed_away_does_not_exclude_the_run():
+    df = confounds(20, 8)
+    df.loc[2, "trans_x"] = np.nan
+    assert sfl.motion_matrix(df, 8).shape == (12, 12)
+
+
+def test_a_nan_just_before_the_trim_excludes_the_run_through_its_derivative():
+    df = confounds(20, 8)
+    df.loc[7, "trans_x"] = np.nan
+    with pytest.raises(sfl.RunExcluded, match="motion_non_finite"):
+        sfl.motion_matrix(df, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -624,16 +630,19 @@ def test_a_rest_run_with_nan_motion_is_excluded_and_the_session_finishes(tmp_pat
     assert result["analyses"]["nback_act"]["status"] == "completed"
 
 
-def test_an_nback_run_with_nan_motion_keeps_the_run_and_censors_the_frame(tmp_path, fake_tools):
+def test_an_nback_run_with_nan_motion_is_excluded_and_leaves_the_mask(tmp_path, fake_tools, monkeypatch):
     seed_session(tmp_path / "raw")
     path = tmp_path / "raw" / f"{SUBJ}_{SES}_task-nback_run-01_desc-confounds_timeseries.tsv"
     df = pd.read_csv(path, sep="\t")
     df.loc[100, "trans_x"] = np.nan
     df.to_csv(path, sep="\t", index=False)
+    masked = []
+    real = sfl.intersect_masks
+    monkeypatch.setattr(sfl, "intersect_masks", lambda paths, dest: masked.extend(paths) or real(paths, dest))
     result = run(tmp_path)
-    assert "excluded" not in result["runs"]["task-nback_run-01"]
-    motion = np.loadtxt(tmp_path / "work" / "task-nback_run-01_motion.1D")
-    assert motion[100 - N_NSS, 0] == sfl.MOTION_NAN
+    assert result["runs"]["task-nback_run-01"] == {"excluded": "motion_non_finite"}
+    assert nback_block(tmp_path)["run_labels"] == [2]
+    assert len(masked) == 1 and "task-nback_run-02" in Path(masked[0]).name
 
 
 def test_a_session_without_a_marker_is_refused(tmp_path, fake_tools):

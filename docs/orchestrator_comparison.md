@@ -43,8 +43,7 @@ gh api repos/tjkeding/ABCD_fmri_orchestrator_S3/compare/5855f3f...main \
 | WM regressor | FastSurfer `label-WM_mask`, nearest-neighbour to the BOLD grid | WM probseg with dilated GM removed, block mean to the BOLD grid, above 0.99 | Differs, unreviewed |
 | CSF regressor | FastSurfer `label-CSF_mask`, nearest-neighbour to the BOLD grid | CSF probseg within that mask, block mean, first of 0.99, 0.9, 0.5 leaving 100 voxels | Differs, unreviewed |
 | Global signal | Mean within the run's brain mask, computed from the BOLD | The confounds file's `global_signal` | Differs, unreviewed |
-| Non-finite motion on rest | Excludes the run, `motion_non_finite` | Same | Adopted: the notch filter would spread a placeholder across the run |
-| Non-finite motion on n-back | Excludes the run, `motion_non_finite` | Isolated NaN becomes 999, so FD censoring removes that frame | Differs, unreviewed |
+| Non-finite motion | Excludes the run, `motion_non_finite` | Same | Adopted |
 | Rotation-unit check | Recomputes FD and compares it with the file's | None | Differs, unreviewed |
 | Pre-analysis QC | tSNR and carpet plots | None | Differs, unreviewed |
 
@@ -52,8 +51,9 @@ gh api repos/tjkeding/ABCD_fmri_orchestrator_S3/compare/5855f3f...main \
 
 Only settings that differ are listed. Each comes from `abcd/data/proc_config_final.yaml` and
 the orchestrator's `example_proc_config.yaml`. `nback_act` `hrf_model` (`GAM`), `rest_conn`
-`censor_prev_tr` (`true`), `nback_conn` `cond_beta_labels` (no `instruction`) and its 29
-connectivity contrasts were adopted from the orchestrator, so they no longer differ.
+`censor_prev_tr` (`true`), `use_sequenced_bandpass` (`false`, with `bandpass: [0.01, 0.1]`),
+`nback_conn` `cond_beta_labels` (no `instruction`) and its 29 connectivity contrasts match the
+orchestrator.
 
 | Setting | Orchestrator | `abcd/` | Status |
 |---|---|---|---|

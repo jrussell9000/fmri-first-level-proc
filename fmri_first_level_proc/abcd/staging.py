@@ -68,7 +68,6 @@ ANALYSES = {
 }
 
 MOTION_BASE = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z"]
-MOTION_NAN = 999.0  # Stands in for a missing motion value
 EXCLUDE_CONDITIONS = ("dummy",)
 # n-back timing. ABCD's GE discard moved from Hagler et al. 2019's 5 and 16 frames to 4 and
 # 15 (ABCD 6.0 release notes), and each event file's `dummy` row states what applies to it.
@@ -182,19 +181,18 @@ def motion_matrix(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
     framewise_displacement equals sum|d trans| + (pi/180)*50*sum|d rot| on these columns.
 
     Derivatives are taken on the untrimmed series (row 1 = 0) and trimmed with it,
-    as the retired orchestrator did. NaN becomes MOTION_NAN after trimming, so on
-    n-back the FD threshold censors that TR. stage_run excludes a rest run that has one.
+    as the retired orchestrator did. A non-finite value left after trimming excludes
+    the run, as ABCD_fmri_orchestrator_S3 does.
     """
     missing = [c for c in MOTION_BASE if c not in confounds.columns]
     if missing:
         raise SessionError(f"confounds lack motion columns {missing}")
     base = confounds[MOTION_BASE].to_numpy(dtype=float)
-    if np.isnan(base).all(axis=0).any():
-        dead = [c for c, d in zip(MOTION_BASE, np.isnan(base).all(axis=0), strict=True) if d]
-        raise SessionError(f"motion columns entirely NaN: {dead}")
     deriv = np.vstack([np.zeros((1, 6)), np.diff(base, axis=0)])
     out = np.hstack([base, deriv])[n_remove:]
-    return np.where(np.isnan(out), MOTION_NAN, out)
+    if not np.isfinite(out).all():
+        raise RunExcluded("motion_non_finite")
+    return out
 
 
 def global_signal(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
@@ -522,9 +520,6 @@ def stage_run(run: Run, raw: dict[str, Path], tr: float, mask: Path, work: Path)
     if run.n_frames < 2:
         raise SessionError(f"{run.rid}: trimming {run.n_remove} frames leaves {run.n_frames}")
     motion = motion_matrix(confounds, run.n_remove)
-    if run.task == "rest" and (motion == MOTION_NAN).any():
-        # The rest notch filter would spread the placeholder over every frame of the run.
-        raise RunExcluded("motion_non_finite")
     run.bold = work / f"{run.rid}_bold.nii.gz"
     run_cmd(
         [
@@ -628,6 +623,7 @@ class Session:
                 run.n_remove, run.onset_shift = nback_trim(
                     run.raw_events, nss_count(confounds), frames[run.rid], tr
                 )
+                motion_matrix(confounds, run.n_remove)  # here, so the run leaves the mask too
             except RunExcluded as exc:
                 run.excluded = str(exc)
                 log("run-excluded", run=run.rid, reason=run.excluded)
