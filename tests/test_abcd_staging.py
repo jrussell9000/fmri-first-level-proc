@@ -374,7 +374,7 @@ def test_run_label_is_the_run_number():
 def test_template_models_the_pooled_cue_and_no_contrast_uses_a_cue():
     blocks = {b["name"]: b for b in template()["analyses"]}
     assert "target_0back" in blocks["nback_act"]["cond_labels"]
-    assert "target_0back" not in blocks["nback_conn"]["cond_beta_labels"]
+    assert not {"target_0back", "instruction"} & set(blocks["nback_conn"]["cond_beta_labels"])
     labels = set(blocks["nback_act"]["cond_labels"])
     assert not labels & {"negface", "posface", "neutface", "place"}
     contrasts = [
@@ -559,7 +559,7 @@ def test_a_full_session_runs_every_analysis(tmp_path, fake_tools):
     rest = next(b for b in config["analyses"] if b["name"] == "rest_conn")
     [gs] = rest["paths"]["GS_paths"]  # GSR, as the orchestrator always passed it
     assert np.loadtxt(gs).shape == (N_FRAMES - N_NSS,)
-    assert rest["censor_prev_tr"] is False and rest["fd_threshold"] == 0.4
+    assert rest["censor_prev_tr"] is True and rest["fd_threshold"] == 0.4
 
 
 def test_stale_probseg_skips_rest_not_the_session(tmp_path, fake_tools):

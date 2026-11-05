@@ -64,7 +64,7 @@ analyses:
     # -- Block settings --
     remove_previous: false       # true = delete all files in out_dir before running
     average_type: "mean"         # "mean" or "median" for parcel averaging
-    hrf_model: "dmBLOCK"             # "GAM" | "BLOCK" | "dmBLOCK" | "SPMG1" | "custom"
+    hrf_model: "GAM"             # "GAM" | "BLOCK" | "dmBLOCK" | "SPMG1" | "custom"
     custom_hrf: null             # Required when hrf_model is "custom", e.g. "TENT(0,14,8)"
     include_motion_derivs: false # true = use first 12 columns (base + derivs); false = use first 6 columns only
     use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM) as additional regressors
@@ -173,9 +173,9 @@ analyses:
     out_file_pre: "subj001_nback_baseline"
 
     # -- Condition beta labels --
-    # Conditions for which trial-level beta series will be estimated. target_0back is
-    # modelled as a nuisance regressor, because it is absent from this list.
-    cond_beta_labels: ["0_back_negface","0_back_posface","0_back_neutface","0_back_place","2_back_negface","2_back_posface","2_back_neutface","2_back_place","instruction"]
+    # Conditions for which trial-level beta series will be estimated. target_0back and
+    # instruction are modelled as nuisance regressors, because they are absent from this list.
+    cond_beta_labels: ["0_back_negface","0_back_posface","0_back_neutface","0_back_place","2_back_negface","2_back_posface","2_back_neutface","2_back_place"]
 
     # -- Block settings --
     remove_previous: false       # true = delete all files in out_dir before running
@@ -251,9 +251,7 @@ analyses:
 
     # -- Per-analysis censoring parameters --
     fd_threshold: 0.4            # Framewise displacement threshold (mm) for censoring
-    # false, not true: the retired orchestrator overwrote this block's value with
-    # its own config's `censor_prev_tr: false`, so every earlier rest run used false.
-    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
+    censor_prev_tr: true         # true = also censor the TR before a high-motion TR
 
     # -- Per-run input file paths (all lists must be the same length) --
     paths:
