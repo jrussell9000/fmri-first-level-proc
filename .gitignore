@@ -45,6 +45,8 @@
 
 # Fork additions (see FORK.md)
 !FORK.md
+!.github/
+!.github/**
 !fmri_first_level_proc/abcd/
 !fmri_first_level_proc/abcd/**
 !docs/
