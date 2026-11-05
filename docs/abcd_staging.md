@@ -40,7 +40,7 @@ func derivatives, or any files with the same names:
 | `_complete.json` | Its `runs` keys name the session's runs |
 | `{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.nii.gz` | BOLD |
 | `{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_brainmask.nii.gz` | Brain mask |
-| `{subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv` | Motion, `global_signal`, `non_steady_state_outlier_*` |
+| `{subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv` | Motion, `non_steady_state_outlier_*` |
 | `{subj}_{ses}_task-nback_{run}_events.tsv` | n-back timing |
 | `{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{GM,WM,CSF}_probseg.nii.gz` | Rest tissue masks |
 | `{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-CSF_mask.nii.gz` | Ventricle restriction |
@@ -79,7 +79,8 @@ the reason; the two tissue rows above are needed only for `fixed`.
 - **Rest CSF mask:** restricted to the ventricles with FastSurfer's `label-CSF_mask`, then
   kept above the first of 0.99, 0.9 and 0.5 that leaves at least 100 voxels. This departs
   from fMRIPrep, and is likely specific to ABCD.
-- **Rest global signal:** the confounds' `global_signal`, trimmed.
+- **Rest global signal:** the mean of the trimmed BOLD within the run's brain mask, as the
+  orchestrator computes it.
 - **Analyses:** fills `abcd/data/proc_config_final.yaml` (or `--template`) and runs each
   block through the `fmri-first-level-proc` CLI, once per block.
 

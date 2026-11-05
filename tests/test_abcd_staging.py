@@ -36,22 +36,11 @@ def confounds(n_frames: int, n_nss: int, seed: int = 0) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     cols = {c: rng.normal(size=n_frames) for c in reversed(sfl.MOTION_BASE)}  # odd order
     cols.update({f"non_steady_state_outlier_{i:02d}": np.eye(n_frames)[i] for i in range(n_nss)})
-    cols["global_signal"] = np.arange(n_frames, dtype=float) + 100.0
     return pd.DataFrame(cols)
 
 
 def test_nss_count_is_the_outlier_column_count():
     assert sfl.nss_count(confounds(20, 8)) == 8
-
-
-def test_global_signal_is_the_trimmed_confound():
-    """Rest keeps the retired orchestrator's GSR: global_signal, NSS-trimmed."""
-    np.testing.assert_array_equal(sfl.global_signal(confounds(20, 8), 8), np.arange(8, 20) + 100.0)
-
-
-def test_missing_global_signal_fails_the_run():
-    with pytest.raises(sfl.SessionError, match="global_signal"):
-        sfl.global_signal(confounds(20, 0).drop(columns="global_signal"), 0)
 
 
 def test_no_nss_columns_means_no_trim():
@@ -569,8 +558,14 @@ def test_a_full_session_runs_every_analysis(tmp_path, fake_tools):
     config = yaml.safe_load((tmp_path / "out" / f"{SUBJ}_{SES}_first_level_config.yaml").read_text())
     assert config["global"]["template_path"] == ATLAS
     rest = next(b for b in config["analyses"] if b["name"] == "rest_conn")
-    [gs] = rest["paths"]["GS_paths"]  # GSR, as the orchestrator always passed it
+    [gs] = rest["paths"]["GS_paths"]  # GSR, as the orchestrator always passes it
     assert np.loadtxt(gs).shape == (N_FRAMES - N_NSS,)
+    maskaves = [c for c in calls if c[0] == "3dmaskave"]
+    assert len(maskaves) == 3  # WM, CSF, then the global signal
+    gs_mask = nib.load(maskaves[2][maskaves[2].index("-mask") + 1])
+    brainmask = nib.load(tmp_path / "raw" / f"{SUBJ}_{SES}_task-rest_run-01_{sfl.SPACE}_brainmask.nii.gz")
+    np.testing.assert_array_equal(np.asarray(gs_mask.dataobj) > 0, np.asarray(brainmask.dataobj) > 0)
+    assert maskaves[2][-1].endswith("task-rest_run-01_bold.nii.gz")
     assert rest["censor_prev_tr"] is True and rest["fd_threshold"] == 0.4
 
 

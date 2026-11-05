@@ -51,7 +51,6 @@ def _seed(root, rng):
         _save(f"{stem}_space-MNI152NLin2009cAsym_brainmask.nii.gz", np.ones((4, 4, 4), np.uint8), REF_AFFINE)
         cols = {c: rng.normal(size=N_FRAMES) for c in staging.MOTION_BASE}
         cols.update({f"non_steady_state_outlier_{i:02d}": np.eye(N_FRAMES)[i] for i in range(N_NSS)})
-        cols["global_signal"] = np.arange(N_FRAMES, dtype=float) + 100.0
         pd.DataFrame(cols).to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False)
         if "nback" in rid:
             (root / f"{SUBJ}_{SES}_{rid}_events.tsv").write_text(EVENTS)
@@ -92,3 +91,8 @@ def test_staging_commands_trim_mask_and_average(tmp_path, monkeypatch):
     assert reason is None
     for key in ("WM_paths", "CSF_paths", "GS_paths"):
         assert np.loadtxt(rest_paths[key][0]).shape == (N_FRAMES - N_NSS,)
+    # The global signal is the trimmed BOLD's mean within the run's brain mask.
+    trimmed = np.asarray(nib.load(str(rest[0].bold)).dataobj)
+    np.testing.assert_allclose(
+        np.loadtxt(rest_paths["GS_paths"][0]), trimmed.mean(axis=(0, 1, 2)), rtol=1e-3
+    )

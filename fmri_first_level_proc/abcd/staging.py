@@ -195,18 +195,6 @@ def motion_matrix(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
     return out
 
 
-def global_signal(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
-    """The rest GSR regressor: the confounds' `global_signal` (mean within the brain
-    mask), trimmed. The retired orchestrator passed this as GS_paths for every rest
-    run, overriding the template's `GS_paths: null`, so rest has always used GSR."""
-    if "global_signal" not in confounds.columns:
-        raise SessionError("confounds lack global_signal")
-    gs = confounds["global_signal"].to_numpy(dtype=float)[n_remove:]
-    if np.isnan(gs).any():
-        raise SessionError("global_signal has NaN")
-    return gs
-
-
 _NBACK = re.compile(r"^(\d+)_back_(.+)$")
 
 
@@ -489,7 +477,6 @@ class Run:
     n_frames: int = 0
     bold: Path | None = None
     motion: Path | None = None
-    gs: Path | None = None  # rest only: the trimmed global_signal confound
     events: pd.DataFrame | None = None
     brainmask: Path | None = None
     dropped_events: int = 0
@@ -538,9 +525,6 @@ def stage_run(run: Run, raw: dict[str, Path], tr: float, mask: Path, work: Path)
     )
     run.motion = work / f"{run.rid}_motion.1D"
     np.savetxt(run.motion, motion, fmt="%.10g", delimiter="\t")
-    if run.task == "rest":
-        run.gs = work / f"{run.rid}_gs.1D"
-        np.savetxt(run.gs, global_signal(confounds, run.n_remove), fmt="%.10g")
     if run.raw_events is not None:
         run.events, run.dropped_events = stage_events(run.raw_events, run.onset_shift)
 
@@ -688,7 +672,7 @@ class Session:
         label = f"{self.subj}_{self.ses}_{SPACE_RES1}_label-CSF_mask.nii.gz"
         csf_label = nib.load(str(self.path(label)))
         gm_exclusion = dilated_gm(prob["GM"])  # once: the probseg is per session
-        csf, wm = [], []
+        csf, wm, gs = [], [], []
         for run in ok:  # per session, but each run has its own brain mask
             ref = nib.load(str(raws[run.rid]["brainmask"]))
             masks, reason, csf_threshold = tissue_masks_from_probseg(
@@ -702,12 +686,14 @@ class Session:
             }
             wm.append(str(maskave(run.bold, masks["WM"], ref, self.work / f"{run.rid}_wm.1D")))
             csf.append(str(maskave(run.bold, masks["CSF"], ref, self.work / f"{run.rid}_csf.1D")))
+            brain = np.asarray(ref.dataobj) > 0
+            gs.append(str(maskave(run.bold, brain, ref, self.work / f"{run.rid}_gs.1D")))
         return {
             "scan_paths": [str(r.bold) for r in ok],
             "motion_paths": [str(r.motion) for r in ok],
             "CSF_paths": csf,
             "WM_paths": wm,
-            "GS_paths": [str(r.gs) for r in ok],  # see global_signal(): GSR as before
+            "GS_paths": gs,
             "run_labels": [run_label(r.rid) for r in ok],
         }, None
 
