@@ -1,0 +1,54 @@
+{
+  "icc": 0.007083979937773608,
+  "qc_fc": 0.0019821648270624786,
+  "qc_fc_all_data": 0.0024276462061975667,
+  "icc_spread_9p_minus_production": 0.07537423804954951,
+  "qc_fc_spread_9p_minus_production": -0.0008793424343661038,
+  "first_pass_icc": 0.07537423804954951,
+  "first_pass_qc_fc": 0.0019821648270624786,
+  "sessions_loaded": 200,
+  "sessions_skipped": 16,
+  "retention": {
+    "bandpass": {
+      "runs_kept": 447,
+      "runs_total": 708,
+      "sessions_losing_a_run": 115,
+      "sessions_losing_all": 25,
+      "median_kept_frames": 1071.0
+    },
+    "anchor_9p": {
+      "runs_kept": 482,
+      "runs_total": 708,
+      "sessions_losing_a_run": 100,
+      "sessions_losing_all": 20,
+      "median_kept_frames": 1084.5
+    }
+  },
+  "anchor": {
+    "n_sessions": 135,
+    "arms": {
+      "bandpass": {
+        "median_edge_icc": 0.26352310635127096,
+        "fingerprint_accuracy": 0.9703703703703703,
+        "median_abs_qc_fc": 0.06494545388547028,
+        "fdr_fraction_qc_fc": 0.0,
+        "qc_fc_distance_dependence": -0.04164050944396372
+      },
+      "anchor_9p": {
+        "median_edge_icc": 0.3388973444008205,
+        "fingerprint_accuracy": 0.9962962962962962,
+        "median_abs_qc_fc": 0.06406611145110418,
+        "fdr_fraction_qc_fc": 0.0,
+        "qc_fc_distance_dependence": -0.004092074051729461,
+        "icc_minus_reference_ci": [
+          0.061665659723075666,
+          0.08278600731255102
+        ],
+        "qc_fc_minus_reference_ci": [
+          -0.0043118908711737075,
+          0.001597782856720715
+        ]
+      }
+    }
+  }
+}
