@@ -43,7 +43,8 @@ gh api repos/tjkeding/ABCD_fmri_orchestrator_S3/compare/5855f3f...main \
 | WM regressor | FastSurfer `label-WM_mask`, nearest-neighbour to the BOLD grid | WM probseg with dilated GM removed, block mean to the BOLD grid, above 0.99 | Differs, unreviewed |
 | CSF regressor | FastSurfer `label-CSF_mask`, nearest-neighbour to the BOLD grid | CSF probseg within that mask, block mean, first of 0.99, 0.9, 0.5 leaving 100 voxels | Differs, unreviewed |
 | Global signal | Mean within the run's brain mask, computed from the BOLD | The confounds file's `global_signal` | Differs, unreviewed |
-| Non-finite motion | Excludes the run | Isolated NaN becomes 999, so FD censoring removes that frame | Differs, unreviewed. On rest the notch filter spreads the 999 across the run, so every frame is censored and the run is lost anyway |
+| Non-finite motion on rest | Excludes the run, `motion_non_finite` | Same | Adopted: the notch filter would spread a placeholder across the run |
+| Non-finite motion on n-back | Excludes the run, `motion_non_finite` | Isolated NaN becomes 999, so FD censoring removes that frame | Differs, unreviewed |
 | Rotation-unit check | Recomputes FD and compares it with the file's | None | Differs, unreviewed |
 | Pre-analysis QC | tSNR and carpet plots | None | Differs, unreviewed |
 

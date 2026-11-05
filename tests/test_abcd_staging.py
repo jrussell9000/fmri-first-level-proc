@@ -612,6 +612,30 @@ def test_one_bad_run_does_not_fail_the_session(tmp_path, fake_tools):
     assert nback_block(tmp_path)["run_labels"] == [1]
 
 
+def test_a_rest_run_with_nan_motion_is_excluded_and_the_session_finishes(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    path = tmp_path / "raw" / f"{SUBJ}_{SES}_task-rest_run-01_desc-confounds_timeseries.tsv"
+    df = pd.read_csv(path, sep="\t")
+    df.loc[100, "trans_x"] = np.nan
+    df.to_csv(path, sep="\t", index=False)
+    result = run(tmp_path)
+    assert result["runs"]["task-rest_run-01"] == {"excluded": "motion_non_finite"}
+    assert result["analyses"]["rest_conn"] == {"status": "skipped", "reason": "no-rest-runs"}
+    assert result["analyses"]["nback_act"]["status"] == "completed"
+
+
+def test_an_nback_run_with_nan_motion_keeps_the_run_and_censors_the_frame(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    path = tmp_path / "raw" / f"{SUBJ}_{SES}_task-nback_run-01_desc-confounds_timeseries.tsv"
+    df = pd.read_csv(path, sep="\t")
+    df.loc[100, "trans_x"] = np.nan
+    df.to_csv(path, sep="\t", index=False)
+    result = run(tmp_path)
+    assert "excluded" not in result["runs"]["task-nback_run-01"]
+    motion = np.loadtxt(tmp_path / "work" / "task-nback_run-01_motion.1D")
+    assert motion[100 - N_NSS, 0] == sfl.MOTION_NAN
+
+
 def test_a_session_without_a_marker_is_refused(tmp_path, fake_tools):
     (tmp_path / "raw").mkdir()
     with pytest.raises(sfl.SessionError, match="_complete.json"):

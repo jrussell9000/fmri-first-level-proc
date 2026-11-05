@@ -68,6 +68,7 @@ ANALYSES = {
 }
 
 MOTION_BASE = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z"]
+MOTION_NAN = 999.0  # Stands in for a missing motion value
 EXCLUDE_CONDITIONS = ("dummy",)
 # n-back timing. ABCD's GE discard moved from Hagler et al. 2019's 5 and 16 frames to 4 and
 # 15 (ABCD 6.0 release notes), and each event file's `dummy` row states what applies to it.
@@ -181,8 +182,8 @@ def motion_matrix(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
     framewise_displacement equals sum|d trans| + (pi/180)*50*sum|d rot| on these columns.
 
     Derivatives are taken on the untrimmed series (row 1 = 0) and trimmed with it,
-    as the retired orchestrator did. NaN becomes 999.0 after trimming so the
-    FD threshold censors that TR.
+    as the retired orchestrator did. NaN becomes MOTION_NAN after trimming, so on
+    n-back the FD threshold censors that TR. stage_run excludes a rest run that has one.
     """
     missing = [c for c in MOTION_BASE if c not in confounds.columns]
     if missing:
@@ -193,7 +194,7 @@ def motion_matrix(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
         raise SessionError(f"motion columns entirely NaN: {dead}")
     deriv = np.vstack([np.zeros((1, 6)), np.diff(base, axis=0)])
     out = np.hstack([base, deriv])[n_remove:]
-    return np.where(np.isnan(out), 999.0, out)
+    return np.where(np.isnan(out), MOTION_NAN, out)
 
 
 def global_signal(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
@@ -520,6 +521,10 @@ def stage_run(run: Run, raw: dict[str, Path], tr: float, mask: Path, work: Path)
     run.n_frames = frames - run.n_remove
     if run.n_frames < 2:
         raise SessionError(f"{run.rid}: trimming {run.n_remove} frames leaves {run.n_frames}")
+    motion = motion_matrix(confounds, run.n_remove)
+    if run.task == "rest" and (motion == MOTION_NAN).any():
+        # The rest notch filter would spread the placeholder over every frame of the run.
+        raise RunExcluded("motion_non_finite")
     run.bold = work / f"{run.rid}_bold.nii.gz"
     run_cmd(
         [
@@ -537,7 +542,7 @@ def stage_run(run: Run, raw: dict[str, Path], tr: float, mask: Path, work: Path)
         ]
     )
     run.motion = work / f"{run.rid}_motion.1D"
-    np.savetxt(run.motion, motion_matrix(confounds, run.n_remove), fmt="%.10g", delimiter="\t")
+    np.savetxt(run.motion, motion, fmt="%.10g", delimiter="\t")
     if run.task == "rest":
         run.gs = work / f"{run.rid}_gs.1D"
         np.savetxt(run.gs, global_signal(confounds, run.n_remove), fmt="%.10g")
@@ -645,6 +650,9 @@ class Session:
         for run in used:
             try:
                 stage_run(run, raws[run.rid], tr, mask or raws[run.rid]["brainmask"], self.work)
+            except RunExcluded as exc:
+                run.excluded = str(exc)
+                log("run-excluded", run=run.rid, reason=run.excluded)
             except (SessionError, subprocess.CalledProcessError, ValueError, KeyError) as exc:
                 # A cue with no following trial lands here: a shape repair_stray_cue left.
                 run.excluded, run.failed = f"{type(exc).__name__}: {exc}", True
