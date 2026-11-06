@@ -44,7 +44,7 @@ gh api repos/tjkeding/ABCD_fmri_orchestrator_S3/compare/5855f3f...main \
 | WM and CSF regressors | FastSurfer `label-WM_mask` and `label-CSF_mask`, nearest-neighbour to the BOLD grid, within the run's brain mask; an empty mask excludes the run, `tissue_mask_empty` | Same | Adopted in `4.0.0+cp.2`, which retired probseg-based masks (fMRIPrep's WM, ventricle-restricted CSF). Compared on 268 baseline sessions with GSR off ([`rest-mask-comparison`](https://github.com/jrussell9000/fmri-first-level-proc/tree/rest-mask-comparison/benchmarks/rest_masks)), the probseg masks did not meet the rule fixed beforehand: split-half ICC was higher, but the QC-FC interval was too wide to show motion no worse, and fingerprinting, mean z and network contrast all pointed to retained global signal |
 | Global signal regression | Off: `GS_paths: null` in its config | Off | Adopted. It was on here until `4.0.0+cp.2` |
 | Non-finite motion | Excludes the run, `motion_non_finite` | Same | Adopted |
-| Rotation-unit check | Recomputes FD and compares it with the file's | None | Differs, unreviewed |
+| Rotation-unit check | Power FD recomputed with rotations in degrees must match the file's `framewise_displacement` within 1e-6 mm, or the run is excluded, `producer_fd_inconsistent` | Same | Adopted in `4.0.0+cp.5`. On 141 sampled ABCD runs (94 rest, 47 n-back, 3 makes) every run passed, with the largest difference 2e-15 mm, so it excludes nothing today |
 | Pre-analysis QC | tSNR and carpet plots | None | Differs, unreviewed |
 
 ## Analysis settings
@@ -57,7 +57,7 @@ orchestrator.
 
 | Setting | Orchestrator | `abcd/` | Status |
 |---|---|---|---|
-| `rest_conn` `keep_run_res_dtseries` | `true` | `false` | Differs, unreviewed |
+| `rest_conn` `keep_run_res_dtseries` | `true` | `false` | Differs, reviewed: kept by decision on 2026-11-06. `false` still keeps the concatenated residual series, voxel and parcel, with zeros at censored frames; `true` adds only per-run copies, about 0.8 GB per session |
 | `remove_previous` | `true` | `false` | Differs, by design: each session runs in an empty directory |
 | `global.num_cores` | `1` | `auto`, from the pod's CPU request | Differs, by design |
 

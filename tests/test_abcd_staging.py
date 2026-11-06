@@ -93,6 +93,40 @@ def test_a_nan_just_before_the_trim_excludes_the_run_through_its_derivative():
         sfl.motion_matrix(df, 8)
 
 
+def with_fd(df: pd.DataFrame, rotations_in: str = "degrees") -> pd.DataFrame:
+    """The confounds with ABCD's framewise_displacement: Power FD, 50 mm head. With
+    `radians`, the file's FD treats the rotations as radians, as a unit mix-up would."""
+    d = np.abs(np.diff(df[sfl.MOTION_BASE].to_numpy(), axis=0))
+    d[:, 3:] *= 50.0 * (np.pi / 180 if rotations_in == "degrees" else 1.0)
+    return df.assign(framewise_displacement=np.concatenate([[np.nan], d.sum(axis=1)]))
+
+
+def test_fd_from_degree_rotations_passes_the_units_check():
+    assert sfl.motion_units_check(with_fd(confounds(20, 0))) == "producer_fd_consistent"
+
+
+def test_fd_from_radian_rotations_excludes_the_run():
+    with pytest.raises(sfl.RunExcluded, match="producer_fd_inconsistent"):
+        sfl.motion_matrix(with_fd(confounds(20, 0), "radians"), 0)
+
+
+def test_the_units_check_tolerance_is_the_orchestrators():
+    df = with_fd(confounds(20, 0))
+    df.loc[5, "framewise_displacement"] += 5e-7  # inside 1e-6 mm
+    assert sfl.motion_units_check(df) == "producer_fd_consistent"
+    df.loc[5, "framewise_displacement"] += 1e-6  # now 1.5e-6 mm out
+    with pytest.raises(sfl.RunExcluded, match="producer_fd_inconsistent"):
+        sfl.motion_units_check(df)
+
+
+@pytest.mark.parametrize("fd", [None, np.nan])
+def test_with_no_usable_fd_the_units_check_is_not_checkable(fd):
+    df = confounds(20, 0)
+    if fd is not None:
+        df["framewise_displacement"] = fd
+    assert sfl.motion_units_check(df) == "not_checkable"
+
+
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
@@ -303,7 +337,7 @@ def seed_session(root, runs=("task-nback_run-01", "task-nback_run-02", "task-res
             np.ones((4, 4, 4), np.uint8),
             REF_AFFINE,
         )
-        confounds(N_FRAMES, N_NSS).to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False)
+        with_fd(confounds(N_FRAMES, N_NSS)).to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False)
         if "nback" in rid:
             nback_events().to_csv(f"{stem}_events.tsv", sep="\t", index=False)
     for tissue in sfl.TISSUES:
@@ -382,7 +416,7 @@ def reseed_run(tmp_path, rid, frames, nss):
         REF_AFFINE,
         (2, 2, 2, TR),
     )
-    confounds(frames, nss).to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False)
+    with_fd(confounds(frames, nss)).to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False)
 
 
 def staged_events(tmp_path, rid="task-nback_run-01") -> pd.DataFrame:
@@ -444,7 +478,7 @@ def test_an_empty_tissue_mask_excludes_only_its_rest_run(tmp_path, fake_tools, m
 
     monkeypatch.setattr(sfl, "tissue_regressor", empty_for_run_one)
     result = run(tmp_path)
-    assert result["runs"]["task-rest_run-01"] == {"excluded": "tissue_mask_empty"}
+    assert result["runs"]["task-rest_run-01"]["excluded"] == "tissue_mask_empty"
     assert result["analyses"]["rest_conn"]["status"] == "completed"
     config = yaml.safe_load((tmp_path / "out" / f"{SUBJ}_{SES}_first_level_config.yaml").read_text())
     rest = next(b for b in config["analyses"] if b["name"] == "rest_conn")
@@ -456,7 +490,7 @@ def test_a_session_whose_rest_masks_are_all_empty_still_runs_nback(tmp_path, fak
     seed_session(tmp_path / "raw")
     save_nifti(tmp_path / "raw" / sfl.tissue_mask_name(SUBJ, SES, "WM"), np.zeros((8, 8, 8), np.uint8), LABEL_AFFINE)
     result = run(tmp_path)
-    assert result["runs"]["task-rest_run-01"] == {"excluded": "tissue_mask_empty"}
+    assert result["runs"]["task-rest_run-01"]["excluded"] == "tissue_mask_empty"
     assert result["analyses"]["rest_conn"] == {"status": "skipped", "reason": "no-rest-runs"}
     assert result["analyses"]["nback_act"]["status"] == "completed"
 
@@ -556,6 +590,19 @@ def test_a_rest_run_with_nan_motion_is_excluded_and_the_session_finishes(tmp_pat
     assert result["runs"]["task-rest_run-01"] == {"excluded": "motion_non_finite"}
     assert result["analyses"]["rest_conn"] == {"status": "skipped", "reason": "no-rest-runs"}
     assert result["analyses"]["nback_act"]["status"] == "completed"
+
+
+@pytest.mark.parametrize("rid", ["task-rest_run-01", "task-nback_run-02"])
+def test_a_run_whose_fd_says_radians_is_excluded_and_others_record_the_check(tmp_path, fake_tools, rid):
+    seed_session(tmp_path / "raw")
+    path = tmp_path / "raw" / f"{SUBJ}_{SES}_{rid}_desc-confounds_timeseries.tsv"
+    with_fd(pd.read_csv(path, sep="\t").drop(columns="framewise_displacement"), "radians").to_csv(
+        path, sep="\t", index=False
+    )
+    runs = run(tmp_path)["runs"]
+    assert runs[rid] == {"excluded": "producer_fd_inconsistent"}
+    kept = [r for r in ("task-nback_run-01", "task-nback_run-02", "task-rest_run-01") if r != rid]
+    assert {runs[r]["motion_units_check"] for r in kept} == {"producer_fd_consistent"}
 
 
 def test_an_nback_run_with_nan_motion_is_excluded_and_leaves_the_mask(tmp_path, fake_tools, monkeypatch):

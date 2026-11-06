@@ -62,8 +62,11 @@ func derivatives, or any files with the same names:
   following trial and starts after the run's last frame, and the next run's first trial
   precedes its first cue, the cue moves back to 3.0 s before that trial.
 - **Motion:** translations first, in degrees, with first derivatives taken before
-  trimming. ABCD's confounds already hold degrees, so rotations pass through unconverted. An
-  non-finite value left after trimming excludes the run as `motion_non_finite`.
+  trimming. ABCD's confounds already hold degrees, so rotations pass through unconverted. As
+  the orchestrator does, each run first confirms that: Power FD recomputed with rotations in
+  degrees on a 50 mm head must match the confounds' `framewise_displacement` within 1e-6 mm,
+  or the run is excluded as `producer_fd_inconsistent`. A non-finite value left after trimming
+  excludes the run as `motion_non_finite`.
 - **n-back events:** a 0-back cue becomes `target_0back`, pooled across stimuli, and a
   2-back cue becomes `instruction`. `dummy` rows are dropped. A session has only 2 cues per
   stimulus, too few to model or correlate alone. In `nback_conn`, `target_0back` and
@@ -128,8 +131,9 @@ about rest, so a held-out session still runs its rest analysis.
 ## Result JSON
 
 `package_version`, `analyses` (name to status, exit code and warning flag, or skip reason)
-and `runs` (run to `n_remove`, `n_frames`, `dropped_events`, plus the WM and CSF mask voxel
-counts on rest, or `excluded`). A repaired cue adds
+and `runs` (run to `n_remove`, `n_frames`, `dropped_events`, `motion_units_check`
+(`producer_fd_consistent`, or `not_checkable` with no usable FD column), plus the WM and CSF
+mask voxel counts on rest, or `excluded`). A repaired cue adds
 `cue_moved_to` and `cue_moved_from` to the two runs. A failed analysis adds `error`: the
 `type`, `message` and `step` from its QC summary's `run_status`.
 

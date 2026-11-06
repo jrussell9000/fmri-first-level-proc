@@ -164,11 +164,38 @@ def nss_count(confounds: pd.DataFrame) -> int:
     return sum(1 for c in confounds.columns if c.startswith("non_steady_state_outlier"))
 
 
+FD_HEAD_RADIUS_MM = 50.0
+FD_CONSISTENCY_ATOL_MM = 1e-6
+
+
+def motion_units_check(confounds: pd.DataFrame) -> str:
+    """ABCD_fmri_orchestrator_S3's _check_producer_fd_consistency (5855f3f): Power FD recomputed
+    from the six motion columns, rotations taken as degrees on a 50 mm head, must match the
+    file's framewise_displacement within 1e-6 mm. Rotations in radians miss by far more.
+
+    Returns "producer_fd_consistent", or "not_checkable" when the FD column is absent or no
+    frame is finite in both. A mismatch excludes the run as `producer_fd_inconsistent`.
+    """
+    if "framewise_displacement" not in confounds.columns:
+        return "not_checkable"
+    produced = pd.to_numeric(confounds["framewise_displacement"], errors="coerce").to_numpy(dtype=float)
+    deltas = np.abs(np.diff(confounds[MOTION_BASE].to_numpy(dtype=float), axis=0))
+    deltas[:, 3:] *= np.pi / 180.0 * FD_HEAD_RADIUS_MM
+    recomputed = np.concatenate([[np.nan], deltas.sum(axis=1)])
+    comparable = np.isfinite(produced) & np.isfinite(recomputed)
+    if not comparable.any():
+        return "not_checkable"
+    if not np.allclose(recomputed[comparable], produced[comparable], atol=FD_CONSISTENCY_ATOL_MM, rtol=0):
+        raise RunExcluded("producer_fd_inconsistent")
+    return "producer_fd_consistent"
+
+
 def motion_matrix(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
     """(T - n_remove, 12): base motion translations first, then first derivatives.
 
-    ABCD's rotations are already degrees, unlike standard fMRIPrep's radians: its n-back
-    framewise_displacement equals sum|d trans| + (pi/180)*50*sum|d rot| on these columns.
+    ABCD's rotations are already degrees, unlike standard fMRIPrep's radians: its
+    framewise_displacement equals sum|d trans| + (pi/180)*50*sum|d rot| on these columns,
+    which motion_units_check confirms for each run first, as the orchestrator does.
 
     Derivatives are taken on the untrimmed series (row 1 = 0) and trimmed with it,
     as the retired orchestrator did. A non-finite value left after trimming excludes
@@ -177,6 +204,7 @@ def motion_matrix(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
     missing = [c for c in MOTION_BASE if c not in confounds.columns]
     if missing:
         raise SessionError(f"confounds lack motion columns {missing}")
+    motion_units_check(confounds)
     base = confounds[MOTION_BASE].to_numpy(dtype=float)
     deriv = np.vstack([np.zeros((1, 6)), np.diff(base, axis=0)])
     out = np.hstack([base, deriv])[n_remove:]
@@ -398,6 +426,7 @@ def stage_run(run: Run, raw: dict[str, Path], tr: float, mask: Path, work: Path)
     if run.n_frames < 2:
         raise SessionError(f"{run.rid}: trimming {run.n_remove} frames leaves {run.n_frames}")
     motion = motion_matrix(confounds, run.n_remove)
+    run.extra["motion_units_check"] = motion_units_check(confounds)  # it passed, or the run is out
     run.bold = work / f"{run.rid}_bold.nii.gz"
     run_cmd(
         [
@@ -572,7 +601,7 @@ class Session:
                 run.excluded = str(exc)
                 log("run-excluded", run=run.rid, reason=run.excluded)
                 continue
-            run.extra = {"mask_voxels": voxels}
+            run.extra["mask_voxels"] = voxels
             regressors[run.rid] = paths
         ok = [r for r in runs if not r.excluded]
         if not ok:
