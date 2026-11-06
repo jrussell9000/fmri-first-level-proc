@@ -8,7 +8,7 @@ and CI fails if that stops being true.
 
 **Upstream base:** `e40d1bc6f519b9a61996a594b395fef4ec9c9fd2`
 
-**Fork version:** `4.0.0+cp.2`, in `pyproject.toml`. The part before the `+` is upstream's
+**Fork version:** `4.0.0+cp.3`, in `pyproject.toml`. The part before the `+` is upstream's
 version and the rest counts fork releases on it. `__version__` in `__init__.py` stays upstream's
 value, so an analysis's QC reports the version of the core that ran it, and
 `fmri-first-level-abcd` records the fork version in its result.
@@ -108,6 +108,17 @@ refactored core with the `src/` layout. Tags `v4.1.0`, `v4.2.0` and `v5.0.0` bel
 They are not ancestors of `main`, and `v5.0.0` is older than `4.0.0+cp.1` despite its number.
 
 ## Fork releases
+
+### 4.0.0+cp.3
+
+The result JSON says why rest runs were lost, and analyses are unchanged.
+
+- **A failed `rest_conn` marks every staged rest run** with `excluded_by_analysis`, using the reason
+  its error names. Before, the runs looked used, because the core's failure record drops the
+  per-run list.
+- **A failed analysis carries its `error`** (type, message and step).
+- **`excluded_by_analysis` is matched by run label.** It was matched by position, so a rest run
+  that staging excluded shifted the reason onto the wrong run.
 
 ### 4.0.0+cp.2
 

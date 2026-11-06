@@ -598,12 +598,39 @@ def _result(sess: Session, analyses: dict, runs: list[Run]) -> dict:
     }
 
 
-def note_runs_excluded_by_analysis(block: dict, runs: list[Run]) -> None:
-    """Record on each rest run whether rest_conn's QC says it left the analysis."""
-    qc = Path(block["out_dir"]) / f"{block['out_file_pre']}_qc_summary.json"
-    staged = [r for r in runs if not r.excluded]  # the order rest_paths passed them in
-    for record in json.loads(qc.read_text()).get("excluded_runs", []):
-        staged[record["run"] - 1].extra["excluded_by_analysis"] = record["reason"]
+# rest_conn exits 5 only when no run is left (the core's ModelErrors in nuisance.py). Its
+# failure QC keeps the error but not the per-run records, so the reason comes from the
+# message; anything unrecognised is `analysis_failed`.
+REST_FAILURE_REASONS = (
+    ("Every run has DOF < 1", "dof_below_1"),
+    ("No run has enough uncensored TRs", "insufficient_uncensored_trs"),
+)
+
+
+def analysis_qc(block: dict) -> dict:
+    path = Path(block["out_dir"]) / f"{block['out_file_pre']}_qc_summary.json"
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def analysis_error(qc: dict) -> dict:
+    """A failed analysis's error, from its failure QC: type, message and step."""
+    error = qc.get("run_status", {}).get("error", {})
+    return {k: error.get(k) for k in ("type", "message", "step")}
+
+
+def note_runs_excluded_by_analysis(block: dict, runs: list[Run], status: str) -> None:
+    """Record on each staged rest run whether rest_conn left it out, and why. The core
+    reports runs by label, the `run_labels` rest_paths passed."""
+    staged = {run_label(r.rid): r for r in runs if not r.excluded}
+    qc = analysis_qc(block)
+    if status == "completed":
+        for record in qc.get("excluded_runs", []):
+            staged[record["run"]].extra["excluded_by_analysis"] = record["reason"]
+        return
+    message = analysis_error(qc)["message"] or ""
+    reason = next((r for prefix, r in REST_FAILURE_REASONS if message.startswith(prefix)), "analysis_failed")
+    for run in staged.values():
+        run.extra["excluded_by_analysis"] = reason
 
 
 def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> dict:
@@ -671,9 +698,11 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
         # Run from the out_dir: 3dDeconvolve writes 3dDeconvolve.err to the cwd.
         code = run_cli(cmd, cwd=block["out_dir"])
         analyses[name] = classify_exit(code)
+        if analyses[name]["status"] == "failed":
+            analyses[name]["error"] = analysis_error(analysis_qc(block))
         log("analysis-end", analysis=name, **analyses[name])
-        if name == "rest_conn" and analyses[name]["status"] == "completed":
-            note_runs_excluded_by_analysis(block, rest_runs)
+        if name == "rest_conn":
+            note_runs_excluded_by_analysis(block, rest_runs, analyses[name]["status"])
 
     return _result(sess, analyses, all_runs)
 

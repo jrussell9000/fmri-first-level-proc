@@ -469,6 +469,56 @@ def test_a_run_the_analysis_excluded_is_recorded_on_that_run(tmp_path, fake_tool
     assert "excluded_by_analysis" not in result["runs"]["task-nback_run-01"]
 
 
+REST_RUNS = ("task-rest_run-01", "task-rest_run-02", "task-rest_run-03")
+
+
+def test_the_analysis_reports_runs_by_label_not_position(tmp_path, fake_tools, analysis_qc):
+    """With run 2 dropped in staging, the core's run 3 is the third run, not the second."""
+    seed_session(tmp_path / "raw", runs=(*NBACK_RUNS, *REST_RUNS))
+    path = tmp_path / "raw" / f"{SUBJ}_{SES}_task-rest_run-02_desc-confounds_timeseries.tsv"
+    df = pd.read_csv(path, sep="\t")
+    df.loc[100, "trans_x"] = np.nan
+    df.to_csv(path, sep="\t", index=False)
+    analysis_qc["rest_conn"] = {"excluded_runs": [{"run": 3, "reason": "dof_below_1"}]}
+    runs = run(tmp_path)["runs"]
+    assert runs["task-rest_run-03"]["excluded_by_analysis"] == "dof_below_1"
+    assert "excluded_by_analysis" not in runs["task-rest_run-01"]
+    assert runs["task-rest_run-02"] == {"excluded": "motion_non_finite"}
+
+
+def failure_qc(message):
+    error = {"type": "ModelError", "message": message, "exit_code": 5, "step": "rest-conn-nuisance"}
+    return {"analysis_type": "rest_conn", "run_status": {"status": "failed", "error": error}}
+
+
+@pytest.mark.parametrize("message, reason", [
+    ("Every run has DOF < 1: run 1: DOF=-3, run 2: DOF=-1, run 3: DOF=0", "dof_below_1"),
+    ("No run has enough uncensored TRs for the model. Runs: [(1, 'excluded')]", "insufficient_uncensored_trs"),
+    ("Something the core may say later", "analysis_failed"),
+])  # fmt: skip
+def test_a_failed_rest_analysis_says_why_on_every_run(tmp_path, fake_tools, analysis_qc, message, reason):
+    _, exits = fake_tools
+    exits["rest_conn"] = 5
+    analysis_qc["rest_conn"] = failure_qc(message)
+    seed_session(tmp_path / "raw", runs=(*NBACK_RUNS, *REST_RUNS))
+    result = run(tmp_path)
+    entry = result["analyses"]["rest_conn"]
+    assert entry["status"] == "failed"
+    assert entry["error"] == {"type": "ModelError", "message": message, "step": "rest-conn-nuisance"}
+    assert {result["runs"][r]["excluded_by_analysis"] for r in REST_RUNS} == {reason}
+    assert "error" not in result["analyses"]["nback_act"]
+
+
+def test_a_failed_analysis_without_qc_still_records_its_failure(tmp_path, fake_tools, analysis_qc, monkeypatch):
+    _, exits = fake_tools
+    exits["nback_conn"] = 5
+    seed_session(tmp_path / "raw")
+    real = sfl.analysis_qc
+    monkeypatch.setattr(sfl, "analysis_qc", lambda b: {} if b["name"] == "nback_conn" else real(b))
+    result = run(tmp_path)
+    assert result["analyses"]["nback_conn"]["error"] == {"type": None, "message": None, "step": None}
+
+
 def test_a_model_failure_fails_only_its_analysis(tmp_path, fake_tools):
     _, exits = fake_tools
     exits["rest_conn"] = 5
