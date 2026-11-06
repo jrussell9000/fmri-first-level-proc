@@ -11,7 +11,6 @@ import pandas as pd
 import pytest
 
 nib = pytest.importorskip("nibabel")
-pytest.importorskip("scipy")
 
 from fmri_first_level_proc.abcd import staging  # noqa: E402
 
@@ -23,7 +22,7 @@ pytestmark = [
 TR = 0.8
 SUBJ, SES = "sub-TEST0001", "ses-00A"
 N_FRAMES, N_NSS = 370, 8
-PROB_AFFINE = np.diag([1.0, 1.0, 1.0, 1.0])
+LABEL_AFFINE = np.diag([1.0, 1.0, 1.0, 1.0])
 REF_AFFINE = np.array([[-2.0, 0, 0, 6.5], [0, -2.0, 0, 6.5], [0, 0, 2.0, 0.5], [0, 0, 0, 1.0]])
 EVENTS = (
     "onset\tduration\tresponse_time\ttrial_type\n"
@@ -54,22 +53,21 @@ def _seed(root, rng):
         pd.DataFrame(cols).to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False)
         if "nback" in rid:
             (root / f"{SUBJ}_{SES}_{rid}_events.tsv").write_text(EVENTS)
-    for name, fill in zip(staging.probseg_names(SUBJ, SES), (0.0, 1.0, 1.0), strict=True):
-        _save(root / name, np.full((8, 8, 8), fill, np.float32), PROB_AFFINE)
-    label = f"{SUBJ}_{SES}_space-MNI152NLin2009cAsym_res-1_label-CSF_mask.nii.gz"
-    _save(root / label, np.ones((8, 8, 8), np.uint8), PROB_AFFINE)
+    _save(root / staging.tissue_mask_name(SUBJ, SES, "WM"), np.ones((8, 8, 8), np.uint8), LABEL_AFFINE)
+    csf = np.zeros((8, 8, 8), np.uint8)
+    csf[0:2, 0:2, 0:2] = 1  # one 2 mm voxel's worth, at BOLD voxel (3, 3, 0): x and y flip
+    _save(root / staging.tissue_mask_name(SUBJ, SES, "CSF"), csf, LABEL_AFFINE)
     (root / "_complete.json").write_text(json.dumps({"runs": {r: [] for r in runs}}))
     return runs
 
 
-def test_staging_commands_trim_mask_and_average(tmp_path, monkeypatch):
-    monkeypatch.setattr(staging, "CSF_MIN_VOXELS", 1)  # the 4^3 test grid holds only 64
+def test_staging_commands_trim_mask_and_average(tmp_path):
     raw = tmp_path / "raw"
     _seed(raw, np.random.default_rng(0))
     work = tmp_path / "work"
     work.mkdir()
     validity = {rid: (True, "") for rid in ("task-nback_run-01", "task-nback_run-02")}
-    sess = staging.Session(SUBJ, SES, raw, "fixed", work, validity)
+    sess = staging.Session(SUBJ, SES, raw, work, validity)
     by_task = sess.runs_by_task(sess.read_marker())
 
     nback, _ = sess.stage_task("nback", by_task["nback"], TR)
@@ -89,10 +87,11 @@ def test_staging_commands_trim_mask_and_average(tmp_path, monkeypatch):
     rest, raws = sess.stage_task("rest", by_task["rest"], TR)
     rest_paths, reason = sess.rest_paths(rest, raws)
     assert reason is None
-    for key in ("WM_paths", "CSF_paths", "GS_paths"):
+    for key in ("WM_paths", "CSF_paths"):
         assert np.loadtxt(rest_paths[key][0]).shape == (N_FRAMES - N_NSS,)
-    # The global signal is the trimmed BOLD's mean within the run's brain mask.
-    trimmed = np.asarray(nib.load(str(rest[0].bold)).dataobj)
-    np.testing.assert_allclose(
-        np.loadtxt(rest_paths["GS_paths"][0]), trimmed.mean(axis=(0, 1, 2)), rtol=1e-3
-    )
+    assert "GS_paths" not in rest_paths
+    # Nearest neighbour put the 1 mm labels on the 2 mm grid: all 64 voxels for WM, and
+    # for CSF only the one voxel, whose mean is the frame index stored there.
+    assert rest[0].extra["mask_voxels"] == {"WM": 64, "CSF": 1}
+    csf = np.loadtxt(rest_paths["CSF_paths"][0])
+    np.testing.assert_allclose(csf, np.asarray(nib.load(str(rest[0].bold)).dataobj)[3, 3, 0], rtol=1e-5)

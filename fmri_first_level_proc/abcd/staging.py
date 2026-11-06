@@ -8,8 +8,7 @@ object, with these names:
   {subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_brainmask.nii.gz
   {subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv
   {subj}_{ses}_task-nback_{run}_events.tsv
-  {subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{GM,WM,CSF}_probseg.nii.gz  (rest only)
-  {subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-CSF_mask.nii.gz             (rest only)
+  {subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{WM,CSF}_mask.nii.gz  (rest only)
 
 Rest trims the frames its confounds flag as non-steady-state. n-back trims what its
 events' `dummy` row states, because ABCD's onsets count from the first non-dummy volume
@@ -40,13 +39,21 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 import yaml
-from scipy.ndimage import binary_dilation
 
 MARKER = "_complete.json"
 SPACE = "space-MNI152NLin2009cAsym"
 SPACE_RES1 = f"{SPACE}_res-1"
-TISSUES = ("GM", "WM", "CSF")
+# Rest's nuisance tissues, from FastSurfer's 1 mm label masks, as the orchestrator takes them.
+TISSUES = ("WM", "CSF")
 PROC_TEMPLATE = Path(__file__).resolve().parent / "data" / "proc_config_final.yaml"
+# Schaefer 400 + Tian S4 in MNI152NLin2009cAsym at 2 mm; data/atlas/README.md has its source,
+# licences and citations.
+PACKAGED_ATLAS = (
+    Path(__file__).resolve().parent
+    / "data"
+    / "atlas"
+    / "Schaefer2018_400Parcels_7Networks_order_Tian_Subcortex_S4_3T_MNI152NLin2009cAsym_2mm.nii.gz"
+)
 
 # Per analysis in proc_config_final.yaml: its task and the post-ID parts of its
 # prefixes (`sub-{ID}_{ses}_{post_id}`). Carried over unchanged from the retired
@@ -76,23 +83,6 @@ GE_NSS_COUNTS = (5, 16)
 KEPT_FRAMES, KEPT_FRAMES_GE = 362, 363
 # A cue starts this long before its block's first stimulus.
 CUE_LEAD_SECONDS = 3.0
-# Rest CSF/WM masks follow fMRIPrep's `acompcor_masks` + `acc_msk_bin`
-# (nipreps/fmriprep, fmriprep/utils/confounds.py and workflows/bold/confounds.py,
-# partial-volume route): GM > 0.05 dilated by a radius-3 ball at 1 mm is removed
-# from WM only; both maps go to the BOLD grid, are brain-masked, and binarized at
-# > 0.99. fMRIPrep resamples with ANTs Gaussian interpolation; this uses the exact
-# 2x2x2 block mean, which is the one deliberate difference.
-GM_PV_THRESHOLD = 0.05
-GM_DILATION_RADIUS = 3
-PROBSEG_THRESHOLD = 0.99  # WM
-# CSF departs from fMRIPrep (operator, 2026-11-01): it is restricted to the ventricles
-# by multiplying the CSF probseg by FastSurfer's 1 mm label-CSF_mask before the block
-# mean, so the regressor is not brain-edge CSF. If > 0.99 leaves fewer than
-# CSF_MIN_VOXELS, the threshold steps down the ladder; below the last rung rest is
-# skipped. Calibrated on 150 sessions (100 baseline): > 0.99 gave 430-3,551 voxels,
-# 1st percentile 529, so the floor of 100 fires only on a broken session.
-CSF_THRESHOLD_LADDER = (0.99, 0.9, 0.5)
-CSF_MIN_VOXELS = 100
 # CLI exit codes (README). 5 is data-determined and does not fail the session; 1/2/4 do.
 EXIT_OK, EXIT_HIGH_WARNINGS, EXIT_MODEL = 0, 3, 5
 
@@ -160,8 +150,8 @@ def package_version() -> str | None:
         return None
 
 
-def probseg_names(subj: str, ses: str) -> list[str]:
-    return [f"{subj}_{ses}_{SPACE_RES1}_label-{t}_probseg.nii.gz" for t in TISSUES]
+def tissue_mask_name(subj: str, ses: str, tissue: str) -> str:
+    return f"{subj}_{ses}_{SPACE_RES1}_label-{tissue}_mask.nii.gz"
 
 
 # ---------------------------------------------------------------------------
@@ -174,11 +164,38 @@ def nss_count(confounds: pd.DataFrame) -> int:
     return sum(1 for c in confounds.columns if c.startswith("non_steady_state_outlier"))
 
 
+FD_HEAD_RADIUS_MM = 50.0
+FD_CONSISTENCY_ATOL_MM = 1e-6
+
+
+def motion_units_check(confounds: pd.DataFrame) -> str:
+    """ABCD_fmri_orchestrator_S3's _check_producer_fd_consistency (5855f3f): Power FD recomputed
+    from the six motion columns, rotations taken as degrees on a 50 mm head, must match the
+    file's framewise_displacement within 1e-6 mm. Rotations in radians miss by far more.
+
+    Returns "producer_fd_consistent", or "not_checkable" when the FD column is absent or no
+    frame is finite in both. A mismatch excludes the run as `producer_fd_inconsistent`.
+    """
+    if "framewise_displacement" not in confounds.columns:
+        return "not_checkable"
+    produced = pd.to_numeric(confounds["framewise_displacement"], errors="coerce").to_numpy(dtype=float)
+    deltas = np.abs(np.diff(confounds[MOTION_BASE].to_numpy(dtype=float), axis=0))
+    deltas[:, 3:] *= np.pi / 180.0 * FD_HEAD_RADIUS_MM
+    recomputed = np.concatenate([[np.nan], deltas.sum(axis=1)])
+    comparable = np.isfinite(produced) & np.isfinite(recomputed)
+    if not comparable.any():
+        return "not_checkable"
+    if not np.allclose(recomputed[comparable], produced[comparable], atol=FD_CONSISTENCY_ATOL_MM, rtol=0):
+        raise RunExcluded("producer_fd_inconsistent")
+    return "producer_fd_consistent"
+
+
 def motion_matrix(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
     """(T - n_remove, 12): base motion translations first, then first derivatives.
 
-    ABCD's rotations are already degrees, unlike standard fMRIPrep's radians: its n-back
-    framewise_displacement equals sum|d trans| + (pi/180)*50*sum|d rot| on these columns.
+    ABCD's rotations are already degrees, unlike standard fMRIPrep's radians: its
+    framewise_displacement equals sum|d trans| + (pi/180)*50*sum|d rot| on these columns,
+    which motion_units_check confirms for each run first, as the orchestrator does.
 
     Derivatives are taken on the untrimmed series (row 1 = 0) and trimmed with it,
     as the retired orchestrator did. A non-finite value left after trimming excludes
@@ -187,6 +204,7 @@ def motion_matrix(confounds: pd.DataFrame, n_remove: int) -> np.ndarray:
     missing = [c for c in MOTION_BASE if c not in confounds.columns]
     if missing:
         raise SessionError(f"confounds lack motion columns {missing}")
+    motion_units_check(confounds)
     base = confounds[MOTION_BASE].to_numpy(dtype=float)
     deriv = np.vstack([np.zeros((1, 6)), np.diff(base, axis=0)])
     out = np.hstack([base, deriv])[n_remove:]
@@ -313,105 +331,6 @@ def stage_events(events: pd.DataFrame, shift: float) -> tuple[pd.DataFrame, int]
     return ev.reset_index(drop=True), int(negative.sum())
 
 
-def block_mean_to_grid(prob: nib.Nifti1Image, ref: nib.Nifti1Image) -> np.ndarray:
-    """Each `ref` voxel's mean over the 2x2x2 `prob` voxels it covers exactly.
-
-    Both images must be axis-aligned, and `ref`'s voxel edges must fall on
-    `prob`'s at a 2:1 ratio. On cloudpipe's grids the 2 mm centres sit half a
-    millimetre off the 1 mm centres, so each 2 mm voxel covers exactly 8 whole 1 mm
-    voxels. Anything else is refused rather than interpolated. Voxels outside
-    `prob`'s field of view count as 0.
-    """
-    pa, ra = prob.affine, ref.affine
-    for a, name in ((pa, "probseg"), (ra, "reference")):
-        if not np.allclose(a[:3, :3], np.diag(np.diag(a[:3, :3])), atol=1e-4):
-            raise SessionError(f"{name} grid is not axis-aligned")
-    # ref voxel index -> prob continuous index, per axis: p = scale * r + shift
-    to_prob = np.linalg.inv(pa) @ ra
-    scale, shift = np.diag(to_prob)[:3], to_prob[:3, 3]
-    if not np.allclose(np.abs(scale), 2.0, atol=1e-4):
-        raise SessionError(f"grids are not 2:1 (scale {scale.round(4).tolist()})")
-    # A 2:1 voxel covers prob centres at p-0.5 and p+0.5; both must be integers.
-    frac = (shift - 0.5) % 1.0
-    if not np.all(np.minimum(frac, 1.0 - frac) < 1e-3):
-        raise SessionError(f"voxel edges do not nest (offset {shift.round(4).tolist()})")
-
-    data = np.asarray(prob.dataobj, dtype=np.float32)
-    total = np.zeros(ref.shape[:3], dtype=np.float32)
-    grids = [np.arange(n) for n in ref.shape[:3]]
-    for dx in (-0.5, 0.5):
-        for dy in (-0.5, 0.5):
-            for dz in (-0.5, 0.5):
-                idx = [
-                    np.rint(scale[k] * grids[k] + shift[k] + d).astype(int)
-                    for k, d in enumerate((dx, dy, dz))
-                ]
-                ok = [(i >= 0) & (i < n) for i, n in zip(idx, data.shape[:3], strict=True)]
-                block = np.zeros(ref.shape[:3], dtype=np.float32)
-                ix = np.ix_(*(i[o] for i, o in zip(idx, ok, strict=True)))
-                block[np.ix_(*(np.flatnonzero(o) for o in ok))] = data[ix]
-                total += block
-    return total / 8.0
-
-
-def ball(radius: int) -> np.ndarray:
-    """skimage.morphology.ball(radius): voxels with x² + y² + z² <= radius²."""
-    r = np.arange(-radius, radius + 1)
-    x, y, z = np.meshgrid(r, r, r, indexing="ij")
-    return x**2 + y**2 + z**2 <= radius**2
-
-
-def dilated_gm(gm: nib.Nifti1Image) -> np.ndarray:
-    """fMRIPrep's GM exclusion: GM partial volume > 0.05, dilated by ball(3), on
-    the probseg's own 1 mm grid."""
-    gm_data = np.asarray(gm.dataobj, dtype=np.float32) > GM_PV_THRESHOLD
-    return binary_dilation(gm_data, structure=ball(GM_DILATION_RADIUS))
-
-
-def tissue_masks_from_probseg(
-    gm: nib.Nifti1Image,
-    wm: nib.Nifti1Image,
-    csf: nib.Nifti1Image,
-    csf_label: nib.Nifti1Image,
-    brainmask: nib.Nifti1Image,
-    *,
-    gm_exclusion: np.ndarray | None = None,
-) -> tuple[dict[str, np.ndarray], str | None, float | None]:
-    """WM and CSF masks on `brainmask`'s grid, or a skip reason.
-
-    WM, as fMRIPrep builds `white_matter`: zero the WM partial volume wherever
-    dilated GM is, block-mean onto the BOLD grid, brain-mask, keep > 0.99.
-
-    CSF, ventricle-restricted: the CSF partial volume times FastSurfer's 1 mm
-    `label-CSF_mask`, block-meaned and brain-masked, kept above the first threshold
-    in CSF_THRESHOLD_LADDER that leaves at least CSF_MIN_VOXELS voxels.
-
-    Returns (masks, None, csf_threshold), or ({}, reason, None) with reason
-    "empty-WM-mask" or "csf-mask-too-small". `gm_exclusion` lets a caller reuse
-    one session's dilated GM across runs.
-    """
-    if not (np.allclose(csf_label.affine, csf.affine) and csf_label.shape == csf.shape):
-        raise SessionError("label-CSF_mask and CSF probseg are not on one grid")
-    if gm_exclusion is None:
-        gm_exclusion = dilated_gm(gm)
-    brain = np.asarray(brainmask.dataobj) > 0
-
-    wm_data = np.asarray(wm.dataobj, dtype=np.float32).copy()
-    wm_data[gm_exclusion] = 0.0
-    wm_frac = block_mean_to_grid(nib.Nifti1Image(wm_data, wm.affine), brainmask)
-    wm_mask = (wm_frac > PROBSEG_THRESHOLD) & brain
-    if not wm_mask.any():
-        return {}, "empty-WM-mask", None
-
-    ventricles = np.asarray(csf.dataobj, dtype=np.float32) * (np.asarray(csf_label.dataobj) > 0)
-    csf_frac = block_mean_to_grid(nib.Nifti1Image(ventricles, csf.affine), brainmask)
-    for threshold in CSF_THRESHOLD_LADDER:
-        csf_mask = (csf_frac > threshold) & brain
-        if csf_mask.sum() >= CSF_MIN_VOXELS:
-            return {"WM": wm_mask, "CSF": csf_mask}, None, threshold
-    return {}, "csf-mask-too-small", None
-
-
 def analysis_prefixes(subj: str, ses: str, name: str) -> dict[str, str]:
     spec = ANALYSES[name]
     base = f"{subj}_{ses}"
@@ -507,6 +426,7 @@ def stage_run(run: Run, raw: dict[str, Path], tr: float, mask: Path, work: Path)
     if run.n_frames < 2:
         raise SessionError(f"{run.rid}: trimming {run.n_remove} frames leaves {run.n_frames}")
     motion = motion_matrix(confounds, run.n_remove)
+    run.extra["motion_units_check"] = motion_units_check(confounds)  # it passed, or the run is out
     run.bold = work / f"{run.rid}_bold.nii.gz"
     run_cmd(
         [
@@ -536,12 +456,19 @@ def intersect_masks(paths: list[Path], dest: Path) -> Path:
     return dest
 
 
-def maskave(bold: Path, mask: np.ndarray, ref: nib.Nifti1Image, dest: Path) -> Path:
-    mask_path = dest.with_suffix(".mask.nii.gz")
-    nib.save(nib.Nifti1Image(mask.astype(np.uint8), ref.affine), str(mask_path))
-    result = run_cmd(["3dmaskave", "-quiet", "-mask", str(mask_path), str(bold)])
-    dest.write_text(result.stdout)
-    return dest
+def tissue_regressor(bold: Path, brainmask: Path, label: Path, dest: Path) -> tuple[Path, int]:
+    """(regressor, mask voxels): the orchestrator's compute_tissue_mask_regressor. The 1 mm
+    label goes to the BOLD grid by nearest neighbour, is intersected with the run's brain
+    mask, and gives the trimmed BOLD's mean there. An empty mask excludes the run."""
+    resampled = dest.with_suffix(".resampled.nii.gz")
+    mask = dest.with_suffix(".mask.nii.gz")
+    run_cmd(["3dresample", "-master", str(bold), "-rmode", "NN", "-input", str(label), "-prefix", str(resampled)])
+    run_cmd(["3dcalc", "-a", str(resampled), "-b", str(brainmask), "-expr", "step(a)*step(b)", "-prefix", str(mask)])
+    voxels = int((np.asarray(nib.load(str(mask)).dataobj) > 0).sum())
+    if not voxels:
+        raise RunExcluded("tissue_mask_empty")
+    dest.write_text(run_cmd(["3dmaskave", "-quiet", "-mask", str(mask), str(bold)]).stdout)
+    return dest, voxels
 
 
 @dataclass
@@ -549,7 +476,6 @@ class Session:
     subj: str
     ses: str
     input_dir: Path
-    probseg_state: str
     work: Path
     validity: dict[str, tuple[bool, str]] = field(default_factory=dict)
 
@@ -658,42 +584,33 @@ class Session:
         }
 
     def rest_paths(self, runs: list[Run], raws: dict) -> tuple[dict | None, str | None]:
+        if not any(not r.excluded for r in runs):
+            return None, "no-rest-runs"
+        labels = {t: self.path(tissue_mask_name(self.subj, self.ses, t)) for t in TISSUES}
+        regressors: dict[str, dict[str, str]] = {}
+        for run in runs:
+            if run.excluded:
+                continue
+            paths, voxels = {}, {}
+            try:  # each run has its own brain mask
+                for tissue, label in labels.items():
+                    dest = self.work / f"{run.rid}_{tissue.lower()}.1D"
+                    path, voxels[tissue] = tissue_regressor(run.bold, raws[run.rid]["brainmask"], label, dest)
+                    paths[tissue] = str(path)
+            except RunExcluded as exc:
+                run.excluded = str(exc)
+                log("run-excluded", run=run.rid, reason=run.excluded)
+                continue
+            run.extra["mask_voxels"] = voxels
+            regressors[run.rid] = paths
         ok = [r for r in runs if not r.excluded]
         if not ok:
             return None, "no-rest-runs"
-        if self.probseg_state != "fixed":
-            return None, f"probseg-{self.probseg_state}"
-        prob = {}
-        for name in probseg_names(self.subj, self.ses):
-            tissue = name.rsplit("_label-", 1)[1].split("_", 1)[0]
-            prob[tissue] = nib.load(str(self.path(name)))
-        # FastSurfer's ventricle-dominated CSF label restricts the CSF regressor. It
-        # never had the probseg defect, so it needs no probseg-state check of its own.
-        label = f"{self.subj}_{self.ses}_{SPACE_RES1}_label-CSF_mask.nii.gz"
-        csf_label = nib.load(str(self.path(label)))
-        gm_exclusion = dilated_gm(prob["GM"])  # once: the probseg is per session
-        csf, wm, gs = [], [], []
-        for run in ok:  # per session, but each run has its own brain mask
-            ref = nib.load(str(raws[run.rid]["brainmask"]))
-            masks, reason, csf_threshold = tissue_masks_from_probseg(
-                prob["GM"], prob["WM"], prob["CSF"], csf_label, ref, gm_exclusion=gm_exclusion
-            )
-            if reason:
-                return None, reason
-            run.extra = {
-                "mask_voxels": {t: int(m.sum()) for t, m in masks.items()},
-                "csf_threshold": csf_threshold,  # the ladder rung used; 0.99 normally
-            }
-            wm.append(str(maskave(run.bold, masks["WM"], ref, self.work / f"{run.rid}_wm.1D")))
-            csf.append(str(maskave(run.bold, masks["CSF"], ref, self.work / f"{run.rid}_csf.1D")))
-            brain = np.asarray(ref.dataobj) > 0
-            gs.append(str(maskave(run.bold, brain, ref, self.work / f"{run.rid}_gs.1D")))
         return {
             "scan_paths": [str(r.bold) for r in ok],
             "motion_paths": [str(r.motion) for r in ok],
-            "CSF_paths": csf,
-            "WM_paths": wm,
-            "GS_paths": gs,
+            "CSF_paths": [regressors[r.rid]["CSF"] for r in ok],
+            "WM_paths": [regressors[r.rid]["WM"] for r in ok],
             "run_labels": [run_label(r.rid) for r in ok],
         }, None
 
@@ -701,7 +618,6 @@ class Session:
 def _result(sess: Session, analyses: dict, runs: list[Run]) -> dict:
     return {
         "package_version": package_version(),
-        "probseg_state": sess.probseg_state,
         "analyses": analyses,
         "runs": {
             r.rid: (
@@ -711,7 +627,7 @@ def _result(sess: Session, analyses: dict, runs: list[Run]) -> dict:
                     "n_remove": r.n_remove,
                     "n_frames": r.n_frames,
                     "dropped_events": r.dropped_events,
-                    **r.extra,  # n-back: any cue move; rest: mask_voxels and csf_threshold
+                    **r.extra,  # n-back: any cue move; rest: mask_voxels
                 }
             )
             for r in runs
@@ -719,12 +635,39 @@ def _result(sess: Session, analyses: dict, runs: list[Run]) -> dict:
     }
 
 
-def note_runs_excluded_by_analysis(block: dict, runs: list[Run]) -> None:
-    """Record on each rest run whether rest_conn's QC says it left the analysis."""
-    qc = Path(block["out_dir"]) / f"{block['out_file_pre']}_qc_summary.json"
-    staged = [r for r in runs if not r.excluded]  # the order rest_paths passed them in
-    for record in json.loads(qc.read_text()).get("excluded_runs", []):
-        staged[record["run"] - 1].extra["excluded_by_analysis"] = record["reason"]
+# rest_conn exits 5 only when no run is left (the core's ModelErrors in nuisance.py). Its
+# failure QC keeps the error but not the per-run records, so the reason comes from the
+# message; anything unrecognised is `analysis_failed`.
+REST_FAILURE_REASONS = (
+    ("Every run has DOF < 1", "dof_below_1"),
+    ("No run has enough uncensored TRs", "insufficient_uncensored_trs"),
+)
+
+
+def analysis_qc(block: dict) -> dict:
+    path = Path(block["out_dir"]) / f"{block['out_file_pre']}_qc_summary.json"
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def analysis_error(qc: dict) -> dict:
+    """A failed analysis's error, from its failure QC: type, message and step."""
+    error = qc.get("run_status", {}).get("error", {})
+    return {k: error.get(k) for k in ("type", "message", "step")}
+
+
+def note_runs_excluded_by_analysis(block: dict, runs: list[Run], status: str) -> None:
+    """Record on each staged rest run whether rest_conn left it out, and why. The core
+    reports runs by label, the `run_labels` rest_paths passed."""
+    staged = {run_label(r.rid): r for r in runs if not r.excluded}
+    qc = analysis_qc(block)
+    if status == "completed":
+        for record in qc.get("excluded_runs", []):
+            staged[record["run"]].extra["excluded_by_analysis"] = record["reason"]
+        return
+    message = analysis_error(qc)["message"] or ""
+    reason = next((r for prefix, r in REST_FAILURE_REASONS if message.startswith(prefix)), "analysis_failed")
+    for run in staged.values():
+        run.extra["excluded_by_analysis"] = reason
 
 
 def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> dict:
@@ -792,9 +735,11 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
         # Run from the out_dir: 3dDeconvolve writes 3dDeconvolve.err to the cwd.
         code = run_cli(cmd, cwd=block["out_dir"])
         analyses[name] = classify_exit(code)
+        if analyses[name]["status"] == "failed":
+            analyses[name]["error"] = analysis_error(analysis_qc(block))
         log("analysis-end", analysis=name, **analyses[name])
-        if name == "rest_conn" and analyses[name]["status"] == "completed":
-            note_runs_excluded_by_analysis(block, rest_runs)
+        if name == "rest_conn":
+            note_runs_excluded_by_analysis(block, rest_runs, analyses[name]["status"])
 
     return _result(sess, analyses, all_runs)
 
@@ -809,14 +754,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--subj", required=True, help="sub-... as it appears in the file names")
     ap.add_argument("--ses", required=True, help="ses-... as it appears in the file names")
     ap.add_argument("--input-dir", type=Path, required=True, help="the session's files")
-    ap.add_argument(
-        "--probseg-state",
-        required=True,
-        help="`fixed` runs rest; anything else skips rest and records the reason",
-    )
     ap.add_argument("--workdir", type=Path, required=True, help="staged inputs go here")
     ap.add_argument("--out-dir", type=Path, required=True, help="analysis outputs go here")
-    ap.add_argument("--atlas", required=True, help="the parcellation, the config's template_path")
+    ap.add_argument(
+        "--atlas",
+        default=str(PACKAGED_ATLAS),
+        help="the parcellation, the config's template_path (default: the packaged Schaefer 400 + Tian S4)",
+    )
     ap.add_argument("--result", type=Path, required=True, help="write the result JSON here")
     ap.add_argument(
         "--run-validity",
@@ -831,7 +775,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     validity = load_validity(args.run_validity, args.subj, args.ses)
-    sess = Session(args.subj, args.ses, args.input_dir, args.probseg_state, args.workdir, validity)
+    sess = Session(args.subj, args.ses, args.input_dir, args.workdir, validity)
     template = yaml.safe_load(args.template.read_text())
     try:
         result = run_session(sess, template, args.out_dir, args.atlas)

@@ -8,7 +8,7 @@ and CI fails if that stops being true.
 
 **Upstream base:** `e40d1bc6f519b9a61996a594b395fef4ec9c9fd2`
 
-**Fork version:** `4.0.0+cp.1`, in `pyproject.toml`. The part before the `+` is upstream's
+**Fork version:** `4.0.0+cp.5`, in `pyproject.toml`. The part before the `+` is upstream's
 version and the rest counts fork releases on it. `__version__` in `__init__.py` stays upstream's
 value, so an analysis's QC reports the version of the core that ran it, and
 `fmri-first-level-abcd` records the fork version in its result.
@@ -43,7 +43,8 @@ Everything else in the fork is a new file under one of these paths:
 
 ### Commits
 
-Each commit is one decision and can be read or reverted alone. Add a row with each new change.
+Each commit is one decision and can be read or reverted alone. The table covers the rebuild;
+`git log <upstream base>..HEAD` lists everything since, and "Fork releases" below describes it.
 
 | Commit | Change |
 |---|---|
@@ -107,6 +108,45 @@ refactored core with the `src/` layout. Tags `v4.1.0`, `v4.2.0` and `v5.0.0` bel
 They are not ancestors of `main`, and `v5.0.0` is older than `4.0.0+cp.1` despite its number.
 
 ## Fork releases
+
+### 4.0.0+cp.5
+
+Each run now passes the orchestrator's rotation-unit check before staging. Power FD is
+recomputed from the motion columns with rotations in degrees, and must match the confounds'
+`framewise_displacement` within 1e-6 mm, or the run is excluded as `producer_fd_inconsistent`.
+Each staged run records `motion_units_check`. Every one of 141 sampled ABCD runs passed, so
+analyses are unchanged today. The check guards against a future input with rotations in radians.
+
+### 4.0.0+cp.4
+
+The Schaefer 400 + Tian S4 atlas now ships with `abcd/`, in `abcd/data/atlas/`, with its label
+table and licences, and `--atlas` defaults to it. The file is byte-identical to Tian's published
+copy and to the one cloudpipe used, so analyses are unchanged.
+
+### 4.0.0+cp.3
+
+The result JSON says why rest runs were lost, and analyses are unchanged.
+
+- **A failed `rest_conn` marks every staged rest run** with `excluded_by_analysis`, using the reason
+  its error names. Before, the runs looked used, because the core's failure record drops the
+  per-run list.
+- **A failed analysis carries its `error`** (type, message and step).
+- **`excluded_by_analysis` is matched by run label.** It was matched by position, so a rest run
+  that staging excluded shifted the reason onto the wrong run.
+
+### 4.0.0+cp.2
+
+Rest now matches the orchestrator's denoising, and n-back analyses are unaffected.
+
+- **No global signal regression,** as in the orchestrator's config. A rest run can have 2 more
+  censored frames before it is lost, because the regressor and its derivative are gone.
+- **WM and CSF from FastSurfer's label masks,** as the orchestrator builds them, replacing the
+  probseg-based masks. On 268 baseline sessions the probseg masks did not meet the comparison's
+  pre-specified rule (`benchmarks/rest_masks/` on branch `rest-mask-comparison`). Rest no longer
+  reads the probseg, so `--probseg-state` and the `probseg_state` result field are gone, and a
+  run whose mask is empty is excluded as `tissue_mask_empty`.
+
+Rest connectivity matrices change.
 
 ### 4.0.0+cp.1
 
