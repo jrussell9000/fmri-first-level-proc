@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fmri-first-level-proc"
-version = "4.0.0+cp.3"
+version = "4.0.0+cp.4"
 description = "General-purpose first-level fMRI analysis framework built on AFNI."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,7 +33,7 @@ include = ["fmri_first_level_proc*"]
 
 [tool.setuptools.package-data]
 fmri_first_level_proc = ["tools.lock.yaml"]
-"fmri_first_level_proc.abcd" = ["data/*.yaml"]
+"fmri_first_level_proc.abcd" = ["data/*.yaml", "data/atlas/*"]
 
 [tool.pytest.ini_options]
 markers = [

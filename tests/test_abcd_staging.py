@@ -622,6 +622,21 @@ def test_the_packaged_template_carries_no_deployment_path():
     assert template()["global"]["num_cores"] == "auto"
 
 
+def test_the_packaged_atlas_is_the_default_and_ships_its_licences(tmp_path):
+    import hashlib
+
+    args = cli_args(tmp_path)
+    i = args.index("--atlas")
+    atlas = sfl.PACKAGED_ATLAS
+    assert sfl.build_parser().parse_args(args[:i] + args[i + 2 :]).atlas == str(atlas)
+    digest = hashlib.sha256(atlas.read_bytes()).hexdigest()
+    assert digest == "b105e68db7b716885c11cb80fc4fc147bc14d117a39850a34936fddee70728f6"
+    labels = np.unique(np.asarray(nib.load(str(atlas)).dataobj)).astype(int)
+    assert labels.tolist() == list(range(455))  # background, then 54 Tian, then 400 Schaefer
+    for name in ("LICENSE-Tian-Melbourne-Subcortex-Atlas.txt", "LICENSE-CBIG-Schaefer2018.md", "README.md"):
+        assert (atlas.parent / name).is_file()
+
+
 def test_the_core_does_not_import_the_abcd_module():
     code = (
         "import sys, fmri_first_level_proc; "

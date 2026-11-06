@@ -8,7 +8,7 @@ and CI fails if that stops being true.
 
 **Upstream base:** `e40d1bc6f519b9a61996a594b395fef4ec9c9fd2`
 
-**Fork version:** `4.0.0+cp.3`, in `pyproject.toml`. The part before the `+` is upstream's
+**Fork version:** `4.0.0+cp.4`, in `pyproject.toml`. The part before the `+` is upstream's
 version and the rest counts fork releases on it. `__version__` in `__init__.py` stays upstream's
 value, so an analysis's QC reports the version of the core that ran it, and
 `fmri-first-level-abcd` records the fork version in its result.
@@ -108,6 +108,12 @@ refactored core with the `src/` layout. Tags `v4.1.0`, `v4.2.0` and `v5.0.0` bel
 They are not ancestors of `main`, and `v5.0.0` is older than `4.0.0+cp.1` despite its number.
 
 ## Fork releases
+
+### 4.0.0+cp.4
+
+The Schaefer 400 + Tian S4 atlas now ships with `abcd/`, in `abcd/data/atlas/`, with its label
+table and licences, and `--atlas` defaults to it. The file is byte-identical to Tian's published
+copy and to the one cloudpipe used, so analyses are unchanged.
 
 ### 4.0.0+cp.3
 
