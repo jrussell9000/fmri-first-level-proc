@@ -291,8 +291,7 @@ analyses:
       WM_paths:
         - "/path/to/subj001_rest_run1_WM.txt"
         - "/path/to/subj001_rest_run2_WM.txt"
-      # Placeholder only: the stager always passes one global signal file per run
-      # (GSR on), the mean of the trimmed BOLD within the run's brain mask.
+      # The stager passes none, so rest has no global signal regression (as the orchestrator).
       GS_paths: null             # null = no global signal regression; list of paths = enable GSR
 
     out_dir: "/path/to/output/subj001/rest_conn"
