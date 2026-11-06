@@ -8,7 +8,7 @@ and CI fails if that stops being true.
 
 **Upstream base:** `e40d1bc6f519b9a61996a594b395fef4ec9c9fd2`
 
-**Fork version:** `4.0.0+cp.4`, in `pyproject.toml`. The part before the `+` is upstream's
+**Fork version:** `4.0.0+cp.5`, in `pyproject.toml`. The part before the `+` is upstream's
 version and the rest counts fork releases on it. `__version__` in `__init__.py` stays upstream's
 value, so an analysis's QC reports the version of the core that ran it, and
 `fmri-first-level-abcd` records the fork version in its result.
@@ -108,6 +108,14 @@ refactored core with the `src/` layout. Tags `v4.1.0`, `v4.2.0` and `v5.0.0` bel
 They are not ancestors of `main`, and `v5.0.0` is older than `4.0.0+cp.1` despite its number.
 
 ## Fork releases
+
+### 4.0.0+cp.5
+
+Each run now passes the orchestrator's rotation-unit check before staging. Power FD is
+recomputed from the motion columns with rotations in degrees, and must match the confounds'
+`framewise_displacement` within 1e-6 mm, or the run is excluded as `producer_fd_inconsistent`.
+Each staged run records `motion_units_check`. Every one of 141 sampled ABCD runs passed, so
+analyses are unchanged today. The check guards against a future input with rotations in radians.
 
 ### 4.0.0+cp.4
 
