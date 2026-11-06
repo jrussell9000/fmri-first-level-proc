@@ -8,7 +8,7 @@ and CI fails if that stops being true.
 
 **Upstream base:** `e40d1bc6f519b9a61996a594b395fef4ec9c9fd2`
 
-**Fork version:** `4.0.0+cp.5`, in `pyproject.toml`. The part before the `+` is upstream's
+**Fork version:** `4.0.0+cp.6`, in `pyproject.toml`. The part before the `+` is upstream's
 version and the rest counts fork releases on it. `__version__` in `__init__.py` stays upstream's
 value, so an analysis's QC reports the version of the core that ran it, and
 `fmri-first-level-abcd` records the fork version in its result.
@@ -27,6 +27,7 @@ until it is listed here with its reason.
 | M | `.gitignore` | Upstream ignores everything by default, so the fork's paths need whitelisting |
 | M | `pyproject.toml` | The fork version, the `abcd` extra, its two scripts, its package data and the `afni` test marker |
 | D | `.aid/reports/fmri-first-level-proc_publish_20260911_160000.md` | It names a participant, and this fork holds no subject-keyed data |
+| M | `fmri_first_level_proc/tools.lock.yaml` | `validated` names the versions cloudpipe's image runs and CI tests: AFNI 26.3.07, numpy 2.5.4, pandas 3.1.1. Minimums are upstream's |
 <!-- ledger:end -->
 
 ### Files added
@@ -108,6 +109,13 @@ refactored core with the `src/` layout. Tags `v4.1.0`, `v4.2.0` and `v5.0.0` bel
 They are not ancestors of `main`, and `v5.0.0` is older than `4.0.0+cp.1` despite its number.
 
 ## Fork releases
+
+### 4.0.0+cp.6
+
+`tools.lock.yaml`'s `validated` versions are now the ones cloudpipe's image runs and the fork's CI
+tests: AFNI 26.3.07, numpy 2.5.4 and pandas 3.1.1, from 26.0.09, 2.4.2 and 3.0.1. Every analysis
+logged an `UNVALIDATED_VERSION` warning for each. The minimums are unchanged, so an older install
+still fails, and a different version still warns. Analyses are unchanged.
 
 ### 4.0.0+cp.5
 
