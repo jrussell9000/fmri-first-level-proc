@@ -126,6 +126,12 @@ about rest, so a held-out session still runs its rest analysis.
 `package_version`, `analyses` (name to status, exit code and warning flag, or skip reason)
 and `runs` (run to `n_remove`, `n_frames`, `dropped_events`, plus the WM and CSF mask voxel
 counts on rest, or `excluded`). A repaired cue adds
-`cue_moved_to` and `cue_moved_from` to the two runs. A rest run that staged but that
-`rest_conn` left out adds `excluded_by_analysis`, with the reason from `excluded_runs` in
-the QC summary. `rest_conn` is recorded `failed` when the data leave no run.
+`cue_moved_to` and `cue_moved_from` to the two runs. A failed analysis adds `error`: the
+`type`, `message` and `step` from its QC summary's `run_status`.
+
+A rest run that staged but that `rest_conn` left out adds `excluded_by_analysis`. When
+`rest_conn` completes, the reason comes from `excluded_runs` in the QC summary, matched by run
+label. It is recorded `failed` when the data leave no run, and the core's failure record then
+keeps the error but not the per-run records. So every staged rest run gets the reason the
+error names: `dof_below_1`, `insufficient_uncensored_trs`, or `analysis_failed` for any other
+message.
