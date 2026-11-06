@@ -95,22 +95,18 @@ def evaluate(rows, distances, networks, n_boot, seed, arms=ARMS):
     def median_icc(arm, idx, edges=Ellipsis):
         return float(np.nanmedian(metrics.edgewise_icc(split[arm][0][idx][:, edges], split[arm][1][idx][:, edges])))
 
-    def median_qc(arm, idx, edges=Ellipsis):
-        r, _ = metrics.qc_fc(whole[arm][idx][:, edges], fd[idx], covariates[idx])
-        return float(np.nanmedian(np.abs(r)))
-
-    def global_motion(arm, idx):
-        return abs(metrics.mean_fc_motion(whole[arm][idx], fd[idx], covariates[idx]))
+    # Every draw at once, from the counts bootstrap_difference's draws give; see metrics.py.
+    counts_split = metrics.bootstrap_counts(n_split, n_boot, seed)
+    counts = metrics.bootstrap_counts(n, n_boot, seed)
+    draws = {arm: {
+        "icc": metrics.batched_median_icc(split[arm][0][:, subset], split[arm][1][:, subset], counts_split),
+        "qc_fc": np.nanmedian(np.abs(metrics.batched_qc_fc(whole[arm][:, subset], fd, covariates, counts)), axis=1),
+        "global_motion": np.abs(metrics.batched_qc_fc(
+            np.nanmean(whole[arm], axis=1, keepdims=True), fd, covariates, counts)[:, 0]),
+    } for arm in arms}  # fmt: skip
 
     def intervals(arm, other):
-        return {
-            "icc": metrics.bootstrap_difference(
-                lambda idx: median_icc(arm, idx, subset) - median_icc(other, idx, subset), n_split, n_boot, seed),
-            "qc_fc": metrics.bootstrap_difference(
-                lambda idx: median_qc(arm, idx, subset) - median_qc(other, idx, subset), n, n_boot, seed),
-            "global_motion": metrics.bootstrap_difference(
-                lambda idx: global_motion(arm, idx) - global_motion(other, idx), n, n_boot, seed),
-        }  # fmt: skip
+        return {k: metrics.percentile_interval(draws[arm][k] - draws[other][k]) for k in draws[arm]}
 
     report = {"n_sessions_motion": n, "n_sessions_reliability": n_split,
               "by_make": {m: sum(r[0] == m for r in rows) for m in {r[0] for r in rows}},

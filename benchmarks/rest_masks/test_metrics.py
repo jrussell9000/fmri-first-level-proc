@@ -76,6 +76,24 @@ def test_qc_fc_recovers_a_known_correlation_and_controls_covariates():
     assert abs(r2[0]) < 0.05
 
 
+def test_batched_bootstrap_matches_the_per_draw_loop():
+    rng = np.random.default_rng(4)
+    n, edges, n_boot = 40, 30, 25
+    a, b = rng.normal(size=(n, edges)), rng.normal(size=(n, edges))
+    fd = rng.normal(size=n)
+    make = np.zeros((n, 2))
+    make[:3, 0] = 1  # a rare level, which some draws leave out
+    make[3:20, 1] = 1
+    counts = metrics.bootstrap_counts(n, n_boot, 7)
+    gen = np.random.default_rng(7)
+    picks = [gen.integers(0, n, n) for _ in range(n_boot)]
+    assert any(c[:3].sum() == 0 for c in counts)
+    loop_icc = [np.nanmedian(metrics.edgewise_icc(a[i], b[i])) for i in picks]
+    loop_qc = np.stack([metrics.qc_fc(a[i], fd[i], make[i])[0] for i in picks])
+    assert metrics.batched_median_icc(a, b, counts, chunk=10) == pytest.approx(loop_icc, abs=1e-10)
+    assert metrics.batched_qc_fc(a, fd, make, counts, chunk=10) == pytest.approx(loop_qc, abs=1e-10)
+
+
 def test_session_fc_uses_only_kept_frames():
     t = np.arange(10.0)
     series = np.column_stack([t, t])

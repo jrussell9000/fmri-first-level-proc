@@ -123,3 +123,60 @@ def bootstrap_difference(statistic, n_subjects, n_boot, seed):
     rng = np.random.default_rng(seed)
     draws = np.array([statistic(rng.integers(0, n_subjects, n_subjects)) for _ in range(n_boot)])
     return float(np.percentile(draws, 2.5)), float(np.percentile(draws, 97.5))
+
+
+# Batched bootstrap. A draw of subjects with replacement is a count per subject, so every
+# statistic below becomes weighted sums, and all draws are one matrix product. The counts come
+# from the same generator calls as bootstrap_difference, so a seed gives the same draws.
+
+def bootstrap_counts(n_subjects, n_boot, seed):
+    """(n_boot, n_subjects) times each subject was drawn."""
+    rng = np.random.default_rng(seed)
+    return np.stack([np.bincount(rng.integers(0, n_subjects, n_subjects), minlength=n_subjects)
+                     for _ in range(n_boot)]).astype(float)  # fmt: skip
+
+
+def percentile_interval(draws):
+    return float(np.percentile(draws, 2.5)), float(np.percentile(draws, 97.5))
+
+
+def _finite(*arrays):
+    if any(np.isnan(a).any() for a in arrays):
+        raise ValueError("the batched bootstrap needs finite edges")
+
+
+def batched_median_icc(half_a, half_b, counts, chunk=100):
+    """Median over edges of edgewise_icc, per draw. Inputs as edgewise_icc."""
+    _finite(half_a, half_b)
+    mean, diff = (half_a + half_b) / 2, half_a - half_b
+    mean, diff = mean - mean.mean(axis=0), diff - diff.mean(axis=0)  # centred, for precision
+    n = counts.shape[1]
+    out = []
+    for c in np.array_split(counts, max(1, len(counts) // chunk)):
+        between = 2 * (c @ mean**2 - (c @ mean) ** 2 / n)
+        error = (c @ diff**2 - (c @ diff) ** 2 / n) / 2
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out.append(np.nanmedian((between - error) / (between + error), axis=1))
+    return np.concatenate(out)
+
+
+def batched_qc_fc(fc, mean_fd, covariates, counts, chunk=100):
+    """qc_fc's r per draw and edge, (n_boot, edges): weighted least squares on the counts."""
+    _finite(fc)
+    n = len(fc)
+    design = np.column_stack([np.ones(n), covariates]) if covariates.size else np.ones((n, 1))
+    y = fc - fc.mean(axis=0)
+    x = np.asarray(mean_fd, dtype=float) - np.mean(mean_fd)
+    design_y = [design[:, [j]] * y for j in range(design.shape[1])]
+    y2, xy_terms = y**2, x[:, None] * y
+    out = []
+    for c in np.array_split(counts, max(1, len(counts) // chunk)):
+        inverse = np.linalg.pinv(np.einsum("bi,ij,ik->bjk", c, design, design))
+        dy = np.stack([c @ term for term in design_y], axis=1)
+        dx = (c * x) @ design
+        yy = c @ y2 - np.einsum("bje,bjk,bke->be", dy, inverse, dy)
+        xx = c @ x**2 - np.einsum("bj,bjk,bk->b", dx, inverse, dx)
+        xy = c @ xy_terms - np.einsum("bj,bjk,bke->be", dx, inverse, dy)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out.append(xy / np.sqrt(xx[:, None] * yy))
+    return np.concatenate(out)
