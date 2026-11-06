@@ -8,7 +8,7 @@ and CI fails if that stops being true.
 
 **Upstream base:** `e40d1bc6f519b9a61996a594b395fef4ec9c9fd2`
 
-**Fork version:** `4.0.0+cp.1`, in `pyproject.toml`. The part before the `+` is upstream's
+**Fork version:** `4.0.0+cp.2`, in `pyproject.toml`. The part before the `+` is upstream's
 version and the rest counts fork releases on it. `__version__` in `__init__.py` stays upstream's
 value, so an analysis's QC reports the version of the core that ran it, and
 `fmri-first-level-abcd` records the fork version in its result.
@@ -43,7 +43,8 @@ Everything else in the fork is a new file under one of these paths:
 
 ### Commits
 
-Each commit is one decision and can be read or reverted alone. Add a row with each new change.
+Each commit is one decision and can be read or reverted alone. The table covers the rebuild;
+`git log <upstream base>..HEAD` lists everything since, and "Fork releases" below describes it.
 
 | Commit | Change |
 |---|---|
@@ -107,6 +108,20 @@ refactored core with the `src/` layout. Tags `v4.1.0`, `v4.2.0` and `v5.0.0` bel
 They are not ancestors of `main`, and `v5.0.0` is older than `4.0.0+cp.1` despite its number.
 
 ## Fork releases
+
+### 4.0.0+cp.2
+
+Rest now matches the orchestrator's denoising, and n-back analyses are unaffected.
+
+- **No global signal regression,** as in the orchestrator's config. A rest run can have 2 more
+  censored frames before it is lost, because the regressor and its derivative are gone.
+- **WM and CSF from FastSurfer's label masks,** as the orchestrator builds them, replacing the
+  probseg-based masks. On 268 baseline sessions the probseg masks did not meet the comparison's
+  pre-specified rule (`benchmarks/rest_masks/` on branch `rest-mask-comparison`). Rest no longer
+  reads the probseg, so `--probseg-state` and the `probseg_state` result field are gone, and a
+  run whose mask is empty is excluded as `tissue_mask_empty`.
+
+Rest connectivity matrices change.
 
 ### 4.0.0+cp.1
 

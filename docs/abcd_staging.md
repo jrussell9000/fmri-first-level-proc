@@ -14,7 +14,6 @@ pip install "fmri-first-level-proc[abcd] @ git+https://github.com/jrussell9000/f
 fmri-first-level-abcd \
     --subj sub-XXXX --ses ses-00A \
     --input-dir /data/sub-XXXX/ses-00A \
-    --probseg-state fixed \
     --workdir /scratch/stage \
     --out-dir /scratch/out \
     --atlas /path/to/parcellation.nii.gz \
@@ -42,11 +41,7 @@ func derivatives, or any files with the same names:
 | `{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_brainmask.nii.gz` | Brain mask |
 | `{subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv` | Motion, `non_steady_state_outlier_*` |
 | `{subj}_{ses}_task-nback_{run}_events.tsv` | n-back timing |
-| `{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{GM,WM,CSF}_probseg.nii.gz` | Rest tissue masks |
-| `{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-CSF_mask.nii.gz` | Ventricle restriction |
-
-`--probseg-state` must be `fixed` for rest to run. Any other value skips rest and records
-the reason; the two tissue rows above are needed only for `fixed`.
+| `{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{WM,CSF}_mask.nii.gz` | Rest tissue masks, needed only with rest runs |
 
 ## What it does
 
@@ -74,13 +69,12 @@ the reason; the two tissue rows above are needed only for `fixed`.
   its `run_labels` entry (the framework's Mode A), so each run gets its own baseline and PSC
   mean. All are masked by the intersection of their brain masks, because they enter one
   model. A run that fails staging is excluded and recorded, and the rest continue.
-- **Rest WM mask:** as fMRIPrep builds `white_matter`: dilated grey matter removed, moved
-  to the BOLD grid as partial-volume fractions, brain-masked, kept above 0.99.
-- **Rest CSF mask:** restricted to the ventricles with FastSurfer's `label-CSF_mask`, then
-  kept above the first of 0.99, 0.9 and 0.5 that leaves at least 100 voxels. This departs
-  from fMRIPrep, and is likely specific to ABCD.
-- **Rest global signal:** the mean of the trimmed BOLD within the run's brain mask, as the
-  orchestrator computes it.
+- **Rest WM and CSF:** as the orchestrator builds them. FastSurfer's 1 mm `label-WM_mask`
+  and `label-CSF_mask` go to the BOLD grid by nearest neighbour and are intersected with
+  the run's brain mask, and each regressor is the trimmed BOLD's mean there. A mask left
+  empty excludes the run as `tissue_mask_empty`.
+- **Rest global signal:** not regressed, as in the orchestrator's config. The core logs
+  `GS_MISSING`, a low-severity warning, for each rest analysis.
 - **Analyses:** fills `abcd/data/proc_config_final.yaml` (or `--template`) and runs each
   block through the `fmri-first-level-proc` CLI, once per block.
 
@@ -129,9 +123,9 @@ about rest, so a held-out session still runs its rest analysis.
 
 ## Result JSON
 
-`package_version`, `probseg_state`, `analyses` (name to status, exit code and warning flag,
-or skip reason) and `runs` (run to `n_remove`, `n_frames`, `dropped_events`, plus the
-mask voxel counts and `csf_threshold` on rest, or `excluded`). A repaired cue adds
+`package_version`, `analyses` (name to status, exit code and warning flag, or skip reason)
+and `runs` (run to `n_remove`, `n_frames`, `dropped_events`, plus the WM and CSF mask voxel
+counts on rest, or `excluded`). A repaired cue adds
 `cue_moved_to` and `cue_moved_from` to the two runs. A rest run that staged but that
 `rest_conn` left out adds `excluded_by_analysis`, with the reason from `excluded_runs` in
 the QC summary. `rest_conn` is recorded `failed` when the data leave no run.
