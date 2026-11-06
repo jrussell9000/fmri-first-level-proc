@@ -97,9 +97,17 @@ aws s3 cp /tmp/sessions.csv s3://abcd-v7/scratch/rest-masks/$TAG/sessions.csv
 aws s3 cp run_session.py s3://abcd-v7/scratch/rest-masks/$TAG/code/run_session.py
 argo -n argo-workflows submit workflow.yaml -p n-sessions=444 -p tag=$TAG
 aws s3 sync s3://abcd-v7/scratch/rest-masks/$TAG/sessions/ /tmp/sessions/
-# The labels: Schaefer2018_400Parcels_7Networks_order_FSLMNI152_1mm.Centroid_RAS.csv, from CBIG
-python analyze.py --sessions-dir /tmp/sessions --margins margins_v7.json --networks labels.csv --out report.json
+LABELS=../../fmri_first_level_proc/abcd/data/atlas/Schaefer2018_400Parcels_7Networks_order_Tian_Subcortex_S4_label.txt
+python analyze.py --sessions-dir /tmp/sessions --margins margins_v7.json --networks $LABELS --out report.json
 ```
+
+**Correction, 2026-11-06.** The first analysis read network names from CBIG's Schaefer-only table
+in list order, so each name sat on the parcel 54 places before its own: the atlas numbers Tian's
+54 subcortical parcels first. That scrambled the secondary network contrast, which is outside the
+rule. With names taken from the atlas's own label table, every other figure in the report is
+unchanged. The network contrast is 0.262 for `taylor_off`, 0.242 for `ours_off` and 0.276 for
+`ours_on`; it was reported as 0.106, 0.093 and 0.111. The order is the same, and the decision does
+not change.
 
 A rerun skips sessions that already have a saved result.
 

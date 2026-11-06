@@ -58,6 +58,26 @@ def test_network_contrast_on_known_edges():
     assert metrics.network_contrast(fc, networks) == pytest.approx(0.75)
 
 
+def test_network_names_follow_the_atlas_values_not_the_list_order(tmp_path, monkeypatch):
+    """Tian's subcortex holds values 1-54 and comes first; a name must land on its own value."""
+    monkeypatch.setattr(analyze, "N_CORTICAL", 2)
+    table = tmp_path / "label.txt"
+    table.write_text("HIP-head-m1-rh\n1 1 1 1 255\n7Networks_LH_Vis_1\n2 1 1 1 255\n"
+                     "7Networks_RH_Default_pCunPCC_9\n3 1 1 1 255\n")  # fmt: skip
+    assert analyze.network_ids(table, 3).tolist() == ["", "Vis", "Default"]
+
+
+def test_the_real_atlas_table_gives_54_unnamed_parcels_then_400_named_ones():
+    table = Path(__file__).resolve().parents[2] / (
+        "fmri_first_level_proc/abcd/data/atlas/Schaefer2018_400Parcels_7Networks_order_Tian_Subcortex_S4_label.txt"
+    )
+    if not table.is_file():
+        pytest.skip("the atlas ships from fork 4.0.0+cp.4")
+    networks = analyze.network_ids(table, 454)
+    assert (networks[:54] == "").all() and (networks[54:] != "").all()
+    assert networks[54] == "Vis" and networks[-1] == "Default"
+
+
 def test_edgewise_icc_is_one_for_identical_halves_and_near_zero_for_unrelated():
     rng = np.random.default_rng(1)
     a = rng.normal(size=(300, 20))

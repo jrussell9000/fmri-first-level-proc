@@ -1,10 +1,12 @@
 """Compare the mask arms from each session's saved series. Writes one JSON with no subject IDs.
 
-    analyze.py --sessions-dir DIR --margins margins_v7.json --networks labels.csv --out report.json
+    analyze.py --sessions-dir DIR --margins margins_v7.json --networks LABEL_TXT --out report.json
+
+LABEL_TXT is the atlas's label table, fmri_first_level_proc/abcd/data/atlas/
+Schaefer2018_400Parcels_7Networks_order_Tian_Subcortex_S4_label.txt.
 """
 
 import argparse
-import csv
 import json
 import sys
 from pathlib import Path
@@ -19,7 +21,7 @@ REFERENCE = "taylor_off"
 CANDIDATE = "ours_off"
 CONTROL = "ours_on"
 MIN_FRAMES_PER_HALF = 150  # 2 minutes
-N_CORTICAL = 400  # the atlas's Schaefer parcels; Tian's subcortical ones follow, with no network
+N_CORTICAL = 400  # the atlas's Schaefer parcels, values 55-454, after Tian's 54 with no network
 
 
 def load_session(path):
@@ -69,13 +71,20 @@ def make_covariates(makes):
     return np.array([[m == level for level in levels] for m in makes], dtype=float).reshape(len(makes), len(levels))
 
 
-def network_ids(path, n_edges_parcels):
-    """Network name per parcel, from the Schaefer label table; '' for parcels with none."""
-    with open(path, newline="") as handle:
-        names = [row["ROI Name"].split("_")[2] for row in csv.DictReader(handle)]
-    if len(names) != N_CORTICAL:
-        raise ValueError(f"expected {N_CORTICAL} labels, got {len(names)}")
-    return np.array(names + [""] * (n_edges_parcels - len(names)))
+def network_ids(path, n_parcels):
+    """Network name per parcel, '' for parcels with none, from the atlas's own label table
+    (abcd/data/atlas/*_label.txt): a name line, then a `value r g b a` line, per parcel.
+    Parcel i holds value i + 1. Tian's subcortical parcels take values 1-54, so they come
+    first. Until 2026-11-06 this read CBIG's Schaefer-only table in order, which put every
+    network name on the parcel 54 places before its own."""
+    lines = [line.strip() for line in Path(path).read_text().splitlines() if line.strip()]
+    networks = np.array([""] * n_parcels, dtype=object)
+    for name, values in zip(lines[0::2], lines[1::2], strict=True):
+        if name.startswith("7Networks_"):
+            networks[int(values.split()[0]) - 1] = name.split("_")[2]
+    if (networks != "").sum() != N_CORTICAL:
+        raise ValueError(f"expected {N_CORTICAL} cortical labels, got {(networks != '').sum()}")
+    return networks.astype(str)
 
 
 def evaluate(rows, distances, networks, n_boot, seed, arms=ARMS):
@@ -162,7 +171,7 @@ def main(argv=None):
     ap.add_argument("--sessions-dir", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--margins", type=Path, required=True)
-    ap.add_argument("--networks", type=Path, help="Schaefer label table; without it, no network measure")
+    ap.add_argument("--networks", type=Path, help="the atlas's label table; without it, no network measure")
     ap.add_argument("--n-boot", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=20261104)
     args = ap.parse_args(argv)
