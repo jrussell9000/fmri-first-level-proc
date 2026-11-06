@@ -46,6 +46,14 @@ SPACE_RES1 = f"{SPACE}_res-1"
 # Rest's nuisance tissues, from FastSurfer's 1 mm label masks, as the orchestrator takes them.
 TISSUES = ("WM", "CSF")
 PROC_TEMPLATE = Path(__file__).resolve().parent / "data" / "proc_config_final.yaml"
+# Schaefer 400 + Tian S4 in MNI152NLin2009cAsym at 2 mm; data/atlas/README.md has its source,
+# licences and citations.
+PACKAGED_ATLAS = (
+    Path(__file__).resolve().parent
+    / "data"
+    / "atlas"
+    / "Schaefer2018_400Parcels_7Networks_order_Tian_Subcortex_S4_3T_MNI152NLin2009cAsym_2mm.nii.gz"
+)
 
 # Per analysis in proc_config_final.yaml: its task and the post-ID parts of its
 # prefixes (`sub-{ID}_{ses}_{post_id}`). Carried over unchanged from the retired
@@ -719,7 +727,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--input-dir", type=Path, required=True, help="the session's files")
     ap.add_argument("--workdir", type=Path, required=True, help="staged inputs go here")
     ap.add_argument("--out-dir", type=Path, required=True, help="analysis outputs go here")
-    ap.add_argument("--atlas", required=True, help="the parcellation, the config's template_path")
+    ap.add_argument(
+        "--atlas",
+        default=str(PACKAGED_ATLAS),
+        help="the parcellation, the config's template_path (default: the packaged Schaefer 400 + Tian S4)",
+    )
     ap.add_argument("--result", type=Path, required=True, help="write the result JSON here")
     ap.add_argument(
         "--run-validity",

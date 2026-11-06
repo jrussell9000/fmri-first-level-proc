@@ -16,10 +16,14 @@ fmri-first-level-abcd \
     --input-dir /data/sub-XXXX/ses-00A \
     --workdir /scratch/stage \
     --out-dir /scratch/out \
-    --atlas /path/to/parcellation.nii.gz \
     --run-validity /path/to/first_level_run_validity.csv \
     --result /scratch/result.json
 ```
+
+`--atlas` defaults to the packaged Schaefer 400 + Tian S4 parcellation in
+MNI152NLin2009cAsym at 2 mm. [`abcd/data/atlas/README.md`](../fmri_first_level_proc/abcd/data/atlas/README.md)
+gives its source, its licences and the two papers to cite. Its subcortical parcels come first
+(values 1–54), so parcel-by-parcel outputs list the subcortex before the cortex.
 
 It works only on local files and never contacts a remote store. It needs AFNI and the
 `fmri-first-level-proc` CLI on `PATH`.
