@@ -30,7 +30,7 @@ It works only on local files and never contacts a remote store. It needs AFNI an
 
 | Exit | Meaning |
 |---|---|
-| 0 | Every analysis finished, and the result JSON is written. An analysis may be recorded `failed` (a data-determined model failure, CLI exit 5, or a tool failure the data decide, such as `3dLSS` given more design columns than frames, recorded with `reason: too-few-frames-for-model`) or skipped. If rules leave nothing to run, the output directory holds only `{subj}_{ses}_first_level_skipped.json`. |
+| 0 | Every analysis finished, and the result JSON is written. An analysis may be recorded `failed` (a data-determined model failure, CLI exit 5, or a tool failure the data decide, such as `3dDeconvolve` or `3dLSS` given more design columns than frames, recorded with `reason: too-few-frames-for-model`) or skipped. If rules leave nothing to run, the output directory holds only `{subj}_{ses}_first_level_skipped.json`. |
 | 1 | The session failed, and no result is written. |
 
 ## Inputs
