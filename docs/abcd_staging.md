@@ -30,7 +30,7 @@ It works only on local files and never contacts a remote store. It needs AFNI an
 
 | Exit | Meaning |
 |---|---|
-| 0 | Every analysis finished, and the result JSON is written. An analysis may be recorded `failed` (a data-determined model failure, CLI exit 5) or skipped. If rules leave nothing to run, the output directory holds only `{subj}_{ses}_first_level_skipped.json`. |
+| 0 | Every analysis finished, and the result JSON is written. An analysis may be recorded `failed` (a data-determined model failure, CLI exit 5, or a tool failure the data decide, such as `3dLSS` given more design columns than frames, recorded with `reason: too-few-frames-for-model`) or skipped. If rules leave nothing to run, the output directory holds only `{subj}_{ses}_first_level_skipped.json`. |
 | 1 | The session failed, and no result is written. |
 
 ## Inputs
@@ -96,6 +96,7 @@ func derivatives, or any files with the same names:
 | `unexpected-dummy` | The `dummy` isn't a whole number of frames, or isn't 0, the NSS count or one below it |
 | `predates-ge-timing-correction` | A GE run logs its full NSS count, unlike every other GE run; its onsets may be up to 0.8 s off |
 | `unexpected-frame-count` | The run wouldn't keep 363 frames (NSS count of 5 or 16, GE) or 362 (otherwise): a wrong scanner label, or a short run |
+| `unexpected-event-timing` | The task events, first to last onset, span more than 276 s. Across ABCD 7.0 the median is 267.1 s and 99% fall in 266.5–269.8 s. A longer span means evenly stretched blocks or pauses not in the design, so the onsets are misplaced. Above about 290 s they also pass the run's end |
 
 ## Run-validity table
 

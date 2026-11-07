@@ -8,7 +8,7 @@ and CI fails if that stops being true.
 
 **Upstream base:** `e40d1bc6f519b9a61996a594b395fef4ec9c9fd2`
 
-**Fork version:** `4.0.0+cp.6`, in `pyproject.toml`. The part before the `+` is upstream's
+**Fork version:** `4.0.0+cp.7`, in `pyproject.toml`. The part before the `+` is upstream's
 version and the rest counts fork releases on it. `__version__` in `__init__.py` stays upstream's
 value, so an analysis's QC reports the version of the core that ran it, and
 `fmri-first-level-abcd` records the fork version in its result.
@@ -109,6 +109,21 @@ refactored core with the `src/` layout. Tags `v4.1.0`, `v4.2.0` and `v5.0.0` bel
 They are not ancestors of `main`, and `v5.0.0` is older than `4.0.0+cp.1` despite its number.
 
 ## Fork releases
+
+### 4.0.0+cp.7
+
+Two cases that failed whole sessions in cloudpipe's cohort waves now lose only what they must.
+
+- **n-back runs with misplaced events are excluded as `unexpected-event-timing`.** A run's task events
+  span more than 276 s, first to last onset, where ABCD 7.0's median is 267.1 s and 99% fall within
+  266.5–269.8 s. That covers 351 of 58,589 runs, from evenly stretched blocks or pauses not in the
+  design. Above about 290 s the core rejected them as past the run's end, and the whole session
+  failed; between 276 and 290 s they would have been modelled with wrong timing. The session keeps
+  its other run and its rest.
+- **`3dLSS` with more design columns than frames fails only `nback_conn`.** Heavy censoring can
+  leave too few frames for the trial-by-trial design. The core reports this as a tool failure (exit
+  4), and the session failed. It is now recorded as that analysis `failed`, with reason
+  `too-few-frames-for-model`, like a model failure, and the session's other analyses publish.
 
 ### 4.0.0+cp.6
 

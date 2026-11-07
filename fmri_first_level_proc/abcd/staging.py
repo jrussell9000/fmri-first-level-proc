@@ -83,8 +83,18 @@ GE_NSS_COUNTS = (5, 16)
 KEPT_FRAMES, KEPT_FRAMES_GE = 362, 363
 # A cue starts this long before its block's first stimulus.
 CUE_LEAD_SECONDS = 3.0
+# The task's events, first to last onset, span a fixed schedule: on all 58,589 ABCD 7.0 runs
+# the median is 267.1 s and 99% lie in 266.5-269.8 s. 351 runs span more, from evenly
+# stretched blocks or pauses not in the design, so every onset after the first is
+# misplaced. Above 290 s the core rejects the events as past the run's end; between 276 and
+# 290 s nothing would notice. 276 s is about 9 s past the median (operator, 2026-11-07).
+NBACK_MAX_EVENT_SPAN_S = 276.0
 # CLI exit codes (README). 5 is data-determined and does not fail the session; 1/2/4 do.
-EXIT_OK, EXIT_HIGH_WARNINGS, EXIT_MODEL = 0, 3, 5
+EXIT_OK, EXIT_HIGH_WARNINGS, EXIT_TOOL, EXIT_MODEL = 0, 3, 4, 5
+# A tool failure that the data decide, not a fault: 3dLSS's trial-by-trial design has more
+# columns than censoring left frames. The core reports it as exit 4; it is recorded as that
+# analysis failed, like exit 5, so the session's other analyses still publish.
+DATA_LIMITED_TOOL_ERRORS = {"Matrix has too many columns": "too-few-frames-for-model"}
 
 
 class SessionError(RuntimeError):
@@ -273,6 +283,15 @@ def nback_trim(events: pd.DataFrame, n_nss: int, frames: int, tr: float) -> tupl
     return n_remove, seconds
 
 
+def check_event_span(events: pd.DataFrame) -> None:
+    """Exclude a run whose task events, first to last onset, span more than the task's
+    schedule allows (NBACK_MAX_EVENT_SPAN_S): its onsets are misplaced, whether or not
+    they still fall inside the scan."""
+    onsets = events.loc[_labels(events) != "dummy", "onset"].astype(float)
+    if len(onsets) > 1 and onsets.max() - onsets.min() > NBACK_MAX_EVENT_SPAN_S:
+        raise RunExcluded("unexpected-event-timing")
+
+
 def repair_stray_cue(
     first: pd.DataFrame, second: pd.DataFrame, first_frames: int, tr: float
 ) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
@@ -374,12 +393,18 @@ def fill_config(
     return cfg
 
 
-def classify_exit(code: int) -> dict:
-    """One analysis's CLI exit -> its result entry; raises for session failures."""
+def classify_exit(code: int, error_message: str | None = None) -> dict:
+    """One analysis's CLI exit -> its result entry; raises for session failures. A tool
+    failure (exit 4) whose error is in DATA_LIMITED_TOOL_ERRORS counts as that analysis
+    failed, with the reason, as a model failure does."""
     if code in (EXIT_OK, EXIT_HIGH_WARNINGS):
         return {"status": "completed", "exit_code": code, "high_warnings": code == 3}
     if code == EXIT_MODEL:
         return {"status": "failed", "exit_code": code, "high_warnings": False}
+    if code == EXIT_TOOL:
+        reason = next((r for text, r in DATA_LIMITED_TOOL_ERRORS.items() if text in (error_message or "")), None)
+        if reason:
+            return {"status": "failed", "exit_code": code, "high_warnings": False, "reason": reason}
     raise SessionError(f"fmri-first-level-proc exited {code}")
 
 
@@ -533,6 +558,7 @@ class Session:
                 run.n_remove, run.onset_shift = nback_trim(
                     run.raw_events, nss_count(confounds), frames[run.rid], tr
                 )
+                check_event_span(run.raw_events)  # after the cue repair, which can shorten it
                 motion_matrix(confounds, run.n_remove)  # here, so the run leaves the mask too
             except RunExcluded as exc:
                 run.excluded = str(exc)
@@ -734,9 +760,10 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
         log("analysis-start", analysis=name)
         # Run from the out_dir: 3dDeconvolve writes 3dDeconvolve.err to the cwd.
         code = run_cli(cmd, cwd=block["out_dir"])
-        analyses[name] = classify_exit(code)
+        error = analysis_error(analysis_qc(block)) if code not in (EXIT_OK, EXIT_HIGH_WARNINGS) else None
+        analyses[name] = classify_exit(code, error and error["message"])
         if analyses[name]["status"] == "failed":
-            analyses[name]["error"] = analysis_error(analysis_qc(block))
+            analyses[name]["error"] = error
         log("analysis-end", analysis=name, **analyses[name])
         if name == "rest_conn":
             note_runs_excluded_by_analysis(block, rest_runs, analyses[name]["status"])
