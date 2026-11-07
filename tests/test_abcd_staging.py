@@ -180,6 +180,31 @@ def test_events_shifted_before_zero_are_dropped_and_counted():
     assert (ev["onset"] >= 0).all()
 
 
+def schedule(span: float) -> pd.DataFrame:
+    """A dummy row, then task events whose onsets run from 6.41 s for `span` seconds."""
+    rows = [(0.0, 6.4, "dummy"), (6.41, 2.89, "cue")]
+    rows += [(6.41 + span * k / 10, 1.9, "0_back_posface") for k in range(1, 11)]
+    return pd.DataFrame(rows, columns=["onset", "duration", "trial_type"])
+
+
+@pytest.mark.parametrize("span", [267.1, 269.8, 276.0])
+def test_a_normal_schedule_passes(span):
+    sfl.check_event_span(schedule(span))
+
+
+@pytest.mark.parametrize("span", [276.1, 300.0, 332.3])
+def test_a_stretched_or_paused_schedule_excludes_the_run(span):
+    """276-290 s still ends inside the scan, so only this rule notices it."""
+    with pytest.raises(sfl.RunExcluded, match="unexpected-event-timing"):
+        sfl.check_event_span(schedule(span))
+
+
+def test_the_dummy_row_is_not_part_of_the_span():
+    events = schedule(267.1)
+    events.loc[0, "onset"] = -40.0  # a dummy row far from the rest changes nothing
+    sfl.check_event_span(events)
+
+
 # ---------------------------------------------------------------------------
 # Tissue masks
 # ---------------------------------------------------------------------------
@@ -570,6 +595,34 @@ def test_a_tool_failure_fails_the_session(tmp_path, fake_tools):
         run(tmp_path)
 
 
+def test_a_beta_series_with_too_few_frames_fails_only_its_analysis(tmp_path, fake_tools, analysis_qc):
+    """3dLSS refuses a design with more columns than frames; the data decide that."""
+    _, exits = fake_tools
+    exits["nback_conn"] = 4
+    message = ("AFNI command failed (3dLSS beta series): 3dLSS -matrix x.x1D\n"
+               "  stderr: ++ 3dLSS: AFNI version=AFNI_26.3.07\n"
+               "** FATAL ERROR: Matrix has too many columns (174) for number of rows (175)")  # fmt: skip
+    error = {"type": "ToolExecutionError", "message": message, "exit_code": 4, "step": "lss"}
+    analysis_qc["nback_conn"] = {"analysis_type": "task_conn", "run_status": {"status": "failed", "error": error}}
+    seed_session(tmp_path / "raw")
+    result = run(tmp_path)
+    entry = result["analyses"]["nback_conn"]
+    assert entry["status"] == "failed" and entry["reason"] == "too-few-frames-for-model"
+    assert entry["error"]["type"] == "ToolExecutionError"
+    assert result["analyses"]["nback_act"]["status"] == "completed"
+    assert result["analyses"]["rest_conn"]["status"] == "completed"
+
+
+def test_a_stretched_run_leaves_the_session_its_other_run_and_rest(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    rows = [(0.0, 6.4, "dummy"), (6.41, 2.89, "cue"), (9.41, 1.9, "0_back_posface"), (300.0, 1.9, "0_back_posface")]
+    overwrite_events(tmp_path, "task-nback_run-02", rows)
+    result = run(tmp_path)
+    assert result["runs"]["task-nback_run-02"] == {"excluded": "unexpected-event-timing"}
+    assert nback_block(tmp_path)["run_labels"] == [1]
+    assert result["analyses"]["rest_conn"]["status"] == "completed"
+
+
 def test_one_bad_run_does_not_fail_the_session(tmp_path, fake_tools):
     seed_session(tmp_path / "raw")
     bad = tmp_path / "raw" / f"{SUBJ}_{SES}_task-nback_run-02_desc-confounds_timeseries.tsv"
@@ -894,7 +947,9 @@ def test_a_stray_cue_with_nowhere_to_go_still_excludes_its_run(tmp_path, fake_to
     seed_session(tmp_path / "raw")
     overwrite_events(tmp_path, "task-nback_run-01", STRAY)
     result = run(tmp_path)  # run-02 has its own first cue
-    assert "no following" in result["runs"]["task-nback_run-01"]["excluded"]
+    # The cue left behind sits past the run's end, so the span rule excludes the run before
+    # the cue relabel would ("cue ... has no following n-back trial").
+    assert result["runs"]["task-nback_run-01"]["excluded"] == "unexpected-event-timing"
 
 
 def test_a_cue_inside_the_scan_with_no_trial_is_not_moved(tmp_path, fake_tools):
