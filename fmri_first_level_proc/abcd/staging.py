@@ -92,10 +92,15 @@ CUE_LEAD_SECONDS = 3.0
 NBACK_MAX_EVENT_SPAN_S = 276.0
 # CLI exit codes (README). 5 is data-determined and does not fail the session; 1/2/4 do.
 EXIT_OK, EXIT_HIGH_WARNINGS, EXIT_TOOL, EXIT_MODEL = 0, 3, 4, 5
-# A tool failure that the data decide, not a fault: 3dLSS's trial-by-trial design has more
-# columns than censoring left frames. The core reports it as exit 4; it is recorded as that
-# analysis failed, like exit 5, so the session's other analyses still publish.
-DATA_LIMITED_TOOL_ERRORS = {"Matrix has too many columns": "too-few-frames-for-model"}
+# Tool failures that the data decide, not faults: the trial-by-trial design has more columns
+# than censoring left frames, caught by 3dDeconvolve when it builds the matrix or by 3dLSS
+# when it fits it. The core reports either as exit 4; each is recorded as that analysis
+# failed, like exit 5, so the session's other analyses still publish.
+DATA_LIMITED_TOOL_ERRORS = {
+    "Matrix has too many columns": "too-few-frames-for-model",  # 3dLSS
+    # 3dDeconvolve: "Insufficient data (153) for estimating 174 parameters"
+    "Insufficient data": "too-few-frames-for-model",
+}
 
 
 class SessionError(RuntimeError):

@@ -595,13 +595,16 @@ def test_a_tool_failure_fails_the_session(tmp_path, fake_tools):
         run(tmp_path)
 
 
-def test_a_beta_series_with_too_few_frames_fails_only_its_analysis(tmp_path, fake_tools, analysis_qc):
-    """3dLSS refuses a design with more columns than frames; the data decide that."""
+@pytest.mark.parametrize("message", [
+    "AFNI command failed (3dLSS beta series): 3dLSS -matrix x.x1D\n  stderr: ++ 3dLSS: AFNI version=AFNI_26.3.07\n"
+    "** FATAL ERROR: Matrix has too many columns (174) for number of rows (175)",
+    "AFNI command failed (3dDeconvolve design matrix): 3dDeconvolve -quiet -input x.nii.gz\n  stderr: ...\n"
+    "** FATAL ERROR: 3dDeconvolve dies: Insufficient data (153) for estimating 174 parameters",
+])  # fmt: skip
+def test_a_beta_series_with_too_few_frames_fails_only_its_analysis(tmp_path, fake_tools, analysis_qc, message):
+    """3dDeconvolve or 3dLSS refuses a design with more columns than frames; the data decide that."""
     _, exits = fake_tools
     exits["nback_conn"] = 4
-    message = ("AFNI command failed (3dLSS beta series): 3dLSS -matrix x.x1D\n"
-               "  stderr: ++ 3dLSS: AFNI version=AFNI_26.3.07\n"
-               "** FATAL ERROR: Matrix has too many columns (174) for number of rows (175)")  # fmt: skip
     error = {"type": "ToolExecutionError", "message": message, "exit_code": 4, "step": "lss"}
     analysis_qc["nback_conn"] = {"analysis_type": "task_conn", "run_status": {"status": "failed", "error": error}}
     seed_session(tmp_path / "raw")
