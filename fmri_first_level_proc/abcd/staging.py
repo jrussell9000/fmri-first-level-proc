@@ -84,10 +84,11 @@ KEPT_FRAMES, KEPT_FRAMES_GE = 362, 363
 # A cue starts this long before its block's first stimulus.
 CUE_LEAD_SECONDS = 3.0
 # The task's events, first to last onset, span a fixed schedule: on all 58,589 ABCD 7.0 runs
-# the median is 267.1 s and 99% lie in 266.5-269.8 s. 351 runs span more, from evenly
-# stretched blocks or pauses not in the design, so every onset after the first is
-# misplaced. Above 290 s the core rejects the events as past the run's end; between 276 and
-# 290 s nothing would notice. 276 s is about 9 s past the median (operator, 2026-11-07).
+# the median is 267.1 s and 99% lie in 266.5-269.8 s. After the stray-cue repair, 256 runs
+# span more, from evenly stretched blocks or pauses not in the design, so every onset after
+# the first is misplaced. Above 290 s (about 214 runs) the core rejects the events as past the
+# run's end; between 276 and 290 s (42) nothing would notice. 276 s is about 9 s past the
+# median (operator, 2026-11-07). The repair runs first: a stray cue alone spans ~310 s.
 NBACK_MAX_EVENT_SPAN_S = 276.0
 # CLI exit codes (README). 5 is data-determined and does not fail the session; 1/2/4 do.
 EXIT_OK, EXIT_HIGH_WARNINGS, EXIT_TOOL, EXIT_MODEL = 0, 3, 4, 5
