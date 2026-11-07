@@ -116,10 +116,12 @@ Two cases that failed whole sessions in cloudpipe's cohort waves now lose only w
 
 - **n-back runs with misplaced events are excluded as `unexpected-event-timing`.** A run's task events
   span more than 276 s, first to last onset, where ABCD 7.0's median is 267.1 s and 99% fall within
-  266.5–269.8 s. That covers 351 of 58,589 runs, from evenly stretched blocks or pauses not in the
-  design. Above about 290 s the core rejected them as past the run's end, and the whole session
-  failed; between 276 and 290 s they would have been modelled with wrong timing. The session keeps
-  its other run and its rest.
+  266.5–269.8 s. That covers 256 of 58,589 runs, from evenly stretched blocks or pauses not in the
+  design. Above about 290 s (about 214 runs) the core rejected them as past the run's end, and the
+  whole session failed; between 276 and 290 s (42) they would have been modelled with wrong timing.
+  The session keeps its other run and its rest. The check follows the stray-cue repair, so the 95
+  stray-cue runs, which span about 310 s only until their cue moves back, are not excluded.
+  (Corrected on 2026-11-07: the first count, 351, measured spans before that repair.)
 - **`3dLSS` with more design columns than frames fails only `nback_conn`.** Heavy censoring can
   leave too few frames for the trial-by-trial design. The core reports this as a tool failure (exit
   4), and the session failed. It is now recorded as that analysis `failed`, with reason
