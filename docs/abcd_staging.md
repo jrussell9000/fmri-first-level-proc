@@ -4,6 +4,10 @@
 it. It is optional and separate from the framework: nothing in the core imports it, and
 it needs the `abcd` extra.
 
+This page is the record of the staging rules. Cloudpipe's own spec covers only how it
+deploys the CLI: which sessions it passes, publishing, and the queue. A change to a rule here
+is a fork release, listed in [`FORK.md`](../FORK.md).
+
 ```bash
 pip install "fmri-first-level-proc[abcd] @ git+https://github.com/jrussell9000/fmri-first-level-proc.git"
 ```
@@ -82,8 +86,28 @@ func derivatives, or any files with the same names:
   empty excludes the run as `tissue_mask_empty`.
 - **Rest global signal:** not regressed, as in the orchestrator's config. The core logs
   `GS_MISSING`, a low-severity warning, for each rest analysis.
+- **Rest denoising:** as the orchestrator `5855f3f`, set in the packaged config's rest
+  block: censoring at `fd_threshold` 0.4 mm with `censor_prev_tr: true`, bandpass
+  0.01–0.1 Hz with `use_sequenced_bandpass: false`, and mean WM and CSF signals, not
+  aCompCor. A run left with DOF below 1 is lost as `dof_below_1`, and a session that
+  loses every rest run records `rest_conn` `failed`.
 - **Analyses:** fills `abcd/data/proc_config_final.yaml` (or `--template`) and runs each
-  block through the `fmri-first-level-proc` CLI, once per block.
+  block through the `fmri-first-level-proc` CLI, once per block, so one analysis's failure
+  cannot stop the others. The setup fields `out_dir`, `out_file_pre`, `extract_out_file_pre`
+  and `conn_out_file_pre` are set to `{subj}_{ses}_{post_id}`. Every analysis setting is
+  left as the template has it.
+
+## Analysis exits
+
+Each analysis's CLI exit becomes its entry in the result JSON:
+
+| CLI exit | Recorded as |
+|---|---|
+| 0 | `completed` |
+| 3 | `completed`, with `high_warnings: true` |
+| 5 (`ModelError`: singular design, DOF below 1, no surviving trials) | `failed`. The data decide it, and a retry would reproduce it, so the session still publishes |
+| 4, with an error in `DATA_LIMITED_TOOL_ERRORS` (`3dLSS` "Matrix has too many columns", `3dDeconvolve` "Insufficient data") | `failed`, with `reason: too-few-frames-for-model`, for the same reason |
+| Any other (1 a bug, 2 a config or input error staging caused, 4 any other tool failure) | The session fails: the CLI exits 1 and writes no result |
 
 ## n-back exclusions
 
