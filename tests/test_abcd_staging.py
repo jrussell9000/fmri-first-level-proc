@@ -520,6 +520,18 @@ def test_a_session_whose_rest_masks_are_all_empty_still_runs_nback(tmp_path, fak
     assert result["analyses"]["nback_act"]["status"] == "completed"
 
 
+@pytest.mark.parametrize("missing", [("WM",), ("CSF",), ("WM", "CSF")])
+def test_a_session_published_without_tissue_masks_skips_rest_and_runs_nback(tmp_path, fake_tools, missing):
+    seed_session(tmp_path / "raw")
+    for tissue in missing:
+        (tmp_path / "raw" / sfl.tissue_mask_name(SUBJ, SES, tissue)).unlink()
+    result = run(tmp_path)
+    assert result["analyses"]["rest_conn"] == {"status": "skipped", "reason": "no-tissue-masks"}
+    assert result["analyses"]["nback_act"]["status"] == "completed"
+    calls, _ = fake_tools
+    assert not any(c[0] == "3dresample" for c in calls)
+
+
 def test_a_run_the_analysis_excluded_is_recorded_on_that_run(tmp_path, fake_tools, analysis_qc):
     analysis_qc["rest_conn"] = {"excluded_runs": [{"run": 1, "reason": "too-few-frames"}]}
     seed_session(tmp_path / "raw")

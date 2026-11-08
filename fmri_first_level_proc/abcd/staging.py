@@ -618,7 +618,12 @@ class Session:
     def rest_paths(self, runs: list[Run], raws: dict) -> tuple[dict | None, str | None]:
         if not any(not r.excluded for r in runs):
             return None, "no-rest-runs"
-        labels = {t: self.path(tissue_mask_name(self.subj, self.ses, t)) for t in TISSUES}
+        # A session can be published without its tissue maps: func preproc's export of them
+        # is non-fatal. Rest then has no WM or CSF regressor, so it is skipped, and the
+        # session's n-back still runs.
+        labels = {t: self.input_dir / tissue_mask_name(self.subj, self.ses, t) for t in TISSUES}
+        if not all(p.is_file() for p in labels.values()):
+            return None, "no-tissue-masks"
         regressors: dict[str, dict[str, str]] = {}
         for run in runs:
             if run.excluded:

@@ -45,7 +45,7 @@ func derivatives, or any files with the same names:
 | `{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_brainmask.nii.gz` | Brain mask |
 | `{subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv` | Motion, `non_steady_state_outlier_*` |
 | `{subj}_{ses}_task-nback_{run}_events.tsv` | n-back timing |
-| `{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{WM,CSF}_mask.nii.gz` | Rest tissue masks, needed only with rest runs |
+| `{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{WM,CSF}_mask.nii.gz` | Rest tissue masks. Without them, rest is skipped as `no-tissue-masks` and n-back still runs |
 
 ## What it does
 
