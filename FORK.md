@@ -118,8 +118,11 @@ cloudpipe's func preproc now writes those columns with the same definition: Fast
 masks, AFNI's nearest neighbour to the BOLD grid, within the run's brain mask, and the BOLD's mean
 there (cloudpipe change `add-tissue-confound-columns`). On 16 real rest runs they matched this
 code's regressors voxel for voxel, with values within 4.8e-6, which is 3dmaskave's 6-digit
-rounding. The columns carry full float32 precision, so outputs differ from cp.9 at about 1e-6 and
-no more.
+rounding. The columns carry full float32 precision. Measured on one subject's four sessions rerun
+on cp.10, the regressors moved by at most 4.9e-6 relative, and regression and the bandpass amplify
+that: the rest Fisher-z matrices moved by a mean |Δz| of 5e-5 to 1.4e-4 (mean |z| 0.16–0.22, at
+most 0.0012), with r above 0.9999998 against cp.9. Censoring was identical. cloudpipe did not
+rerun its cp.9 trees.
 
 - A session whose rest TSVs lack the columns skips `rest_conn` as `no-tissue-confounds`. It replaces
   `no-tissue-masks`, and staging no longer reads the label masks. There is no fallback: every
