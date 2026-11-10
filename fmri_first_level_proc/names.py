@@ -126,12 +126,16 @@ def run_psc(pre, label=None):
     return f"{pre}_run{label}_psc.nii.gz"
 
 
+# The concatenations are uncompressed: each is the per-run files end to end, written
+# once and read whole by the model, the raw ptseries and validation, and gzip costs a
+# full compression to write and a full decompression on every read. (With one run
+# supplied, run_psc(pre, None) is the model input and keeps its .nii.gz name.)
 def psc_concat(pre):
-    return f"{pre}_psc.nii.gz"
+    return f"{pre}_psc.nii"
 
 
 def concat_scan(pre):
-    return f"{pre}_concat_scan.nii.gz"
+    return f"{pre}_concat_scan.nii"
 
 
 def run_intersect_mask(pre):
