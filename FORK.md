@@ -8,7 +8,7 @@ and CI fails if that stops being true.
 
 **Upstream base:** `e40d1bc6f519b9a61996a594b395fef4ec9c9fd2`
 
-**Fork version:** `4.0.0+cp.9`, in `pyproject.toml`. The part before the `+` is upstream's
+**Fork version:** `4.0.0+cp.10`, in `pyproject.toml`. The part before the `+` is upstream's
 version and the rest counts fork releases on it. `__version__` in `__init__.py` stays upstream's
 value, so an analysis's QC reports the version of the core that ran it, and
 `fmri-first-level-abcd` records the fork version in its result.
@@ -109,6 +109,23 @@ refactored core with the `src/` layout. Tags `v4.1.0`, `v4.2.0` and `v5.0.0` bel
 They are not ancestors of `main`, and `v5.0.0` is older than `4.0.0+cp.1` despite its number.
 
 ## Fork releases
+
+### 4.0.0+cp.10
+
+Rest's WM and CSF regressors are read from the confounds TSV's `white_matter` and `csf` columns,
+less the trimmed rows, instead of being computed here with `3dresample`, `3dcalc` and `3dmaskave`.
+cloudpipe's func preproc now writes those columns with the same definition: FastSurfer's label
+masks, AFNI's nearest neighbour to the BOLD grid, within the run's brain mask, and the BOLD's mean
+there (cloudpipe change `add-tissue-confound-columns`). On 16 real rest runs they matched this
+code's regressors voxel for voxel, with values within 4.8e-6, which is 3dmaskave's 6-digit
+rounding. The columns carry full float32 precision, so outputs differ from cp.9 at about 1e-6 and
+no more.
+
+- A session whose rest TSVs lack the columns skips `rest_conn` as `no-tissue-confounds`. It replaces
+  `no-tissue-masks`, and staging no longer reads the label masks. There is no fallback: every
+  published TSV has the columns.
+- A column that is `n/a` (an empty mask) excludes its run as `tissue_mask_empty`, as before.
+- The result no longer records `mask_voxels` on rest runs. FuncQC records the masks instead.
 
 ### 4.0.0+cp.9
 
