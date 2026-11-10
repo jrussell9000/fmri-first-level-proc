@@ -469,6 +469,36 @@ def test_every_analysis_shares_stages_through_the_work_dir(tmp_path, fake_tools)
     assert share_dirs == [str(tmp_path / "work" / "shared_stages")] * 3
 
 
+def test_concatenations_are_removed_after_every_analysis_and_runs_kept(tmp_path, fake_tools, monkeypatch):
+    """The concatenated series are the per-run files end to end, so they are not kept.
+    They go only after the last analysis: nback_conn takes nback_act's while it runs."""
+    pre = f"{SUBJ}_{SES}_nback"
+    concats = [f"{pre}_psc.nii", f"{pre}_concat_scan.nii"]
+    fake_cli = sfl.run_cli
+    act_concats_seen_by_conn = []
+
+    def run_cli(cmd, cwd):
+        out = Path(cwd)
+        if out.name == "nback_conn":
+            act_concats_seen_by_conn.append(all((out.parent / "nback_act" / c).is_file() for c in concats))
+        if out.name.startswith("nback"):
+            for name in [*concats, f"{pre}_run1_psc.nii.gz"]:
+                (out / name).write_text("x")
+        return fake_cli(cmd, cwd)
+
+    monkeypatch.setattr(sfl, "run_cli", run_cli)
+    seed_session(tmp_path / "raw")
+    result = run(tmp_path)
+
+    assert act_concats_seen_by_conn == [True]
+    for name in ("nback_act", "nback_conn"):
+        out = tmp_path / "out" / name
+        assert not any((out / c).exists() for c in concats)
+        assert (out / f"{pre}_run1_psc.nii.gz").is_file()
+        assert result["analyses"][name]["removed"] == concats
+    assert "removed" not in result["analyses"]["rest_conn"]
+
+
 def test_a_full_session_runs_every_analysis(tmp_path, fake_tools):
     seed_session(tmp_path / "raw")
     result = run(tmp_path)

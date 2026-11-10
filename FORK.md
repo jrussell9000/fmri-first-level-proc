@@ -36,6 +36,7 @@ reason.
 | M | `fmri_first_level_proc/roi.py` | The template stage is marked shareable; ROI QC and non-constant mask temporaries are uncompressed (4.0.0+cp.11) |
 | M | `fmri_first_level_proc/prep.py` | PSC QC temporaries are uncompressed (4.0.0+cp.11) |
 | M | `fmri_first_level_proc/rest_conn_first_level.py` | Per-run residual temporaries are uncompressed (4.0.0+cp.11) |
+| M | `fmri_first_level_proc/names.py` | The two concatenated series, `{pre}_psc` and `{pre}_concat_scan`, are uncompressed `.nii` (4.0.0+cp.11) |
 <!-- ledger:end -->
 
 ### Files added
