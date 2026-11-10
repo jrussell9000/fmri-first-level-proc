@@ -25,9 +25,11 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import gzip
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -790,18 +792,39 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
         removed = remove_concatenations(block)
         if removed:
             analyses[block["name"]]["removed"] = removed
+    keep_staged_runs(sess, all_runs, out_root)
 
     return _result(sess, analyses, all_runs)
+
+
+STAGED_DIR = "staged"
+
+
+def keep_staged_runs(sess: Session, runs: list[Run], out_root: Path) -> None:
+    """Write each staged run, the raw series every analysis started from, to
+    `{out_root}/staged/{subj}_{ses}_{run}_bold.nii.gz`, and record that path on the run as
+    `staged_bold`. They are kept in place of `{pre}_concat_scan`, which is these end to
+    end. Staging reads them uncompressed; they are compressed once here, at gzip's default
+    level, as AFNI writes a .nii.gz (level 1 measured no faster). A run that failed
+    staging is skipped: its file may be partial."""
+    for run in runs:
+        if run.failed or run.bold is None or not run.bold.is_file():
+            continue
+        rel = f"{STAGED_DIR}/{sess.subj}_{sess.ses}_{run.rid}_bold.nii.gz"
+        (out_root / STAGED_DIR).mkdir(parents=True, exist_ok=True)
+        with run.bold.open("rb") as src, gzip.GzipFile(out_root / rel, "wb", mtime=0) as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+        run.extra["staged_bold"] = rel
 
 
 def remove_concatenations(block: dict) -> list[str]:
     """Delete an analysis's concatenated series from its out_dir; the names removed.
 
     `{pre}_psc` is the published `{pre}_run{N}_psc` files end to end, and
-    `{pre}_concat_scan` the staged runs end to end, which staging rebuilds exactly from
-    the func derivatives; the PSC runs and their `_mean` volumes also give back the raw
-    runs (raw = psc * mean / 100) wherever PSC was neither capped at 200 nor zeroed.
-    The analysis's ledger still records them, as outputs of the run that made them."""
+    `{pre}_concat_scan` the staged runs end to end, which keep_staged_runs keeps; the
+    PSC runs and their `_mean` volumes also give back the raw runs (raw = psc * mean /
+    100) wherever PSC was neither capped at 200 nor zeroed. The analysis's ledger still
+    records them, as outputs of the run that made them."""
     out_dir, pre = Path(block["out_dir"]), block["out_file_pre"]
     removed = []
     for rel in (psc_concat(pre), concat_scan(pre)):

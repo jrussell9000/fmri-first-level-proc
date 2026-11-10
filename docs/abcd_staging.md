@@ -81,7 +81,8 @@ func derivatives, or any files with the same names:
   model. A run that fails staging is excluded and recorded, and the rest continue.
 - **Staged runs** are written to `{workdir}/{task}_{run}_bold.nii`, uncompressed: every
   analysis reads each one several times, and gzip would cost a full decompression each time.
-  They are about 1.6 GB each and stay in the work dir.
+  They are about 1.6 GB each. A compressed copy of each is kept in `staged/` (see "Runs are
+  kept, concatenations are not").
 - **Rest WM and CSF:** the confounds TSV's `white_matter` and `csf` columns, less the
   trimmed rows. cloudpipe's func preproc writes them as the orchestrator builds its
   regressors: FastSurfer's 1 mm `label-WM_mask` and `label-CSF_mask` go to the BOLD grid
@@ -175,19 +176,27 @@ masks are built by cloudpipe's func preproc, and its FuncQC records them per run
 (`wm_mask_voxels`, `csf_mask_voxels`). A repaired cue adds
 `cue_moved_to` and `cue_moved_from` to the two runs. A failed analysis adds `error`: the
 `type`, `message` and `step` from its QC summary's `run_status`. An n-back analysis adds
-`removed`, the concatenated series deleted from its `out_dir` (see below).
+`removed`, the concatenated series deleted from its `out_dir`, and each staged run adds
+`staged_bold`, its kept copy (see below).
 
-## Concatenated series are not kept
+## Runs are kept, concatenations are not
 
-After every analysis has finished, staging deletes each n-back analysis's `{pre}_psc.nii`
-and `{pre}_concat_scan.nii` (since `4.0.0+cp.11`). They are the per-run files end to end:
-`{pre}_psc` is the `{pre}_run{N}_psc.nii.gz` files, which stay, and `{pre}_concat_scan`
-is the staged runs, which staging rebuilds exactly from the func derivatives. The PSC runs
-with their `{pre}_run{N}_mean.nii.gz` also give back the raw runs, `raw = psc * mean / 100`,
-except where PSC was capped at 200 or zeroed (a non-positive value or mean): on a real
-session that is about 0.06% of values, at the brain's edge. 95.4% of the rest come back
-bit for bit and all within 1.2e-7 relative. The analysis's ledger still lists the
-concatenations, as outputs of the run that made them.
+Since `4.0.0+cp.11`, a session keeps each run's series and not the concatenations made
+from them. After every analysis has finished, staging:
+
+- deletes each n-back analysis's `{pre}_psc.nii` and `{pre}_concat_scan.nii`. The first is
+  the `{pre}_run{N}_psc.nii.gz` files end to end, which stay; the second is the staged
+  runs end to end. The analysis's ledger still lists them, as outputs of the run that
+  made them.
+- writes each staged run, the trimmed and masked raw series every analysis started from,
+  to `staged/{subj}_{ses}_{task}_{run}_bold.nii.gz` under the output directory, gzipped
+  once at the default level (level 1 measured no faster). A run that failed staging is
+  not kept.
+
+The PSC runs with their `{pre}_run{N}_mean.nii.gz` also give back the raw runs,
+`raw = psc * mean / 100`, except where PSC was capped at 200 or zeroed (a non-positive
+value or mean): on a real session that is about 0.06% of values, at the brain's edge.
+95.4% of the rest come back bit for bit and all within 1.2e-7 relative.
 
 A rest run that staged but that `rest_conn` left out adds `excluded_by_analysis`. When
 `rest_conn` completes, the reason comes from `excluded_runs` in the QC summary, matched by run
