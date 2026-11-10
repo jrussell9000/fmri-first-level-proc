@@ -15,11 +15,19 @@ with a ``run_status`` record. ``run_with_status`` wraps a pipeline body: on
 any exception it writes a failure qc_summary.json (``analysis_type``,
 ``run_status`` and provenance only, never partial metrics) through
 ``write_failure_qc`` and re-raises.
+
+Analyses run one after another on the same inputs can share stages whose
+body is the same code in each (``StageSpec.share_as``): with
+``FFLP_STAGE_SHARE_DIR`` set, a stage that would run takes a sibling's
+outputs instead when the sibling's stage had the same share key, which is
+the stage hash with ``share_as`` in place of the label, the output prefix
+included, and each shareable upstream stage keyed the same way.
 """
 
 import copy
 import dataclasses
 import gzip
+import json
 import logging
 import os
 import shutil
@@ -38,6 +46,11 @@ from .first_level_utils import (
     warning_count,
     run_afni_command,
 )
+
+
+# Directory where analyses of one session publish their shareable stages'
+# outputs (StageSpec.share_as) for each other. Unset, nothing is shared.
+SHARE_DIR_ENV = "FFLP_STAGE_SHARE_DIR"
 
 
 # ---------------------------------------------------------------------------
@@ -83,12 +96,19 @@ class Output:
 
 @dataclasses.dataclass
 class StageSpec:
-    """Hash specification for a ledgered stage."""
+    """Hash specification for a ledgered stage.
+
+    ``share_as`` names a stage whose body is the same code in more than one
+    analysis type (e.g. ``task-prep`` for task-act-prep and task-conn-prep),
+    so its outputs depend only on what this spec declares and the output
+    prefix. Only such stages may be shared (see RunContext.run_stage).
+    """
     label: str
     fields: tuple = ()
     derived_files: tuple = ()
     derived_values: dict = dataclasses.field(default_factory=dict)
     upstream: tuple = ()
+    share_as: str | None = None
 
 
 @dataclasses.dataclass
@@ -187,6 +207,9 @@ class RunContext:
         self.stage_outputs = {}
         self.fragments = []
         self.new_records = []
+
+        self.share_dir = os.environ.get(SHARE_DIR_ENV) or None
+        self.share_keys = {}  # label -> (share_as or label, share key or stage hash)
 
     # ---- Lifecycle ----
 
@@ -545,6 +568,7 @@ class RunContext:
 
         h = self.stage_hash(spec)
         latest = checkpoint.latest_completion(self.history, label)
+        share_key = self.share_key(spec) if self.share_dir and spec.share_as else None
 
         # Five rerun triggers
         rerun = (
@@ -568,24 +592,28 @@ class RunContext:
             for w in latest.warnings:
                 reemit_warning(w, self.logger, f"[reused stage {label}]")
             self.logger.info("Reusing stage %s", label)
+            self._offer_shared(spec, share_key, latest.outputs, latest.qc, latest.warnings)
             return Outcome(reused=True, qc=latest.qc)
 
-        # Execute
+        # Execute, or take a sibling analysis's outputs for a shared stage
         staging = os.path.join(self.out_dir, names.staging_dir(self.pre, label))
         if os.path.exists(staging):
             shutil.rmtree(staging)
         os.makedirs(staging)
 
         io = StepIO(label=label, staging=staging, out_dir=self.out_dir, pre=self.pre)
+        shared = self._find_shared(share_key) if share_key else None
         n0 = warning_count()
         t0 = time.time()
-        outcome = fn(io)
+        outcome = self._import_shared(io, label, shared) if shared else fn(io)
         elapsed = time.time() - t0
         stage_warnings = get_warnings()[n0:]
 
-        # Validate
-        for out in outcome.outputs:
-            self._validate(io, out)
+        # Validate. Shared outputs are the files the sibling validated when it
+        # produced them, as a reused stage's are.
+        if not shared:
+            for out in outcome.outputs:
+                self._validate(io, out)
 
         # Staged record
         staged = checkpoint.StagedRecord(
@@ -625,8 +653,111 @@ class RunContext:
         ]
         if outcome.qc:
             self.fragments.append((label, outcome.qc))
+        self._offer_shared(spec, share_key, self.stage_outputs[label], outcome.qc,
+                           completion.warnings)
 
         return outcome
+
+    # ---- Shared stages ----
+
+    def share_key(self, spec):
+        """The stage hash with ``share_as`` in place of the label and the output
+        prefix added. A shareable upstream stage enters by its share name and
+        key, any other by its label and stage hash, which no other analysis
+        type has, so a stage downstream of an unshared one never matches."""
+        upstream = {}
+        for u in spec.upstream:
+            if u not in self.stage_hashes:
+                raise GuardError(
+                    f"Upstream stage '{u}' not yet hashed in this invocation "
+                    f"(required by '{spec.label}')."
+                )
+            name, key = self.share_keys.get(u, (u, self.stage_hashes[u]))
+            upstream[name] = key
+        payload = {
+            "share_as": spec.share_as,
+            "pre": self.pre,
+            "fields": {f: [getattr(self.entry_config, f, None), getattr(self.config, f, None)]
+                       for f in spec.fields},
+            "derived_files": {p: checkpoint.sha256_file(p) for p in spec.derived_files},
+            "derived_values": spec.derived_values,
+            "upstream": upstream,
+            "versions": self.versions,
+        }
+        return checkpoint.compute_stage_hash(self._out_dir_relative(checkpoint._jsonable(payload)))
+
+    def _out_dir_relative(self, obj):
+        """``obj`` with each path inside out_dir, as a value or a key, written
+        relative to it: each analysis has its own copy of such a file (e.g. the
+        resampled template), and the stage that wrote it is in the key."""
+        if isinstance(obj, dict):
+            return {self._out_dir_relative(k): self._out_dir_relative(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._out_dir_relative(v) for v in obj]
+        if isinstance(obj, str) and obj.startswith(self.out_dir + os.sep):
+            return "<out_dir>/" + os.path.relpath(obj, self.out_dir)
+        return obj
+
+    def _shared_path(self, key):
+        return os.path.join(self.share_dir, f"{key}.json")
+
+    def _find_shared(self, key):
+        """A sibling's record for this share key whose outputs all still exist,
+        or None. A record with failed runs is never taken, as such a stage is
+        never reused."""
+        try:
+            with open(self._shared_path(key), encoding="utf-8") as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if os.path.abspath(rec["out_dir"]) == self.out_dir or rec["qc"].get("failed_runs"):
+            return None
+        if not all(os.path.isfile(os.path.join(rec["out_dir"], p)) for p, _ in rec["outputs"]):
+            return None
+        return rec
+
+    def _import_shared(self, io, label, rec):
+        """Hard-link a sibling's outputs into staging (copying across devices)
+        and replay its warnings; the caller records and promotes them."""
+        outputs = []
+        for rel, cls in rec["outputs"]:
+            src, dst = os.path.join(rec["out_dir"], rel), io.path(rel)
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+            outputs.append(Output(rel, cls, "shared", producer=f"shared stage {rec['share_as']}"))
+        for w in rec["warnings"]:
+            reemit_warning(w, self.logger, f"[shared stage {label}]")
+        self.logger.info("Stage %s: took %d output(s) of shared stage %s from %s",
+                         label, len(outputs), rec["share_as"], rec["out_dir"])
+        return Outcome(outputs=outputs, qc=rec["qc"])
+
+    def _offer_shared(self, spec, key, outputs, qc_fragment, warnings):
+        """Record this stage's share key and, the first time, write its outputs
+        where a later analysis can take them. Sharing only saves work, so a
+        write error is logged, never raised."""
+        if key is None:
+            return
+        self.share_keys[spec.label] = (spec.share_as, key)
+        path = self._shared_path(key)
+        if os.path.exists(path):
+            return
+        rec = {
+            "share_as": spec.share_as,
+            "out_dir": self.out_dir,
+            "outputs": [[o.path, o.cls] for o in outputs],
+            "qc": qc_fragment,
+            "warnings": warnings,
+        }
+        try:
+            os.makedirs(self.share_dir, exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(rec, f, sort_keys=True)
+            os.replace(tmp, path)
+        except (OSError, TypeError) as e:
+            self.logger.warning("Could not share stage %s: %s", spec.label, e)
 
     def _track(self, label):
         if self.tracker is not None:
