@@ -381,7 +381,7 @@ def nonconstant_mask(io, run_spec, rel, logger):
     str
         Absolute path to the mask file.
     """
-    mm_path = io.path(rel + "_mm.nii.gz")
+    mm_path = io.path(rel + "_mm.nii")  # a temporary, so uncompressed
     run_afni_command(
         ["3dTstat", "-max", "-min", "-prefix", mm_path, run_spec],
         description="3dTstat max/min for nonconstant mask",
@@ -404,7 +404,7 @@ def nonconstant_intersection(io, specs, rel, tag, logger):
     return its absolute path. Each indicator is exactly 0 or 1
     (step(max - min)), so the voxelwise minimum is the intersection.
     """
-    indicators = [nonconstant_mask(io, s, f"_{tag}_nc_{i}.nii.gz", logger)
+    indicators = [nonconstant_mask(io, s, f"_{tag}_nc_{i}.nii", logger)
                   for i, s in enumerate(specs)]
     if len(indicators) == 1:
         run_afni_command(
@@ -461,14 +461,15 @@ def roi_qc(io, config, runsets, labels, template_resolved, unscaled_spec,
     lowbase_records = []
 
     for label_n in labels:
-        # Non-constant mask
-        m_rel = f"_roiqc_mask_run{label_n}.nii.gz"
+        # Non-constant mask. The _roiqc_ temporaries are uncompressed: gzip costs
+        # a full compression to write and a full decompression on every read.
+        m_rel = f"_roiqc_mask_run{label_n}.nii"
         mask_path = nonconstant_mask(io, unscaled_spec(label_n), m_rel, logger)
 
         # Mean volume
         mean_path = mean_volume(label_n)
         if mean_path is None:
-            mean_rel = f"_roiqc_mean_run{label_n}.nii.gz"
+            mean_rel = f"_roiqc_mean_run{label_n}.nii"
             run_afni_command(
                 ["3dTstat", "-mean", "-prefix", io.path(mean_rel),
                  unscaled_spec(label_n)],
@@ -481,7 +482,7 @@ def roi_qc(io, config, runsets, labels, template_resolved, unscaled_spec,
         total_masked_counts = count_nonzero_by_roi(mask_path, mask_path, logger)
         total_masked = total_masked_counts.get(1, 0)
 
-        np_rel = f"_roiqc_nonpos_run{label_n}.nii.gz"
+        np_rel = f"_roiqc_nonpos_run{label_n}.nii"
         run_afni_command(
             ["3dcalc", "-a", mask_path, "-b", mean_path,
              "-expr", "step(a)*not(ispositive(b))",
@@ -503,14 +504,14 @@ def roi_qc(io, config, runsets, labels, template_resolved, unscaled_spec,
         med = med_dict.get(1, 0.0)
 
         # ROI coverage
-        absmax_rel = f"_roiqc_absmax_run{label_n}.nii.gz"
+        absmax_rel = f"_roiqc_absmax_run{label_n}.nii"
         run_afni_command(
             ["3dTstat", "-absmax", "-prefix", io.path(absmax_rel),
              model_series_spec(label_n)],
             description="3dTstat absmax for roi_coverage",
             logger=logger, cwd=io.staging,
         )
-        indicator_rel = f"_roiqc_indicator_run{label_n}.nii.gz"
+        indicator_rel = f"_roiqc_indicator_run{label_n}.nii"
         run_afni_command(
             ["3dcalc", "-a", io.path(absmax_rel), "-expr", "step(a)",
              "-prefix", io.path(indicator_rel)],
@@ -538,7 +539,7 @@ def roi_qc(io, config, runsets, labels, template_resolved, unscaled_spec,
         roi_med_dict = {}
         threshold = 0.2 * med
         if not sentinel_fail and any(masked_counts.get(r, 0) > 0 for r in tlabels):
-            low_rel = f"_roiqc_low_run{label_n}.nii.gz"
+            low_rel = f"_roiqc_low_run{label_n}.nii"
             run_afni_command(
                 ["3dcalc", "-a", mask_path, "-b", mean_path,
                  "-expr", f"a*step({threshold}-b)",
@@ -549,7 +550,7 @@ def roi_qc(io, config, runsets, labels, template_resolved, unscaled_spec,
             low_counts = count_nonzero_by_roi(
                 template_resolved, io.path(low_rel), logger
             )
-            v_rel = f"_roiqc_masked_mean_run{label_n}.nii.gz"
+            v_rel = f"_roiqc_masked_mean_run{label_n}.nii"
             run_afni_command(
                 ["3dcalc", "-a", mask_path, "-b", mean_path,
                  "-expr", "a*b", "-prefix", io.path(v_rel)],

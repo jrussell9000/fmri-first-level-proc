@@ -59,8 +59,9 @@ def psc_qc(io, run_label, input_spec, mean_path, logger):
     dict
         psc_per_run record.
     """
-    # Temporary min/max stats
-    mm_rel = f"_pscqc_mm_run{run_label}.nii.gz"
+    # Temporary min/max stats. Temporaries are uncompressed NIfTI: gzip costs a
+    # full compression to write and a full decompression on every read.
+    mm_rel = f"_pscqc_mm_run{run_label}.nii"
     run_afni_command(
         ["3dTstat", "-min", "-max", "-prefix", io.path(mm_rel), input_spec],
         description="3dTstat min/max for PSC QC",
@@ -68,7 +69,7 @@ def psc_qc(io, run_label, input_spec, mean_path, logger):
     )
 
     # Non-constant mask
-    mask_rel = f"_pscqc_mask_run{run_label}.nii.gz"
+    mask_rel = f"_pscqc_mask_run{run_label}.nii"
     mask_path = nonconstant_mask(io, input_spec, mask_rel, logger)
 
     mask_counts = count_nonzero_by_roi(mask_path, mask_path, logger)
@@ -87,7 +88,7 @@ def psc_qc(io, run_label, input_spec, mean_path, logger):
         }
 
     # Guarded = masked AND (min <= 0 OR mean <= 0)
-    guard_rel = f"_pscqc_guard_run{run_label}.nii.gz"
+    guard_rel = f"_pscqc_guard_run{run_label}.nii"
     run_afni_command(
         ["3dcalc", "-a", mask_path, "-b", f"{io.path(mm_rel)}[1]",
          "-c", mean_path, "-expr", "a*or(not(ispositive(b)),not(ispositive(c)))",
@@ -99,7 +100,7 @@ def psc_qc(io, run_label, input_spec, mean_path, logger):
     n_guarded = guard_counts.get(1, 0)
 
     # Capped = masked AND mean > 0 AND max > 2*mean
-    cap_rel = f"_pscqc_cap_run{run_label}.nii.gz"
+    cap_rel = f"_pscqc_cap_run{run_label}.nii"
     run_afni_command(
         ["3dcalc", "-a", mask_path, "-b", mean_path,
          "-c", f"{io.path(mm_rel)}[0]",
@@ -112,7 +113,7 @@ def psc_qc(io, run_label, input_spec, mean_path, logger):
     n_capped = cap_counts.get(1, 0)
 
     # Nonpositive mean = masked AND mean <= 0
-    np_rel = f"_pscqc_np_run{run_label}.nii.gz"
+    np_rel = f"_pscqc_np_run{run_label}.nii"
     run_afni_command(
         ["3dcalc", "-a", mask_path, "-b", mean_path,
          "-expr", "a*not(ispositive(b))",
