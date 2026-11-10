@@ -47,9 +47,8 @@ func derivatives, or any files with the same names:
 | `_complete.json` | Its `runs` keys name the session's runs |
 | `{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.nii.gz` | BOLD |
 | `{subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_brainmask.nii.gz` | Brain mask |
-| `{subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv` | Motion, `non_steady_state_outlier_*` |
+| `{subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv` | Motion, `non_steady_state_outlier_*`, and on rest `white_matter` and `csf`. A session whose rest TSVs lack those two is skipped as `no-tissue-confounds`, and n-back still runs |
 | `{subj}_{ses}_task-nback_{run}_events.tsv` | n-back timing |
-| `{subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{WM,CSF}_mask.nii.gz` | Rest tissue masks. Without them, rest is skipped as `no-tissue-masks` and n-back still runs |
 
 ## What it does
 
@@ -80,10 +79,14 @@ func derivatives, or any files with the same names:
   its `run_labels` entry (the framework's Mode A), so each run gets its own baseline and PSC
   mean. All are masked by the intersection of their brain masks, because they enter one
   model. A run that fails staging is excluded and recorded, and the rest continue.
-- **Rest WM and CSF:** as the orchestrator builds them. FastSurfer's 1 mm `label-WM_mask`
-  and `label-CSF_mask` go to the BOLD grid by nearest neighbour and are intersected with
-  the run's brain mask, and each regressor is the trimmed BOLD's mean there. A mask left
-  empty excludes the run as `tissue_mask_empty`.
+- **Rest WM and CSF:** the confounds TSV's `white_matter` and `csf` columns, less the
+  trimmed rows. cloudpipe's func preproc writes them as the orchestrator builds its
+  regressors: FastSurfer's 1 mm `label-WM_mask` and `label-CSF_mask` go to the BOLD grid
+  by AFNI's nearest neighbour and are intersected with the run's brain mask, and each
+  column is the BOLD's mean there on every frame. A column that is `n/a` (its mask was
+  empty) excludes the run as `tissue_mask_empty`. Until `4.0.0+cp.10` staging computed the
+  same regressors itself with `3dresample`, `3dcalc` and `3dmaskave`. The columns agree
+  with those to 3dmaskave's 6 significant digits, and carry float32 precision.
 - **Rest global signal:** not regressed, as in the orchestrator's config. The core logs
   `GS_MISSING`, a low-severity warning, for each rest analysis.
 - **Rest denoising:** as the orchestrator `5855f3f`, set in the packaged config's rest
@@ -157,8 +160,10 @@ about rest, so a held-out session still runs its rest analysis.
 
 `package_version`, `analyses` (name to status, exit code and warning flag, or skip reason)
 and `runs` (run to `n_remove`, `n_frames`, `dropped_events`, `motion_units_check`
-(`producer_fd_consistent`, or `not_checkable` with no usable FD column), plus the WM and CSF
-mask voxel counts on rest, or `excluded`). A repaired cue adds
+(`producer_fd_consistent`, or `not_checkable` with no usable FD column), or `excluded`).
+Rest no longer records mask voxel counts here (`mask_voxels`, until `4.0.0+cp.10`): the
+masks are built by cloudpipe's func preproc, and its FuncQC records them per run
+(`wm_mask_voxels`, `csf_mask_voxels`). A repaired cue adds
 `cue_moved_to` and `cue_moved_from` to the two runs. A failed analysis adds `error`: the
 `type`, `message` and `step` from its QC summary's `run_status`.
 

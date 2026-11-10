@@ -206,40 +206,32 @@ def test_the_dummy_row_is_not_part_of_the_span():
 
 
 # ---------------------------------------------------------------------------
-# Tissue masks
+# Tissue regressors
 # ---------------------------------------------------------------------------
 
-# cloudpipe's grids: 1 mm RAS label masks, 2 mm BOLD with x and y flipped.
-LABEL_AFFINE = np.diag([1.0, 1.0, 1.0, 1.0])
+# cloudpipe's 2 mm BOLD grid, x and y flipped.
 REF_AFFINE = np.array([[-2.0, 0, 0, 6.5], [0, -2.0, 0, 6.5], [0, 0, 2.0, 0.5], [0, 0, 0, 1.0]])
 
 
-def test_tissue_regressor_runs_the_orchestrators_commands(tmp_path, fake_tools):
-    """compute_tissue_mask_regressor in ABCD_fmri_orchestrator_S3 5855f3f: 3dresample -rmode NN
-    to the BOLD, 3dcalc step(a)*step(b) with the run's brain mask, 3dmaskave on the BOLD."""
-    seed_session(tmp_path)
-    bold = tmp_path / f"{SUBJ}_{SES}_task-rest_run-01_space-MNI152NLin2009cAsym_bold.nii.gz"
-    brain = tmp_path / f"{SUBJ}_{SES}_task-rest_run-01_space-MNI152NLin2009cAsym_brainmask.nii.gz"
-    label = tmp_path / sfl.tissue_mask_name(SUBJ, SES, "WM")
-    path, voxels = sfl.tissue_regressor(bold, brain, label, tmp_path / "wm.1D")
-    calls, _ = fake_tools
-    resample, intersect, average = calls
-    assert resample == ["3dresample", "-master", str(bold), "-rmode", "NN", "-input", str(label),
-                        "-prefix", resample[-1]]  # fmt: skip
-    assert intersect[:2] == ["3dcalc", "-a"] and intersect[2] == resample[-1]
-    assert intersect[3:7] == ["-b", str(brain), "-expr", "step(a)*step(b)"]
-    assert average == ["3dmaskave", "-quiet", "-mask", intersect[-1], str(bold)]
-    assert voxels == 64 and len(path.read_text().split()) == N_FRAMES - N_NSS
+def test_tissue_regressor_is_the_trimmed_confounds_column(tmp_path):
+    """cloudpipe's func preproc writes `white_matter` and `csf` the way the orchestrator's
+    compute_tissue_mask_regressor builds them (5855f3f), over every frame. The regressor is
+    that column less the NSS rows, which equals averaging the trimmed BOLD."""
+    values = np.arange(N_FRAMES, dtype=float) * 0.5 + 1000.25
+    path = sfl.tissue_regressor(pd.DataFrame({"white_matter": values}), "white_matter", N_NSS, tmp_path / "wm.1D")
+    np.testing.assert_array_equal(np.loadtxt(path), values[N_NSS:])
+    assert len(path.read_text().splitlines()) == N_FRAMES - N_NSS
 
 
-def test_an_empty_tissue_mask_excludes_the_run(tmp_path, fake_tools):
-    seed_session(tmp_path)
-    label = tmp_path / sfl.tissue_mask_name(SUBJ, SES, "CSF")
-    save_nifti(label, np.zeros((8, 8, 8), np.uint8), LABEL_AFFINE)
-    bold = tmp_path / f"{SUBJ}_{SES}_task-rest_run-01_space-MNI152NLin2009cAsym_bold.nii.gz"
-    brain = tmp_path / f"{SUBJ}_{SES}_task-rest_run-01_space-MNI152NLin2009cAsym_brainmask.nii.gz"
+@pytest.mark.parametrize("bad", ["all", "one"])
+def test_an_na_tissue_column_excludes_the_run(tmp_path, bad):
+    values = np.full(N_FRAMES, 900.0)
+    if bad == "all":
+        values[:] = np.nan  # an empty mask: func preproc writes n/a on every frame
+    else:
+        values[N_NSS + 3] = np.nan
     with pytest.raises(sfl.RunExcluded, match="tissue_mask_empty"):
-        sfl.tissue_regressor(bold, brain, label, tmp_path / "csf.1D")
+        sfl.tissue_regressor(pd.DataFrame({"csf": values}), "csf", N_NSS, tmp_path / "csf.1D")
 
 
 # ---------------------------------------------------------------------------
@@ -362,11 +354,12 @@ def seed_session(root, runs=("task-nback_run-01", "task-nback_run-02", "task-res
             np.ones((4, 4, 4), np.uint8),
             REF_AFFINE,
         )
-        with_fd(confounds(N_FRAMES, N_NSS)).to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False)
+        table = with_fd(confounds(N_FRAMES, N_NSS))
+        table["csf"] = np.linspace(800.0, 810.0, N_FRAMES)  # as cloudpipe's func preproc writes them
+        table["white_matter"] = np.linspace(600.0, 605.0, N_FRAMES)
+        table.to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False, na_rep="n/a")
         if "nback" in rid:
             nback_events().to_csv(f"{stem}_events.tsv", sep="\t", index=False)
-    for tissue in sfl.TISSUES:
-        save_nifti(root / sfl.tissue_mask_name(SUBJ, SES, tissue), np.ones((8, 8, 8), np.uint8), LABEL_AFFINE)
     (root / "_complete.json").write_text(json.dumps({"runs": {r: [] for r in runs}}))
 
 
@@ -378,24 +371,17 @@ def analysis_qc() -> dict[str, dict]:
 
 @pytest.fixture
 def fake_tools(monkeypatch, analysis_qc):
-    """AFNI writes its -prefix output (3dresample: the master's grid, all ones unless the
-    label is empty); 3dmaskave prints one value per frame; the CLI writes a QC summary and
-    returns the exit code a test asks for, per analysis."""
+    """AFNI writes its -prefix output; the CLI writes a QC summary and returns the exit
+    code a test asks for, per analysis."""
     calls: list[list[str]] = []
     exits: dict[str, int] = {}
 
     def run_cmd(cmd, **_):
         calls.append(cmd)
-        if cmd[0] == "3dresample":
-            master = nib.load(cmd[cmd.index("-master") + 1])
-            label = np.asarray(nib.load(cmd[cmd.index("-input") + 1]).dataobj)
-            mask = np.full(master.shape[:3], int(label.any()), np.uint8)
-            nib.save(nib.Nifti1Image(mask, master.affine), cmd[cmd.index("-prefix") + 1])
         if cmd[0] in ("3dcalc", "3dTcat"):
             src = cmd[cmd.index("-a") + 1].split("[")[0] if cmd[0] == "3dcalc" else cmd[-1]
             shutil.copy(src, cmd[cmd.index("-prefix") + 1])
-        out = "\n".join(["1.0"] * (N_FRAMES - N_NSS)) if cmd[0] == "3dmaskave" else ""
-        return type("R", (), {"stdout": out})()
+        return type("R", (), {"stdout": ""})()
 
     def run_cli(cmd, cwd):
         calls.append(cmd)
@@ -478,30 +464,35 @@ def test_a_full_session_runs_every_analysis(tmp_path, fake_tools):
         "rest_conn": "completed",
     }
     assert result["runs"]["task-nback_run-01"]["n_remove"] == N_NSS
-    assert result["runs"]["task-rest_run-01"]["mask_voxels"] == {"WM": 64, "CSF": 64}
+    assert "mask_voxels" not in result["runs"]["task-rest_run-01"]  # FuncQC records the masks now
     assert "probseg_state" not in result
     calls, _ = fake_tools
     trims = [c for c in calls if c[0] == "3dcalc" and "[" in c[2]]
-    assert len(trims) == 3  # each run's BOLD; the other 3dcalc calls build tissue masks
+    assert len(trims) == 3  # each run's BOLD, and nothing else: no tissue masks are built here
     assert all(c[2].endswith(f"[{N_NSS}..$]") for c in trims)
     config = yaml.safe_load((tmp_path / "out" / f"{SUBJ}_{SES}_first_level_config.yaml").read_text())
     assert config["global"]["template_path"] == ATLAS
     rest = next(b for b in config["analyses"] if b["name"] == "rest_conn")
     assert "GS_paths" not in rest["paths"]  # no GSR, as the orchestrator's config has it
-    assert len([c for c in calls if c[0] == "3dmaskave"]) == 2  # WM, CSF
+    assert not any(c[0] in ("3dresample", "3dmaskave") for c in calls)
+    wm = np.loadtxt(rest["paths"]["WM_paths"][0])
+    np.testing.assert_allclose(wm, np.linspace(600.0, 605.0, N_FRAMES)[N_NSS:])  # the trimmed column
     assert rest["censor_prev_tr"] is True and rest["fd_threshold"] == 0.4
 
 
-def test_an_empty_tissue_mask_excludes_only_its_rest_run(tmp_path, fake_tools, monkeypatch):
+def set_tissue_column(root, rid, column, value):
+    tsv = root / f"{SUBJ}_{SES}_{rid}_desc-confounds_timeseries.tsv"
+    table = pd.read_csv(tsv, sep="\t", na_values=["n/a"])
+    if value is None:
+        table = table.drop(columns=[column])
+    else:
+        table[column] = value
+    table.to_csv(tsv, sep="\t", index=False, na_rep="n/a")
+
+
+def test_an_empty_tissue_mask_excludes_only_its_rest_run(tmp_path, fake_tools):
     seed_session(tmp_path / "raw", runs=(*NBACK_RUNS, "task-rest_run-01", "task-rest_run-02"))
-    real = sfl.tissue_regressor
-
-    def empty_for_run_one(bold, brainmask, label, dest):
-        if "run-01" in dest.name and "wm" in dest.name:
-            raise sfl.RunExcluded("tissue_mask_empty")
-        return real(bold, brainmask, label, dest)
-
-    monkeypatch.setattr(sfl, "tissue_regressor", empty_for_run_one)
+    set_tissue_column(tmp_path / "raw", "task-rest_run-01", "white_matter", np.nan)
     result = run(tmp_path)
     assert result["runs"]["task-rest_run-01"]["excluded"] == "tissue_mask_empty"
     assert result["analyses"]["rest_conn"]["status"] == "completed"
@@ -513,23 +504,22 @@ def test_an_empty_tissue_mask_excludes_only_its_rest_run(tmp_path, fake_tools, m
 
 def test_a_session_whose_rest_masks_are_all_empty_still_runs_nback(tmp_path, fake_tools):
     seed_session(tmp_path / "raw")
-    save_nifti(tmp_path / "raw" / sfl.tissue_mask_name(SUBJ, SES, "WM"), np.zeros((8, 8, 8), np.uint8), LABEL_AFFINE)
+    set_tissue_column(tmp_path / "raw", "task-rest_run-01", "csf", np.nan)
     result = run(tmp_path)
     assert result["runs"]["task-rest_run-01"]["excluded"] == "tissue_mask_empty"
     assert result["analyses"]["rest_conn"] == {"status": "skipped", "reason": "no-rest-runs"}
     assert result["analyses"]["nback_act"]["status"] == "completed"
 
 
-@pytest.mark.parametrize("missing", [("WM",), ("CSF",), ("WM", "CSF")])
-def test_a_session_published_without_tissue_masks_skips_rest_and_runs_nback(tmp_path, fake_tools, missing):
+@pytest.mark.parametrize("missing", [("white_matter",), ("csf",), ("white_matter", "csf")])
+def test_a_session_whose_tsvs_lack_the_tissue_columns_skips_rest_and_runs_nback(tmp_path, fake_tools, missing):
+    """A TSV published before the columns existed (no fallback to computing them here)."""
     seed_session(tmp_path / "raw")
-    for tissue in missing:
-        (tmp_path / "raw" / sfl.tissue_mask_name(SUBJ, SES, tissue)).unlink()
+    for column in missing:
+        set_tissue_column(tmp_path / "raw", "task-rest_run-01", column, None)
     result = run(tmp_path)
-    assert result["analyses"]["rest_conn"] == {"status": "skipped", "reason": "no-tissue-masks"}
+    assert result["analyses"]["rest_conn"] == {"status": "skipped", "reason": "no-tissue-confounds"}
     assert result["analyses"]["nback_act"]["status"] == "completed"
-    calls, _ = fake_tools
-    assert not any(c[0] == "3dresample" for c in calls)
 
 
 def test_a_run_the_analysis_excluded_is_recorded_on_that_run(tmp_path, fake_tools, analysis_qc):

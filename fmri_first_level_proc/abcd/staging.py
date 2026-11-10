@@ -6,9 +6,8 @@ object, with these names:
   _complete.json   its `runs` keys name the session's runs; nothing else does
   {subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_bold.nii.gz
   {subj}_{ses}_{task}_{run}_space-MNI152NLin2009cAsym_brainmask.nii.gz
-  {subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv
+  {subj}_{ses}_{task}_{run}_desc-confounds_timeseries.tsv  (rest: with `white_matter`, `csf`)
   {subj}_{ses}_task-nback_{run}_events.tsv
-  {subj}_{ses}_space-MNI152NLin2009cAsym_res-1_label-{WM,CSF}_mask.nii.gz  (rest only)
 
 Rest trims the frames its confounds flag as non-steady-state. n-back trims what its
 events' `dummy` row states, because ABCD's onsets count from the first non-dummy volume
@@ -42,9 +41,9 @@ import yaml
 
 MARKER = "_complete.json"
 SPACE = "space-MNI152NLin2009cAsym"
-SPACE_RES1 = f"{SPACE}_res-1"
-# Rest's nuisance tissues, from FastSurfer's 1 mm label masks, as the orchestrator takes them.
-TISSUES = ("WM", "CSF")
+# Rest's nuisance tissues -> their confounds columns. cloudpipe's func preproc computes them
+# as the orchestrator does (FastSurfer's 1 mm label masks), since 4.0.0+cp.10 read from there.
+TISSUE_COLUMNS = {"WM": "white_matter", "CSF": "csf"}
 PROC_TEMPLATE = Path(__file__).resolve().parent / "data" / "proc_config_final.yaml"
 # Schaefer 400 + Tian S4 in MNI152NLin2009cAsym at 2 mm; data/atlas/README.md has its source,
 # licences and citations.
@@ -164,10 +163,6 @@ def package_version() -> str | None:
         return metadata.version("fmri-first-level-proc")
     except metadata.PackageNotFoundError:
         return None
-
-
-def tissue_mask_name(subj: str, ses: str, tissue: str) -> str:
-    return f"{subj}_{ses}_{SPACE_RES1}_label-{tissue}_mask.nii.gz"
 
 
 # ---------------------------------------------------------------------------
@@ -487,19 +482,18 @@ def intersect_masks(paths: list[Path], dest: Path) -> Path:
     return dest
 
 
-def tissue_regressor(bold: Path, brainmask: Path, label: Path, dest: Path) -> tuple[Path, int]:
-    """(regressor, mask voxels): the orchestrator's compute_tissue_mask_regressor. The 1 mm
-    label goes to the BOLD grid by nearest neighbour, is intersected with the run's brain
-    mask, and gives the trimmed BOLD's mean there. An empty mask excludes the run."""
-    resampled = dest.with_suffix(".resampled.nii.gz")
-    mask = dest.with_suffix(".mask.nii.gz")
-    run_cmd(["3dresample", "-master", str(bold), "-rmode", "NN", "-input", str(label), "-prefix", str(resampled)])
-    run_cmd(["3dcalc", "-a", str(resampled), "-b", str(brainmask), "-expr", "step(a)*step(b)", "-prefix", str(mask)])
-    voxels = int((np.asarray(nib.load(str(mask)).dataobj) > 0).sum())
-    if not voxels:
+def tissue_regressor(confounds: pd.DataFrame, column: str, n_remove: int, dest: Path) -> Path:
+    """The run's WM or CSF regressor: its confounds column less the first n_remove rows,
+    one value per line. The column is the orchestrator's compute_tissue_mask_regressor
+    (the 1 mm label, nearest neighbour to the BOLD grid, within the run's brain mask, the
+    BOLD's mean there), computed by cloudpipe's func preproc on every frame, so trimming it
+    equals computing it on the trimmed BOLD. n/a means the mask was empty: the run is
+    excluded."""
+    values = confounds[column].to_numpy(dtype=float)[n_remove:]
+    if not len(values) or not np.isfinite(values).all():
         raise RunExcluded("tissue_mask_empty")
-    dest.write_text(run_cmd(["3dmaskave", "-quiet", "-mask", str(mask), str(bold)]).stdout)
-    return dest, voxels
+    dest.write_text("".join(f"{float(v)!r}\n" for v in values))  # numpy 2's repr names the type
+    return dest
 
 
 @dataclass
@@ -618,28 +612,32 @@ class Session:
     def rest_paths(self, runs: list[Run], raws: dict) -> tuple[dict | None, str | None]:
         if not any(not r.excluded for r in runs):
             return None, "no-rest-runs"
-        # A session can be published without its tissue maps: func preproc's export of them
-        # is non-fatal. Rest then has no WM or CSF regressor, so it is skipped, and the
-        # session's n-back still runs.
-        labels = {t: self.input_dir / tissue_mask_name(self.subj, self.ses, t) for t in TISSUES}
-        if not all(p.is_file() for p in labels.values()):
-            return None, "no-tissue-masks"
+        # WM and CSF come from the confounds TSV's own `white_matter` and `csf` columns,
+        # which cloudpipe's func preproc writes with the orchestrator's definition (D17):
+        # FastSurfer's label masks, nearest neighbour to the BOLD grid, within the run's
+        # brain mask. A session whose TSVs predate the columns has no regressor, so rest
+        # is skipped and n-back still runs. A column that is n/a means its mask was
+        # empty, and only that run is excluded.
+        tables = {
+            r.rid: pd.read_csv(raws[r.rid]["confounds"], sep="\t", na_values=["n/a"])
+            for r in runs
+            if not r.excluded
+        }
+        if not all(set(TISSUE_COLUMNS.values()) <= set(t.columns) for t in tables.values()):
+            return None, "no-tissue-confounds"
         regressors: dict[str, dict[str, str]] = {}
         for run in runs:
             if run.excluded:
                 continue
-            paths, voxels = {}, {}
-            try:  # each run has its own brain mask
-                for tissue, label in labels.items():
-                    dest = self.work / f"{run.rid}_{tissue.lower()}.1D"
-                    path, voxels[tissue] = tissue_regressor(run.bold, raws[run.rid]["brainmask"], label, dest)
-                    paths[tissue] = str(path)
+            try:
+                regressors[run.rid] = {
+                    tissue: str(tissue_regressor(tables[run.rid], column, run.n_remove,
+                                                 self.work / f"{run.rid}_{tissue.lower()}.1D"))
+                    for tissue, column in TISSUE_COLUMNS.items()
+                }  # fmt: skip
             except RunExcluded as exc:
                 run.excluded = str(exc)
                 log("run-excluded", run=run.rid, reason=run.excluded)
-                continue
-            run.extra["mask_voxels"] = voxels
-            regressors[run.rid] = paths
         ok = [r for r in runs if not r.excluded]
         if not ok:
             return None, "no-rest-runs"
@@ -664,7 +662,7 @@ def _result(sess: Session, analyses: dict, runs: list[Run]) -> dict:
                     "n_remove": r.n_remove,
                     "n_frames": r.n_frames,
                     "dropped_events": r.dropped_events,
-                    **r.extra,  # n-back: any cue move; rest: mask_voxels
+                    **r.extra,  # n-back: any cue move
                 }
             )
             for r in runs

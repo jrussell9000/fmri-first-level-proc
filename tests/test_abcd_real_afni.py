@@ -22,7 +22,6 @@ pytestmark = [
 TR = 0.8
 SUBJ, SES = "sub-TEST0001", "ses-00A"
 N_FRAMES, N_NSS = 370, 8
-LABEL_AFFINE = np.diag([1.0, 1.0, 1.0, 1.0])
 REF_AFFINE = np.array([[-2.0, 0, 0, 6.5], [0, -2.0, 0, 6.5], [0, 0, 2.0, 0.5], [0, 0, 0, 1.0]])
 EVENTS = (
     "onset\tduration\tresponse_time\ttrial_type\n"
@@ -50,13 +49,14 @@ def _seed(root, rng):
         _save(f"{stem}_space-MNI152NLin2009cAsym_brainmask.nii.gz", np.ones((4, 4, 4), np.uint8), REF_AFFINE)
         cols = {c: rng.normal(size=N_FRAMES) for c in staging.MOTION_BASE}
         cols.update({f"non_steady_state_outlier_{i:02d}": np.eye(N_FRAMES)[i] for i in range(N_NSS)})
+        # cloudpipe writes these over every frame, NSS included. Here csf is the voxel
+        # holding each frame's own index, so its trimmed column must line up with the
+        # trimmed BOLD frame for frame.
+        cols["csf"] = bold[0, 0, 0, :].astype(float)
+        cols["white_matter"] = bold.reshape(-1, N_FRAMES).mean(axis=0, dtype=np.float64)
         pd.DataFrame(cols).to_csv(f"{stem}_desc-confounds_timeseries.tsv", sep="\t", index=False)
         if "nback" in rid:
             (root / f"{SUBJ}_{SES}_{rid}_events.tsv").write_text(EVENTS)
-    _save(root / staging.tissue_mask_name(SUBJ, SES, "WM"), np.ones((8, 8, 8), np.uint8), LABEL_AFFINE)
-    csf = np.zeros((8, 8, 8), np.uint8)
-    csf[0:2, 0:2, 0:2] = 1  # one 2 mm voxel's worth, at BOLD voxel (3, 3, 0): x and y flip
-    _save(root / staging.tissue_mask_name(SUBJ, SES, "CSF"), csf, LABEL_AFFINE)
     (root / "_complete.json").write_text(json.dumps({"runs": {r: [] for r in runs}}))
     return runs
 
@@ -90,8 +90,10 @@ def test_staging_commands_trim_mask_and_average(tmp_path):
     for key in ("WM_paths", "CSF_paths"):
         assert np.loadtxt(rest_paths[key][0]).shape == (N_FRAMES - N_NSS,)
     assert "GS_paths" not in rest_paths
-    # Nearest neighbour put the 1 mm labels on the 2 mm grid: all 64 voxels for WM, and
-    # for CSF only the one voxel, whose mean is the frame index stored there.
-    assert rest[0].extra["mask_voxels"] == {"WM": 64, "CSF": 1}
-    csf = np.loadtxt(rest_paths["CSF_paths"][0])
-    np.testing.assert_allclose(csf, np.asarray(nib.load(str(rest[0].bold)).dataobj)[3, 3, 0], rtol=1e-5)
+    # The trimmed column lines up with AFNI's trimmed BOLD: the voxel holding the frame
+    # index, read from the staged BOLD, equals the CSF regressor frame for frame.
+    trimmed = np.asarray(nib.load(str(rest[0].bold)).dataobj)
+    np.testing.assert_array_equal(np.loadtxt(rest_paths["CSF_paths"][0]), trimmed[0, 0, 0])
+    np.testing.assert_allclose(
+        np.loadtxt(rest_paths["WM_paths"][0]), trimmed.reshape(-1, trimmed.shape[3]).mean(axis=0), rtol=1e-6
+    )
