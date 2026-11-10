@@ -3,6 +3,7 @@ what staging prepares and records, not about what AFNI computes."""
 
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import os
@@ -497,6 +498,18 @@ def test_concatenations_are_removed_after_every_analysis_and_runs_kept(tmp_path,
         assert (out / f"{pre}_run1_psc.nii.gz").is_file()
         assert result["analyses"][name]["removed"] == concats
     assert "removed" not in result["analyses"]["rest_conn"]
+
+
+def test_staged_runs_are_kept_compressed_in_place_of_the_concatenation(tmp_path, fake_tools):
+    seed_session(tmp_path / "raw")
+    result = run(tmp_path)
+    kept = sorted((tmp_path / "out" / "staged").iterdir())
+    assert [p.name for p in kept] == [f"{SUBJ}_{SES}_{rid}_bold.nii.gz" for rid in sorted(result["runs"])]
+    for rid, entry in result["runs"].items():
+        assert entry["staged_bold"] == f"staged/{SUBJ}_{SES}_{rid}_bold.nii.gz"
+        staged = tmp_path / "work" / f"{rid}_bold.nii"
+        with gzip.open(tmp_path / "out" / entry["staged_bold"], "rb") as f:
+            assert f.read() == staged.read_bytes()
 
 
 def test_a_full_session_runs_every_analysis(tmp_path, fake_tools):
