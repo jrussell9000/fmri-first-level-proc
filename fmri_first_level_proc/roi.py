@@ -350,6 +350,7 @@ def template_stage(ctx, config, runsets, pre, same_grid, analysis, logger):
         fields=("template_path",),
         derived_files=(config.template_path,),
         derived_values={"same_grid": same_grid, "scan_grid": scan_grid},
+        share_as="template",
     )
 
     def _template_stage(io):

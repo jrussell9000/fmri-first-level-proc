@@ -402,6 +402,7 @@ def _run(config, logger, tracker):
         label="task-conn-prep",
         fields=("scan_path", "scan_paths", "run_lengths", "run_labels", "scale_to_psc"),
         derived_values={"s_pre": list(s_pre)},
+        share_as="task-prep",
     )
 
     def _prep_stage(io):
@@ -572,6 +573,7 @@ def _run(config, logger, tracker):
         label="task-conn-min-outlier-epi",
         fields=("scan_path", "scan_paths", "run_lengths", "run_labels"),
         derived_values={"s_final": list(s_final)},
+        share_as="task-min-outlier-epi",
     )
 
     def _moe_stage(io):
@@ -596,6 +598,7 @@ def _run(config, logger, tracker):
                     "run_labels", "scale_to_psc"),
             derived_values={"s_pre": list(s_pre), "template_resolved": template_resolved},
             upstream=("task-conn-prep", "task-conn-template"),
+            share_as="task-raw-ptseries",
         )
 
         def _raw_ptseries_stage(io):
@@ -1000,6 +1003,7 @@ def _run(config, logger, tracker):
                     "run_lengths", "run_labels", "scale_to_psc"),
             derived_values={"s_pre": list(s_pre), "template_resolved": template_resolved},
             upstream=("task-conn-template", "task-conn-prep"),
+            share_as="task-roi-qc",
         )
 
         def _roiqc_stage(io):
