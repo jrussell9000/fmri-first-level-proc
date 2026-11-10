@@ -39,6 +39,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from ..engine import SHARE_DIR_ENV
+
 MARKER = "_complete.json"
 SPACE = "space-MNI152NLin2009cAsym"
 # Rest's nuisance tissues -> their confounds columns. cloudpipe's func preproc computes them
@@ -453,7 +455,9 @@ def stage_run(run: Run, raw: dict[str, Path], tr: float, mask: Path, work: Path)
         raise SessionError(f"{run.rid}: trimming {run.n_remove} frames leaves {run.n_frames}")
     motion = motion_matrix(confounds, run.n_remove)
     run.extra["motion_units_check"] = motion_units_check(confounds)  # it passed, or the run is out
-    run.bold = work / f"{run.rid}_bold.nii.gz"
+    # Uncompressed: every analysis reads it several times, and gzip would cost a full
+    # decompression each time. It stays in the work dir and is never published.
+    run.bold = work / f"{run.rid}_bold.nii"
     run_cmd(
         [
             "3dcalc",
@@ -749,6 +753,9 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
     cfg = fill_config(template, sess.subj, sess.ses, staged, out_root, atlas)
     # The CLI uses num_cores for its own work; AFNI takes this from the environment.
     os.environ["OMP_NUM_THREADS"] = str(cfg["global"]["num_cores"])
+    # nback_conn takes nback_act's template, prep, min-outlier EPI, raw ptseries and
+    # ROI QC instead of computing them again: the same code on the same staged runs.
+    os.environ[SHARE_DIR_ENV] = str(sess.work / "shared_stages")
     out_root.mkdir(parents=True, exist_ok=True)
     config_path = out_root / f"{sess.subj}_{sess.ses}_first_level_config.yaml"
     config_path.write_text(yaml.safe_dump(cfg, sort_keys=False))

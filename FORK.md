@@ -1,14 +1,15 @@
 # This fork
 
 This is a fork of [tjkeding/fmri-first-level-proc](https://github.com/tjkeding/fmri-first-level-proc).
-It runs upstream's analysis core unchanged and adds `fmri_first_level_proc/abcd/`, which stages
-one ABCD session of [cloudpipe](https://github.com/jrussell9000/cloudpipe) func derivatives and
-runs the core on it. Every difference from upstream is one of the commits or files listed here,
-and CI fails if that stops being true.
+It adds `fmri_first_level_proc/abcd/`, which stages one ABCD session of
+[cloudpipe](https://github.com/jrussell9000/cloudpipe) func derivatives and runs upstream's analysis
+core on it. The core is upstream's except for the modules the ledger lists: speed-ups that leave
+every output unchanged, each offered upstream. Every difference from upstream is one of the commits
+or files listed here, and CI fails if that stops being true.
 
 **Upstream base:** `e40d1bc6f519b9a61996a594b395fef4ec9c9fd2`
 
-**Fork version:** `4.0.0+cp.10`, in `pyproject.toml`. The part before the `+` is upstream's
+**Fork version:** `4.0.0+cp.11`, in `pyproject.toml`. The part before the `+` is upstream's
 version and the rest counts fork releases on it. `__version__` in `__init__.py` stays upstream's
 value, so an analysis's QC reports the version of the core that ran it, and
 `fmri-first-level-abcd` records the fork version in its result.
@@ -17,9 +18,10 @@ value, so an analysis's QC reports the version of the core that ran it, and
 
 ### Upstream files changed
 
-The core's Python modules are not on this list. `.github/scripts/check_fork_ledger.py` compares
-the table with `git diff` from the upstream base, so a change to any other upstream file fails CI
-until it is listed here with its reason.
+A core module is on this list only where the fork changed it, and only to make it faster with the
+same outputs. `.github/scripts/check_fork_ledger.py` compares the table with `git diff` from the
+upstream base, so a change to any other upstream file fails CI until it is listed here with its
+reason.
 
 <!-- ledger:start -->
 | Status | File | Why |
@@ -28,6 +30,12 @@ until it is listed here with its reason.
 | M | `pyproject.toml` | The fork version, the `abcd` extra, its two scripts, its package data and the `afni` test marker |
 | D | `.aid/reports/fmri-first-level-proc_publish_20260911_160000.md` | It names a participant, and this fork holds no subject-keyed data |
 | M | `fmri_first_level_proc/tools.lock.yaml` | `validated` names the versions cloudpipe's image runs and CI tests: AFNI 26.3.07, numpy 2.5.4, pandas 3.1.1. Minimums are upstream's |
+| M | `fmri_first_level_proc/task_act_first_level.py` | Extraction reads the stats bucket once per stat type, not once per sub-brick; the stages task_conn shares are marked; Z temporaries are uncompressed (4.0.0+cp.11) |
+| M | `fmri_first_level_proc/task_conn_first_level.py` | The stages it shares with task_act are marked (4.0.0+cp.11) |
+| M | `fmri_first_level_proc/engine.py` | Shared stages: an analysis takes a sibling's outputs for a stage that is the same code on the same inputs (4.0.0+cp.11) |
+| M | `fmri_first_level_proc/roi.py` | The template stage is marked shareable; ROI QC and non-constant mask temporaries are uncompressed (4.0.0+cp.11) |
+| M | `fmri_first_level_proc/prep.py` | PSC QC temporaries are uncompressed (4.0.0+cp.11) |
+| M | `fmri_first_level_proc/rest_conn_first_level.py` | Per-run residual temporaries are uncompressed (4.0.0+cp.11) |
 <!-- ledger:end -->
 
 ### Files added
@@ -99,7 +107,8 @@ commit named there.
 
 - **One decision:** `git revert <commit>`, using the table above.
 - **The whole fork:** delete the paths under "Files added", and restore the upstream files with
-  `git checkout <upstream base> -- .gitignore pyproject.toml`. What remains is upstream's core.
+  `git checkout <upstream base> -- .gitignore pyproject.toml fmri_first_level_proc/`, which
+  restores the core modules the ledger lists. What remains is upstream's core.
   The removed report stays removed unless you restore it by its path.
 
 ## The older fork
