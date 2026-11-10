@@ -285,9 +285,12 @@ def extract_stat_bucket_niftis(io, bucket_path, stat_types, ext, token, logger):
                 logger=logger, cwd=io.staging,
             )
         else:
-            selectors = [f"{bucket_path}[{idx}]" for _, idx in matched]
+            # One selector listing every sub-brick: a gzipped NIfTI cannot be read
+            # in part, so AFNI decompresses the whole bucket once per dataset
+            # argument, and one argument per sub-brick decompressed it N times.
+            selector = f"{bucket_path}[{','.join(str(idx) for _, idx in matched)}]"
             run_afni_command(
-                ["3dbucket", "-prefix", io.path(bucket_out_rel)] + selectors,
+                ["3dbucket", "-prefix", io.path(bucket_out_rel), selector],
                 description=f"3dbucket extract {stat_type} bucket",
                 logger=logger, cwd=io.staging,
             )
@@ -325,13 +328,19 @@ def stat_bucket_parcellations(io, ext, matched, bucket_out_paths, template,
         if template is not None:
             csv_rel = names.stat_parcellated(ext, stat_type)
             bucket_path = bucket_out_paths[stat_type]
+            # One 3dROIstats over the whole bucket: a row per sub-brick, in order.
+            roi_df = roi.extract_roi_stats(
+                bucket_path, template, average_type,
+                roi_zero_handling, logger, cwd=io.staging,
+            )
+            if len(roi_df) != len(items):
+                raise ToolExecutionError(
+                    f"3dROIstats returned {len(roi_df)} rows for {bucket_path}, "
+                    f"which has {len(items)} sub-bricks"
+                )
             rows = {}
             for new_idx, (label, _) in enumerate(items):
-                roi_df = roi.extract_roi_stats(
-                    f"{bucket_path}[{new_idx}]", template, average_type,
-                    roi_zero_handling, logger, cwd=io.staging,
-                )
-                rows[label] = roi_df.iloc[0]
+                rows[label] = roi_df.iloc[new_idx]
             parcellated_df = pd.DataFrame(rows).T
             parcellated_df.index.name = "condition"
             csv_text = parcellated_df.to_csv()
