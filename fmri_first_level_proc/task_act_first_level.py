@@ -269,7 +269,7 @@ def extract_stat_bucket_niftis(io, bucket_path, stat_types, ext, token, logger):
                         f"in {bucket_path}; cannot convert T to Z."
                     )
                 dof = int(aux_params[0])
-                z_tmp_rel = f"_zconv_tmp_{i}.nii.gz"
+                z_tmp_rel = f"_zconv_tmp_{i}.nii"  # a temporary, so uncompressed
                 run_afni_command(
                     ["3dcalc", "-a", f"{bucket_path}[{idx}]",
                      "-expr", f"fitt_t2z(a,{dof})",

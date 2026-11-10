@@ -657,7 +657,8 @@ def _run(config, logger, tracker):
                             write_tissue_derivative(tpath, tname, [ri.n_vols], io.path(drel))
                             tissue_paths["derivs"][tname] = io.path(drel)
 
-                    out_rel = f"{subdir}/residual.nii.gz"
+                    # A temporary that only 3dTcat below reads, so uncompressed.
+                    out_rel = f"{subdir}/residual.nii"
 
                     if not config.use_sequenced_bandpass:
                         _residual_simultaneous(
@@ -685,7 +686,7 @@ def _run(config, logger, tracker):
                     f"{failed}",
                 )
 
-            run_files = [io.path(f"run{lbl}/residual.nii.gz") for lbl in successes]
+            run_files = [io.path(f"run{lbl}/residual.nii") for lbl in successes]
             concat_rel = names.residual_concat(pre)
             cmd = ["3dTcat", "-TR", str(config.tr), "-prefix", io.path(concat_rel)] + run_files
             run_afni_command(cmd, description="3dTcat residual concat",
