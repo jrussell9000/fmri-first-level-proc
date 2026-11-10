@@ -40,6 +40,7 @@ import pandas as pd
 import yaml
 
 from ..engine import SHARE_DIR_ENV
+from ..names import concat_scan, psc_concat
 
 MARKER = "_complete.json"
 SPACE = "space-MNI152NLin2009cAsym"
@@ -784,7 +785,30 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
         if name == "rest_conn":
             note_runs_excluded_by_analysis(block, rest_runs, analyses[name]["status"])
 
+    # Only after every analysis: nback_conn takes nback_act's prep, these included.
+    for block in cfg["analyses"]:
+        removed = remove_concatenations(block)
+        if removed:
+            analyses[block["name"]]["removed"] = removed
+
     return _result(sess, analyses, all_runs)
+
+
+def remove_concatenations(block: dict) -> list[str]:
+    """Delete an analysis's concatenated series from its out_dir; the names removed.
+
+    `{pre}_psc` is the published `{pre}_run{N}_psc` files end to end, and
+    `{pre}_concat_scan` the staged runs end to end, which staging rebuilds exactly from
+    the func derivatives; the PSC runs and their `_mean` volumes also give back the raw
+    runs (raw = psc * mean / 100) wherever PSC was neither capped at 200 nor zeroed.
+    The analysis's ledger still records them, as outputs of the run that made them."""
+    out_dir, pre = Path(block["out_dir"]), block["out_file_pre"]
+    removed = []
+    for rel in (psc_concat(pre), concat_scan(pre)):
+        if (out_dir / rel).is_file():
+            (out_dir / rel).unlink()
+            removed.append(rel)
+    return removed
 
 
 # ---------------------------------------------------------------------------
