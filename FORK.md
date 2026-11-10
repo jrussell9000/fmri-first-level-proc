@@ -120,6 +120,37 @@ They are not ancestors of `main`, and `v5.0.0` is older than `4.0.0+cp.1` despit
 
 ## Fork releases
 
+### 4.0.0+cp.11
+
+A session runs in about 40% less time, and keeps each run's series in place of the
+concatenations made from them (per Taylor Keding). Every voxel and every text output is
+unchanged.
+
+- **Extraction reads each stats bucket once** per stat type, not once per sub-brick. The
+  T-to-Z step is unchanged: it is bound by `fitt_t2z`'s compute, about 54 µs per brain
+  voxel, not by reading.
+- **nback_conn takes nback_act's identical stages** (template, prep, min-outlier EPI, raw
+  ptseries, ROI QC) through the core's new shared stages, instead of computing them again.
+- **Intermediates are uncompressed:** the staged runs, the stages' temporaries, and the two
+  concatenations, each of which was gzipped on one core and decompressed on every read.
+- **The concatenations are not kept.** Staging deletes `{pre}_psc` and `{pre}_concat_scan`
+  after the analyses and keeps each staged run as `staged/{subj}_{ses}_{task}_{run}_bold.nii.gz`.
+  The PSC runs and their means also give the raw runs back, `psc * mean / 100`, except the
+  ~0.06% of values PSC capped or zeroed.
+
+Measured on one ABCD session (2 n-back and 4 rest runs, one thread each, run side by side
+on one machine, so the times are relative): the analyses' stages took 2,903 s against
+5,047 s (nback_act 3,042 → 2,008, nback_conn 1,033 → 194, rest_conn 972 → 701), and
+staging about half as long. Keeping the staged runs costs about 45 s a run to gzip. Every
+output was compared: voxel data, data type, affine, sub-brick labels and statistics
+parameters of each NIfTI, every text file byte for byte, and the QC summaries and ledgers
+without times, are identical, apart from the removed concatenations and one label change:
+`rest_conn`'s `concat_residual_dtseries` names its sub-bricks after the per-run files
+`3dTcat` joined, now `residual.nii[i]` where they were `residual.nii.gz[i]`. Its data are
+unchanged. The work directory peaked at 22.3 GB, during rest's residuals stage (the old
+code's ended at 7.7 GB; its peak was not sampled), because staged runs and temporaries are
+four to five times their compressed size.
+
 ### 4.0.0+cp.10
 
 Rest's WM and CSF regressors are read from the confounds TSV's `white_matter` and `csf` columns,
