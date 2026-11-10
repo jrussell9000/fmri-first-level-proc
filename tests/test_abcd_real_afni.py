@@ -72,6 +72,9 @@ def test_staging_commands_trim_mask_and_average(tmp_path):
 
     nback, _ = sess.stage_task("nback", by_task["nback"], TR)
     assert not any(r.excluded for r in nback)
+    # Staged runs are uncompressed NIfTI: each analysis reads them several times.
+    assert nback[0].bold.suffix == ".nii"
+    assert nback[0].bold.read_bytes()[:2] != b"\x1f\x8b"  # no gzip magic
     first = nib.load(str(nback[0].bold))
     assert first.shape[3] == N_FRAMES - N_NSS
     assert first.header.get_zooms()[3] == pytest.approx(TR)

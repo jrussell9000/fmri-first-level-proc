@@ -79,6 +79,9 @@ func derivatives, or any files with the same names:
   its `run_labels` entry (the framework's Mode A), so each run gets its own baseline and PSC
   mean. All are masked by the intersection of their brain masks, because they enter one
   model. A run that fails staging is excluded and recorded, and the rest continue.
+- **Staged runs** are written to `{workdir}/{task}_{run}_bold.nii`, uncompressed: every
+  analysis reads each one several times, and gzip would cost a full decompression each time.
+  They are about 1.6 GB each and stay in the work dir.
 - **Rest WM and CSF:** the confounds TSV's `white_matter` and `csf` columns, less the
   trimmed rows. cloudpipe's func preproc writes them as the orchestrator builds its
   regressors: FastSurfer's 1 mm `label-WM_mask` and `label-CSF_mask` go to the BOLD grid
@@ -99,6 +102,12 @@ func derivatives, or any files with the same names:
   cannot stop the others. The setup fields `out_dir`, `out_file_pre`, `extract_out_file_pre`
   and `conn_out_file_pre` are set to `{subj}_{ses}_{post_id}`. Every analysis setting is
   left as the template has it.
+- **Shared stages:** staging sets `FFLP_STAGE_SHARE_DIR` to `{workdir}/shared_stages`, so
+  `nback_conn` takes `nback_act`'s template, prep, min-outlier EPI, raw ptseries and ROI QC
+  (hard links into its own `out_dir`, with their QC and warnings) instead of computing them
+  again. Both analyses run the same code on the same staged runs, and the core shares a
+  stage only when its share key matches: its inputs, settings, upstream stages, output
+  prefix and tool versions. Each analysis's outputs and ledger are as if it had run alone.
 
 ## Analysis exits
 

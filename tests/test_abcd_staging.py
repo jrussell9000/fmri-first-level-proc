@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -19,11 +20,13 @@ import yaml
 nib = pytest.importorskip("nibabel")
 
 from fmri_first_level_proc.abcd import staging as sfl  # noqa: E402
+from fmri_first_level_proc.engine import SHARE_DIR_ENV  # noqa: E402
 
 TR = 0.8
 SUBJ, SES = "sub-TEST0001", "ses-00A"
 TEMPLATE = sfl.PROC_TEMPLATE
 ATLAS = "/atlas/parcels.nii.gz"
+share_dirs: list[str | None] = []  # FFLP_STAGE_SHARE_DIR as each faked CLI call saw it
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +378,7 @@ def fake_tools(monkeypatch, analysis_qc):
     code a test asks for, per analysis."""
     calls: list[list[str]] = []
     exits: dict[str, int] = {}
+    share_dirs.clear()
 
     def run_cmd(cmd, **_):
         calls.append(cmd)
@@ -385,6 +389,7 @@ def fake_tools(monkeypatch, analysis_qc):
 
     def run_cli(cmd, cwd):
         calls.append(cmd)
+        share_dirs.append(os.environ.get(SHARE_DIR_ENV))
         cfg = yaml.safe_load(Path(cmd[cmd.index("--config") + 1]).read_text())
         name = cfg["analyses"][int(cmd[cmd.index("--analyses") + 1])]["name"]
         (Path(cwd) / f"{name}_out.txt").write_text("result")
@@ -394,7 +399,8 @@ def fake_tools(monkeypatch, analysis_qc):
 
     monkeypatch.setattr(sfl, "run_cmd", run_cmd)
     monkeypatch.setattr(sfl, "run_cli", run_cli)
-    monkeypatch.setenv("OMP_NUM_THREADS", "2")  # run_session sets it; this restores it after
+    monkeypatch.setenv("OMP_NUM_THREADS", "2")  # run_session sets these; this restores them after
+    monkeypatch.setenv(SHARE_DIR_ENV, "")
     return calls, exits
 
 
@@ -453,6 +459,14 @@ def test_each_nback_run_stays_separate_with_its_own_label_and_local_events(tmp_p
     assert staged_events(tmp_path, "task-nback_run-02")["onset"].max() < 362 * TR
     calls, _ = fake_tools
     assert not any(c[0] == "3dTcat" for c in calls)
+
+
+def test_every_analysis_shares_stages_through_the_work_dir(tmp_path, fake_tools):
+    """nback_conn takes nback_act's identical stages from one directory per session,
+    outside out_dir, so nothing extra is published."""
+    seed_session(tmp_path / "raw")
+    run(tmp_path)
+    assert share_dirs == [str(tmp_path / "work" / "shared_stages")] * 3
 
 
 def test_a_full_session_runs_every_analysis(tmp_path, fake_tools):
