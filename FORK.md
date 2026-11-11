@@ -9,7 +9,7 @@ or files listed here, and CI fails if that stops being true.
 
 **Upstream base:** `e40d1bc6f519b9a61996a594b395fef4ec9c9fd2`
 
-**Fork version:** `4.0.0+cp.11`, in `pyproject.toml`. The part before the `+` is upstream's
+**Fork version:** `4.0.0+cp.12`, in `pyproject.toml`. The part before the `+` is upstream's
 version and the rest counts fork releases on it. `__version__` in `__init__.py` stays upstream's
 value, so an analysis's QC reports the version of the core that ran it, and
 `fmri-first-level-abcd` records the fork version in its result.
@@ -119,6 +119,17 @@ refactored core with the `src/` layout. Tags `v4.1.0`, `v4.2.0` and `v5.0.0` bel
 They are not ancestors of `main`, and `v5.0.0` is older than `4.0.0+cp.1` despite its number.
 
 ## Fork releases
+
+### 4.0.0+cp.12
+
+`nback_conn` no longer keeps its own copy of what it shares with `nback_act`. Shared
+stages hard-link `nback_act`'s outputs into `nback_conn`'s `out_dir`, so both trees held
+the same PSC runs and means: about 0.6 GB a session, uploaded twice. After the
+analyses, staging deletes each of `nback_conn`'s intermediates that is a hard link of
+`nback_act`'s file (the PSC runs, their means, the run-intersection mask and the
+resampled atlas) and records them as `deduplicated: {"nback_act": [...]}`. Its `final`
+outputs (min-outlier EPIs, raw ptseries) stay with its results, and a file it computed
+itself, without sharing, is never removed. Analyses are unchanged.
 
 ### 4.0.0+cp.11
 
