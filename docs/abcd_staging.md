@@ -176,8 +176,9 @@ masks are built by cloudpipe's func preproc, and its FuncQC records them per run
 (`wm_mask_voxels`, `csf_mask_voxels`). A repaired cue adds
 `cue_moved_to` and `cue_moved_from` to the two runs. A failed analysis adds `error`: the
 `type`, `message` and `step` from its QC summary's `run_status`. An n-back analysis adds
-`removed`, the concatenated series deleted from its `out_dir`, and each staged run adds
-`staged_bold`, its kept copy (see below).
+`removed`, the concatenated series deleted from its `out_dir`; `nback_conn` adds
+`deduplicated`, the files it shared with `nback_act` and that only `nback_act` keeps; and
+each staged run adds `staged_bold`, its kept copy (see below).
 
 ## Runs are kept, concatenations are not
 
@@ -192,6 +193,10 @@ from them. After every analysis has finished, staging:
   to `staged/{subj}_{ses}_{task}_{run}_bold.nii.gz` under the output directory, gzipped
   once at the default level (level 1 measured no faster). A run that failed staging is
   not kept.
+- (since `4.0.0+cp.12`) deletes each of `nback_conn`'s intermediates that is a hard link
+  of `nback_act`'s file, put there by a shared stage: the PSC runs, their means, the
+  run-intersection mask and the resampled atlas. Read them from `nback_act/`.
+  `nback_conn`'s `final` outputs stay, and so does any file it computed itself.
 
 The PSC runs with their `{pre}_run{N}_mean.nii.gz` also give back the raw runs,
 `raw = psc * mean / 100`, except where PSC was capped at 200 or zeroed (a non-positive

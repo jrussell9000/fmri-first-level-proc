@@ -42,7 +42,7 @@ import pandas as pd
 import yaml
 
 from ..engine import SHARE_DIR_ENV
-from ..names import concat_scan, psc_concat
+from ..names import concat_scan, ledger, psc_concat
 
 MARKER = "_complete.json"
 SPACE = "space-MNI152NLin2009cAsym"
@@ -788,10 +788,13 @@ def run_session(sess: Session, template: dict, out_root: Path, atlas: str) -> di
             note_runs_excluded_by_analysis(block, rest_runs, analyses[name]["status"])
 
     # Only after every analysis: nback_conn takes nback_act's prep, these included.
-    for block in cfg["analyses"]:
+    for i, block in enumerate(cfg["analyses"]):
+        entry = analyses[block["name"]]
         removed = remove_concatenations(block)
         if removed:
-            analyses[block["name"]]["removed"] = removed
+            entry["removed"] = removed
+        for earlier, files in remove_shared_duplicates(block, cfg["analyses"][:i]).items():
+            entry.setdefault("deduplicated", {})[earlier] = files
     keep_staged_runs(sess, all_runs, out_root)
 
     return _result(sess, analyses, all_runs)
@@ -815,6 +818,45 @@ def keep_staged_runs(sess: Session, runs: list[Run], out_root: Path) -> None:
         with run.bold.open("rb") as src, gzip.GzipFile(out_root / rel, "wb", mtime=0) as dst:
             shutil.copyfileobj(src, dst, 1 << 20)
         run.extra["staged_bold"] = rel
+
+
+def ledger_classes(block: dict) -> dict[str, str]:
+    """{path: class} from an analysis's ledger, the latest record for each path."""
+    path = Path(block["out_dir"]) / ledger(block["out_file_pre"])
+    classes: dict[str, str] = {}
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            for out in record.get("outputs") or []:
+                classes[out["path"]] = out["class"]
+    return classes
+
+
+def remove_shared_duplicates(block: dict, earlier: list[dict]) -> dict[str, list[str]]:
+    """Delete each of this analysis's intermediates that is the same file as one an
+    earlier analysis keeps; {earlier analysis: names removed}.
+
+    Shared stages hard-link nback_act's template, prep and QC outputs into nback_conn's
+    out_dir, so both trees held the same PSC runs and means, about 0.6 GB a session.
+    Only a hard link of the earlier analysis's file goes, so a stage nback_conn computed
+    itself (no share) keeps its files, and only `intermediate` outputs go: nback_conn's
+    `final` ones (min-outlier EPIs, raw ptseries) stay with its results."""
+    out_dir = Path(block["out_dir"])
+    removed: dict[str, list[str]] = {}
+    for rel, cls in sorted(ledger_classes(block).items()):
+        mine = out_dir / rel
+        if cls != "intermediate" or not mine.is_file():
+            continue
+        for other in earlier:
+            theirs = Path(other["out_dir"]) / rel
+            if theirs.is_file() and os.path.samefile(mine, theirs):
+                mine.unlink()
+                removed.setdefault(other["name"], []).append(rel)
+                break
+    return removed
 
 
 def remove_concatenations(block: dict) -> list[str]:

@@ -500,6 +500,68 @@ def test_concatenations_are_removed_after_every_analysis_and_runs_kept(tmp_path,
     assert "removed" not in result["analyses"]["rest_conn"]
 
 
+def test_nback_conn_drops_intermediates_it_shares_with_nback_act(tmp_path, fake_tools, monkeypatch):
+    """A shared stage hard-links nback_act's outputs into nback_conn's out_dir. Those
+    intermediates are kept once, in nback_act; nback_conn keeps its finals, and any
+    intermediate it computed itself."""
+    pre = f"{SUBJ}_{SES}_nback"
+    shared_inter = [f"{pre}_run1_psc.nii.gz", f"{pre}_run1_mean.nii.gz"]
+    shared_final = f"{pre}_run1_min_outlier_epi.nii.gz"
+    own_inter = f"{pre}_estimability_dmat.x1D"
+    fake_cli = sfl.run_cli
+
+    def ledger_line(paths):
+        return json.dumps({"record_type": "staged", "step": "s", "outputs": [{"path": p, "class": c} for p, c in paths]})
+
+    def run_cli(cmd, cwd):
+        out = Path(cwd)
+        if out.name == "nback_act":
+            for name in [*shared_inter, shared_final]:
+                (out / name).write_text(name)
+            (out / f"{pre}_ledger.jsonl").write_text(
+                ledger_line([(p, "intermediate") for p in shared_inter] + [(shared_final, "final")]) + "\n")
+        if out.name == "nback_conn":
+            for name in [*shared_inter, shared_final]:
+                os.link(out.parent / "nback_act" / name, out / name)  # as a shared stage does
+            (out / own_inter).write_text("conn's own")
+            (out / f"{pre}_ledger.jsonl").write_text(ledger_line(
+                [(p, "intermediate") for p in [*shared_inter, own_inter]] + [(shared_final, "final")]) + "\n")
+        return fake_cli(cmd, cwd)
+
+    monkeypatch.setattr(sfl, "run_cli", run_cli)
+    seed_session(tmp_path / "raw")
+    result = run(tmp_path)
+
+    act, conn = tmp_path / "out" / "nback_act", tmp_path / "out" / "nback_conn"
+    assert all((act / p).is_file() for p in [*shared_inter, shared_final]), "nback_act keeps its copy"
+    assert not any((conn / p).exists() for p in shared_inter)
+    assert (conn / shared_final).is_file() and (conn / own_inter).is_file()
+    assert result["analyses"]["nback_conn"]["deduplicated"] == {"nback_act": sorted(shared_inter)}
+    assert "deduplicated" not in result["analyses"]["nback_act"]
+
+
+def test_a_same_named_file_nback_conn_computed_itself_is_kept(tmp_path, fake_tools, monkeypatch):
+    """Without sharing (another file, same name), nothing is removed: only a hard link
+    of nback_act's own file is a duplicate."""
+    pre = f"{SUBJ}_{SES}_nback"
+    rel = f"{pre}_run1_psc.nii.gz"
+    fake_cli = sfl.run_cli
+
+    def run_cli(cmd, cwd):
+        out = Path(cwd)
+        if out.name.startswith("nback"):
+            (out / rel).write_text(out.name)
+            (out / f"{pre}_ledger.jsonl").write_text(json.dumps(
+                {"outputs": [{"path": rel, "class": "intermediate"}]}) + "\n")
+        return fake_cli(cmd, cwd)
+
+    monkeypatch.setattr(sfl, "run_cli", run_cli)
+    seed_session(tmp_path / "raw")
+    result = run(tmp_path)
+    assert (tmp_path / "out" / "nback_conn" / rel).read_text() == "nback_conn"
+    assert "deduplicated" not in result["analyses"]["nback_conn"]
+
+
 def test_staged_runs_are_kept_compressed_in_place_of_the_concatenation(tmp_path, fake_tools):
     seed_session(tmp_path / "raw")
     result = run(tmp_path)
